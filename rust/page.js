@@ -1,66 +1,144 @@
-// Runs inside the Ozon tab. No account, address, or order widgets leave the page.
-async (options) => {
-  const names = new Set(['tileGridDesktop', 'webShortCharacteristics',
-    'webSingleProductScore', 'webReviewProductScore', 'webCurrentSeller',
-    'webDescription', 'webIconWithText', 'webProductHeading', 'webPrice',
-    'webGallery', 'webListReviews']);
-  const maxBytes = 4 * 1024 * 1024;
-  if (location.origin !== 'https://www.ozon.ru') return { error: 'INVALID_ORIGIN' };
-  const filter = (page) => {
+// Generated from rust/page.ts; run npm run build:page.
+(()=>{
+const publicWidgetNames = new Set([
+    "tileGridDesktop",
+    "webShortCharacteristics",
+    "webSingleProductScore",
+    "webReviewProductScore",
+    "webCurrentSeller",
+    "webDescription",
+    "webIconWithText",
+    "webProductHeading",
+    "webPrice",
+    "webGallery",
+    "webListReviews",
+]);
+const maxBytes = 4 * 1024 * 1024;
+function isRecord(value) {
+    return typeof value === "object" && value !== null;
+}
+function widgetName(key) {
+    return key.split("-")[0] ?? "";
+}
+function parseOptions(value) {
+    if (!isRecord(value))
+        return null;
+    if (value.mode === "widgets")
+        return { mode: "widgets" };
+    if (value.mode === "fetch" && typeof value.path === "string") {
+        return { mode: "fetch", path: value.path };
+    }
+    return null;
+}
+function filterPage(page) {
+    if (!isRecord(page))
+        return { error: "INVALID_RESPONSE" };
     const widgetStates = Object.create(null);
-    for (const [key, value] of Object.entries(page.widgetStates || {})) {
-      if (names.has(key.split('-')[0])) widgetStates[key] = value;
+    if (isRecord(page.widgetStates)) {
+        for (const [key, value] of Object.entries(page.widgetStates)) {
+            if (publicWidgetNames.has(widgetName(key)))
+                widgetStates[key] = value;
+        }
     }
     const result = { widgetStates };
-    if (page.seo && typeof page.seo === 'object') {
-      result.seo = {
-        title: typeof page.seo.title === 'string' ? page.seo.title : null,
-        link: Array.isArray(page.seo.link) ? page.seo.link.filter(x => x && typeof x.href === 'string').map(x => ({href: x.href})) : [],
-      };
+    if (isRecord(page.seo)) {
+        result.seo = {
+            title: typeof page.seo.title === "string" ? page.seo.title : null,
+            link: Array.isArray(page.seo.link)
+                ? page.seo.link
+                    .filter((entry) => isRecord(entry) && typeof entry.href === "string")
+                    .map((entry) => ({ href: entry.href }))
+                : [],
+        };
     }
     try {
-      const tracking = typeof page.layoutTrackingInfo === 'string' ? JSON.parse(page.layoutTrackingInfo) : page.layoutTrackingInfo;
-      if (tracking && /^[0-9]+$/.test(String(tracking.sku))) result.layoutTrackingInfo = {sku: tracking.sku};
-    } catch {}
-    if (new TextEncoder().encode(JSON.stringify(result)).length > maxBytes)
-      return { error: 'RESPONSE_TOO_LARGE' };
+        const tracking = typeof page.layoutTrackingInfo === "string"
+            ? JSON.parse(page.layoutTrackingInfo)
+            : page.layoutTrackingInfo;
+        if (isRecord(tracking) && /^[0-9]+$/.test(String(tracking.sku))) {
+            result.layoutTrackingInfo = { sku: tracking.sku };
+        }
+    }
+    catch {
+    }
+    if (new TextEncoder().encode(JSON.stringify(result)).length > maxBytes) {
+        return { error: "RESPONSE_TOO_LARGE" };
+    }
     return { page: result };
-  };
-  if (options.mode === 'widgets') {
-    const widgetStates = Object.create(null);
-    let bytes = 0;
-    for (const el of document.querySelectorAll('[id^="state-"][data-state]')) {
-      const key = el.id.slice(6);
-      if (!names.has(key.split('-')[0])) continue;
-      const value = el.getAttribute('data-state');
-      bytes += new TextEncoder().encode(value).length;
-      if (bytes > maxBytes) return { error: 'RESPONSE_TOO_LARGE' };
-      widgetStates[key] = value;
-    }
-    return Object.keys(widgetStates).length ? filter({ widgetStates }) : { error: 'CAPTCHA_OR_BLOCKED' };
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 35000);
-  try {
-    const response = await fetch('/api/composer-api.bx/page/json/v2?url=' + encodeURIComponent(options.path), {
-      headers: { accept: 'application/json' }, signal: controller.signal,
-    });
-    if (!response.ok) return { status: response.status };
-    if (Number(response.headers.get('content-length')) > maxBytes)
-      return { error: 'RESPONSE_TOO_LARGE' };
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let bytes = 0, text = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      bytes += value.length;
-      if (bytes > maxBytes) { controller.abort(); return { error: 'RESPONSE_TOO_LARGE' }; }
-      text += decoder.decode(value, { stream: true });
-    }
-    try { return filter(JSON.parse(text + decoder.decode())); }
-    catch { return { error: 'INVALID_RESPONSE' }; }
-  } catch (error) {
-    return { error: error.name === 'AbortError' ? 'FETCH_TIMEOUT' : 'FETCH_FAILED' };
-  } finally { clearTimeout(timer); }
 }
+async function ozonPage(rawOptions) {
+    if (location.origin !== "https://www.ozon.ru") {
+        return { error: "INVALID_ORIGIN" };
+    }
+    const options = parseOptions(rawOptions);
+    if (options === null)
+        return { error: "INVALID_OPTIONS" };
+    if (options.mode === "widgets") {
+        const widgetStates = Object.create(null);
+        let bytes = 0;
+        for (const element of document.querySelectorAll('[id^="state-"][data-state]')) {
+            const key = element.id.slice(6);
+            if (!publicWidgetNames.has(widgetName(key)))
+                continue;
+            const value = element.getAttribute("data-state");
+            if (value === null)
+                continue;
+            bytes += new TextEncoder().encode(value).length;
+            if (bytes > maxBytes)
+                return { error: "RESPONSE_TOO_LARGE" };
+            widgetStates[key] = value;
+        }
+        return Object.keys(widgetStates).length > 0
+            ? filterPage({ widgetStates })
+            : { error: "CAPTCHA_OR_BLOCKED" };
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 35_000);
+    try {
+        const response = await fetch("/api/composer-api.bx/page/json/v2?url=" +
+            encodeURIComponent(options.path), {
+            headers: { accept: "application/json" },
+            signal: controller.signal,
+        });
+        if (!response.ok)
+            return { status: response.status };
+        if (Number(response.headers.get("content-length")) > maxBytes) {
+            return { error: "RESPONSE_TOO_LARGE" };
+        }
+        if (response.body === null)
+            return { error: "INVALID_RESPONSE" };
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let bytes = 0;
+        let text = "";
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done)
+                break;
+            bytes += value.length;
+            if (bytes > maxBytes) {
+                controller.abort();
+                return { error: "RESPONSE_TOO_LARGE" };
+            }
+            text += decoder.decode(value, { stream: true });
+        }
+        try {
+            return filterPage(JSON.parse(text + decoder.decode()));
+        }
+        catch {
+            return { error: "INVALID_RESPONSE" };
+        }
+    }
+    catch (error) {
+        return {
+            error: isRecord(error) && error.name === "AbortError"
+                ? "FETCH_TIMEOUT"
+                : "FETCH_FAILED",
+        };
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+return ozonPage;
+})()

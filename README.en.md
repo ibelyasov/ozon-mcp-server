@@ -70,6 +70,19 @@ Keep the profile outside the repository because it may contain an account sessio
 
 ## Development
 
+Edit the browser script in `rust/page.ts`; TypeScript 7.0.2 compiles it into the tracked `rust/page.js`. Rust embeds the generated JavaScript, so Cargo builds and server execution do not require Node.js. Do not edit `page.js` by hand.
+
+To change the script, use Node.js 22+ with npm:
+
+```sh
+npm ci
+npm run build:page
+npm run check:page
+npm test
+```
+
+`check:page` checks types and verifies that `page.js` matches its source. Commit both files together; CI repeats this check and the browser script's offline tests.
+
 ```sh
 cargo test --locked
 ```

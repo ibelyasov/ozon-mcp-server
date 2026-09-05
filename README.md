@@ -70,6 +70,19 @@ agent-browser install
 
 ## Разработка
 
+Браузерный скрипт редактируется в `rust/page.ts` и компилируется TypeScript 7.0.2 в отслеживаемый Git файл `rust/page.js`. Rust встраивает готовый JavaScript, поэтому для сборки через Cargo и запуска сервера Node.js не нужен. Не редактируйте `page.js` вручную.
+
+Для изменения скрипта нужен Node.js 22+ с npm:
+
+```sh
+npm ci
+npm run build:page
+npm run check:page
+npm test
+```
+
+Команда `check:page` проверяет типы и соответствие `page.js` исходнику. Коммитьте оба файла вместе; CI повторяет проверку и офлайн-тесты браузерного скрипта.
+
 ```sh
 cargo test --locked
 ```
