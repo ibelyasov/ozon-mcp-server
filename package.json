@@ -1,6 +1,6 @@
 {
   "name": "ozon-mcp-server",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Ozon buyer MCP: macOS-compatible Chromium, verified brand parsing and HTML/JSON product descriptions",
   "type": "module",
   "bin": {

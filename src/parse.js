@@ -3,105 +3,312 @@
 // plain data. Kept side-effect-free so it can be unit-tested against saved
 // samples.
 
-function widgetName(key) {
-  return String(key).split("-")[0];
+const OZON_ORIGIN = "https://www.ozon.ru";
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function widget(page, name) {
-  const ws = page?.widgetStates || {};
-  const key = Object.keys(ws).find((k) => widgetName(k) === name);
-  if (!key) return null;
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function text(value) {
+  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() || null : null;
+}
+
+function textFrom(value) {
+  if (typeof value === "string") return text(value);
+  if (!isRecord(value)) return null;
+  return text(value.text) ?? text(value.content);
+}
+
+function optionalString(record, key) {
+  return isRecord(record) && typeof record[key] === "string" ? record[key] : null;
+}
+
+function booleanOrNull(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function primitiveOrNull(value) {
+  if (typeof value === "string") return value.trim() || null;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function parseJsonValue(value) {
+  if (isRecord(value) || Array.isArray(value)) return value;
+  if (typeof value !== "string") return null;
   try {
-    return JSON.parse(ws[key]);
+    return JSON.parse(value);
   } catch {
     return null;
   }
 }
 
-function widgets(page, name) {
-  const ws = page?.widgetStates || {};
-  return Object.keys(ws)
-    .filter((k) => widgetName(k) === name)
-    .map((k) => {
-      try {
-        return JSON.parse(ws[k]);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
+function parseWidgetState(value) {
+  const parsed = parseJsonValue(value);
+  return isRecord(parsed) ? parsed : null;
 }
 
-function priceToNumber(text) {
-  if (typeof text !== "string") return null;
-  const digits = text.replace(/[^\d]/g, "");
-  return digits ? parseInt(digits, 10) : null;
+function widgetName(key) {
+  return typeof key === "string" ? key.split("-")[0] : "";
+}
+
+function widget(page, name) {
+  const states = isRecord(page?.widgetStates) ? page.widgetStates : {};
+  for (const key of Object.keys(states)) {
+    if (widgetName(key) !== name) continue;
+    const parsed = parseWidgetState(states[key]);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function widgets(page, name) {
+  const states = isRecord(page?.widgetStates) ? page.widgetStates : {};
+  const parsed = [];
+  for (const key of Object.keys(states)) {
+    if (widgetName(key) !== name) continue;
+    const value = parseWidgetState(states[key]);
+    if (value) parsed.push(value);
+  }
+  return parsed;
+}
+
+function validGroupedInteger(value) {
+  if (/^\d+$/.test(value)) return true;
+  const separators = value.match(/[.,]/g) || [];
+  if (new Set(separators).size !== 1) return false;
+  const groups = value.split(separators[0]);
+  return (
+    groups.length > 1 &&
+    /^\d{1,3}$/.test(groups[0]) &&
+    groups.slice(1).every((group) => /^\d{3}$/.test(group))
+  );
+}
+
+function parseLocalizedNumber(value) {
+  if (typeof value !== "string") return null;
+  const compact = value.replace(/[\s\u00a0\u202f]/g, "");
+  if (!/^[+-]?\d(?:[\d.,]*\d)?$/.test(compact)) return null;
+
+  const signed = compact[0] === "+" || compact[0] === "-";
+  const sign = compact[0] === "-" ? -1 : 1;
+  const body = signed ? compact.slice(1) : compact;
+  const comma = body.lastIndexOf(",");
+  const dot = body.lastIndexOf(".");
+  let decimalIndex = -1;
+
+  if (comma >= 0 && dot >= 0) {
+    decimalIndex = Math.max(comma, dot);
+  } else {
+    const separator = comma >= 0 ? comma : dot;
+    if (separator >= 0 && body.length - separator - 1 <= 2) decimalIndex = separator;
+  }
+
+  let normalized;
+  if (decimalIndex >= 0) {
+    const integerPart = body.slice(0, decimalIndex);
+    const fractionPart = body.slice(decimalIndex + 1);
+    if (!/^\d+$/.test(fractionPart) || !validGroupedInteger(integerPart)) return null;
+    normalized = integerPart.replace(/[.,]/g, "") + "." + fractionPart;
+  } else {
+    if (!validGroupedInteger(body)) return null;
+    normalized = body.replace(/[.,]/g, "");
+  }
+
+  const parsed = Number(normalized) * sign;
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function priceToNumber(value) {
+  let parsed = typeof value === "number" && Number.isFinite(value) ? value : null;
+  if (parsed === null && typeof value === "string") {
+    const match = value.match(/[+-]?\d(?:[\d\s\u00a0\u202f.,]*\d)?/u);
+    parsed = match ? parseLocalizedNumber(match[0]) : null;
+  }
+  return parsed !== null && parsed >= 0 ? parsed : null;
+}
+
+function scaledCount(number, multiplier = 1) {
+  if (number === null || number < 0) return null;
+  const scaled = number * multiplier;
+  if (!Number.isFinite(scaled) || scaled > Number.MAX_SAFE_INTEGER) return null;
+  return Math.round(scaled);
+}
+
+function countFromValue(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return scaledCount(value);
+  if (typeof value !== "string") return null;
+
+  const match = value.match(
+    /^\s*([+-]?\d(?:[\d\s\u00a0\u202f.,]*\d)?)(?:\s*)(тыс(?:яч[аи])?\.?|млн\.?|миллион[а-яё]*|k|m)?\s*$/iu
+  );
+  if (!match) return null;
+  const suffix = (match[2] || "").toLowerCase();
+  const multiplier = /^(?:тыс|k)/u.test(suffix) ? 1_000 : /^(?:млн|миллион|m)/u.test(suffix) ? 1_000_000 : 1;
+  return scaledCount(parseLocalizedNumber(match[1]), multiplier);
+}
+
+function parseReviewCount(value) {
+  if (typeof value !== "string") return null;
+  const matcher = /([+-]?\d(?:[\d\s\u00a0\u202f.,]*\d)?)(?:\s*)(тыс(?:яч[аи])?\.?|млн\.?|миллион[а-яё]*|k|m)?\s*(?:отзыв[а-яё]*|reviews?)/giu;
+  for (const match of value.matchAll(matcher)) {
+    const suffix = (match[2] || "").toLowerCase();
+    const multiplier = /^(?:тыс|k)/u.test(suffix) ? 1_000 : /^(?:млн|миллион|m)/u.test(suffix) ? 1_000_000 : 1;
+    const count = scaledCount(parseLocalizedNumber(match[1]), multiplier);
+    if (count !== null) return count;
+  }
+  return null;
+}
+
+function ratingFromValue(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 && value <= 5 ? value : null;
+  }
+  if (isRecord(value)) return ratingFromValue(value.text) ?? ratingFromValue(value.value);
+  if (typeof value !== "string") return null;
+
+  const source = text(value);
+  if (!source) return null;
+  const direct = parseLocalizedNumber(source);
+  if (direct !== null && direct >= 0 && direct <= 5) return direct;
+
+  const explicit = source.match(
+    /(?:^|[^\d])([0-5](?:[.,]\d+)?)(?![\d.,])\s*(?:из\s*5|\/\s*5|[★⭐]|звезд[а-яё]*)/iu
+  );
+  if (explicit) return ratingFromValue(explicit[1]);
+
+  const atStart = source.match(/^([0-5](?:[.,]\d+)?)(?![\d.,])/u);
+  if (!atStart) return null;
+  const remaining = source.slice(atStart[0].length);
+  if (
+    /^\s*\d/u.test(remaining) ||
+    /^\s*(?:(?:тыс(?:яч[аи])?\.?|млн\.?|миллион[а-яё]*|k|m)\s*)?(?:отзыв[а-яё]*|reviews?)/iu.test(
+      remaining
+    )
+  ) {
+    return null;
+  }
+  return ratingFromValue(atStart[1]);
+}
+
+function collectStrings(value, result = [], seen = new WeakSet()) {
+  if (typeof value === "string") {
+    result.push(value);
+    return result;
+  }
+  if (value === null || typeof value !== "object" || seen.has(value)) return result;
+  seen.add(value);
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    collectStrings(child, result, seen);
+  }
+  return result;
+}
+
+function hasStarIcon(value) {
+  return collectStrings(value).some((item) => item.includes("ic_s_star"));
+}
+
+function normalizeSku(value) {
+  if (typeof value === "number") {
+    return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+  }
+  const candidate = typeof value === "string" ? value.trim() : null;
+  return candidate && /^\d+$/.test(candidate) ? candidate : null;
 }
 
 function cleanUrl(link) {
-  if (!link) return null;
-  const path = String(link).split("?")[0];
-  return path.startsWith("http") ? path : `https://www.ozon.ru${path}`;
+  if (typeof link !== "string" || !link.trim()) return null;
+  try {
+    const url = new URL(link.trim(), OZON_ORIGIN);
+    if (!/^https?:$/i.test(url.protocol) || !/^(?:www\.)?ozon\.ru$/i.test(url.hostname)) {
+      return null;
+    }
+    url.protocol = "https:";
+    url.hostname = "www.ozon.ru";
+    url.search = "";
+    url.hash = "";
+    return url.href;
+  } catch {
+    return null;
+  }
 }
 
 function skuFromUrl(url) {
-  const m = String(url || "").match(/-(\d+)\/?(?:\?|$)/) || String(url || "").match(/(\d{6,})/);
-  return m ? m[1] : null;
+  const clean = cleanUrl(url);
+  if (!clean) return null;
+  const path = new URL(clean).pathname;
+  const product = path.match(/\/product\/(?:[^/]*-)?(\d+)\/?$/iu);
+  const terminal = path.match(/-(\d+)\/?$/u);
+  return normalizeSku(product?.[1] ?? terminal?.[1]);
+}
+
+function imageUrl(value) {
+  if (typeof value === "string") return value.trim() || null;
+  if (!isRecord(value)) return null;
+  return imageUrl(value.src) ?? imageUrl(value.link) ?? imageUrl(value.url);
 }
 
 // ── search ────────────────────────────────────────────────────────────────────
 
-function parseSearchItem(it) {
-  if (!it) return null;
-  const ms = Array.isArray(it.mainState) ? it.mainState : [];
+function parseSearchItem(item) {
+  if (!isRecord(item)) return null;
+  const states = asArray(item.mainState).filter(isRecord);
 
-  const priceBlock = ms.find((s) => s.type === "priceV2")?.priceV2;
-  const prices = priceBlock?.price || [];
-  const price = priceToNumber(prices.find((p) => p.textStyle === "PRICE")?.text);
-  const oldPrice = priceToNumber(prices.find((p) => p.textStyle === "ORIGINAL_PRICE")?.text);
+  const priceBlock = states.find((state) => state.type === "priceV2" && isRecord(state.priceV2))
+    ?.priceV2;
+  const prices = asArray(priceBlock?.price).filter(isRecord);
+  const price = priceToNumber(prices.find((entry) => entry.textStyle === "PRICE")?.text);
+  const oldPrice = priceToNumber(prices.find((entry) => entry.textStyle === "ORIGINAL_PRICE")?.text);
 
-  const name = ms.find((s) => s.id === "name")?.textDS?.text || null;
+  const name = textFrom(states.find((state) => state.id === "name")?.textDS);
 
   let rating = null;
   let reviews = null;
-  const ratingList = ms.find(
-    (s) => s.labelListV2 && JSON.stringify(s.labelListV2).includes("ic_s_star")
-  )?.labelListV2?.items;
+  const ratingList = states.find((state) => hasStarIcon(state.labelListV2))?.labelListV2?.items;
   if (Array.isArray(ratingList)) {
-    const texts = ratingList.filter((x) => x.type === "text").map((x) => x.text?.text);
-    if (texts[0]) rating = parseFloat(String(texts[0]).replace(",", "."));
-    if (texts[1]) reviews = priceToNumber(texts[1]);
+    const labels = ratingList
+      .filter((entry) => isRecord(entry) && entry.type === "text")
+      .map((entry) => textFrom(entry.text))
+      .filter(Boolean);
+    rating = ratingFromValue(labels[0]);
+    reviews = parseReviewCount(labels[1]) ?? countFromValue(labels[1]);
   }
 
   // Financial/reward labels also contain text; only accept explicit brand evidence.
   let brand = null;
-  for (const state of ms) {
-    const ll = state.labelListV2;
-    if (!ll || ll.testInfo?.automatizationId !== "tile-list-labels") continue;
-    const texts = (ll.items || []).filter((x) => x.type === "text")
-      .map((x) => x.text?.text?.trim()).filter(Boolean);
-    const verifiedIndex = texts.findIndex((text) => /^бренд проверен$/i.test(text));
+  for (const state of states) {
+    const labels = state.labelListV2;
+    if (!isRecord(labels) || labels.testInfo?.automatizationId !== "tile-list-labels") continue;
+    const texts = asArray(labels.items)
+      .filter((entry) => isRecord(entry) && entry.type === "text")
+      .map((entry) => textFrom(entry.text))
+      .filter(Boolean);
+    const verifiedIndex = texts.findIndex((itemText) => /^бренд проверен$/iu.test(itemText));
     if (verifiedIndex > 0) {
       brand = texts[verifiedIndex - 1];
       break;
     }
   }
 
-  const url = cleanUrl(it.action?.link);
-  const sku = String(it.sku || it.id || skuFromUrl(url) || "") || null;
-
+  const url = cleanUrl(item.action?.link);
+  const sku = normalizeSku(item.sku) ?? normalizeSku(item.id) ?? skuFromUrl(url);
+  const tileImage = isRecord(item.tileImage) ? item.tileImage : null;
   const image =
-    it.tileImage?.items?.find((x) => x.image?.link)?.image?.link ||
-    it.tileImage?.coverImage ||
-    null;
+    asArray(tileImage?.items)
+      .filter(isRecord)
+      .map((entry) => imageUrl(entry.image))
+      .find(Boolean) ?? imageUrl(tileImage?.coverImage);
 
-  if (!sku || !price) return null;
+  if (!sku || price === null) return null;
   return {
     sku,
     name,
     price,
-    oldPrice: oldPrice && oldPrice > price ? oldPrice : null,
-    discount: priceBlock?.discount || null,
+    oldPrice: oldPrice !== null && oldPrice > price ? oldPrice : null,
+    discount: primitiveOrNull(priceBlock?.discount),
     rating,
     reviews,
     brand,
@@ -110,93 +317,170 @@ function parseSearchItem(it) {
   };
 }
 
+function normalizedLimit(value, fallback) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.floor(value));
+}
+
 export function parseSearch(page, limit = 12) {
   const grid = widget(page, "tileGridDesktop");
-  const raw = grid?.items || [];
-  const items = raw.map(parseSearchItem).filter(Boolean).slice(0, limit);
+  const items = asArray(grid?.items)
+    .map(parseSearchItem)
+    .filter(Boolean)
+    .slice(0, normalizedLimit(limit, 12));
   return { count: items.length, items };
 }
 
 // ── product details ───────────────────────────────────────────────────────────
 
-function rsText(arr) {
-  return (arr || [])
-    .map((v) => v.text || v.content)
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
+function rsText(value) {
+  const pieces = [];
+  for (const item of Array.isArray(value) ? value : [value]) {
+    const piece = typeof item === "string" ? text(item) : textFrom(item);
+    if (piece) pieces.push(piece);
+  }
+  return pieces.join(" ").replace(/\s+/g, " ").trim();
+}
+
+function firstRsText(...values) {
+  for (const value of values) {
+    const parsed = rsText(value);
+    if (parsed) return parsed;
+  }
+  return null;
 }
 
 function parseShortCharacteristics(page) {
-  const w = widget(page, "webShortCharacteristics");
+  const state = widget(page, "webShortCharacteristics");
   const out = {};
-  for (const c of w?.characteristics || []) {
-    const title = rsText(c.title?.textRs) || (typeof c.title === "string" ? c.title : null);
-    const value = rsText(c.values || c.contentRS || c.valueRs);
-    if (title && value) out[title] = value;
+  for (const characteristic of asArray(state?.characteristics).filter(isRecord)) {
+    const title = firstRsText(characteristic.title?.textRs, characteristic.title?.text, characteristic.title);
+    const value = firstRsText(characteristic.values, characteristic.contentRS, characteristic.valueRs);
+    if (title && value) {
+      // Defining an own property avoids the legacy __proto__ setter on plain objects.
+      Object.defineProperty(out, title, { configurable: true, enumerable: true, value, writable: true });
+    }
   }
   return out;
 }
 
 function parseProductScore(page) {
-  const w = widget(page, "webSingleProductScore") || widget(page, "webReviewProductScore");
-  const text = w?.text || JSON.stringify(w || {});
+  const state = widget(page, "webSingleProductScore") || widget(page, "webReviewProductScore");
+  if (!state) return { rating: null, reviews: null };
+
+  const ratingCandidates = [state.rating, state.ratingValue, state.text, state.title?.text];
   let rating = null;
+  for (const candidate of ratingCandidates) {
+    rating = ratingFromValue(candidate);
+    if (rating !== null) break;
+  }
+
+  const countCandidates = [state.reviews, state.reviewCount, state.reviewsCount, state.totalReviews];
   let reviews = null;
-  const rm = text.match(/(\d[.,]\d)/);
-  if (rm) rating = parseFloat(rm[1].replace(",", "."));
-  const cm = text.match(/(\d[\d\s]*)\s*отзыв/);
-  if (cm) reviews = priceToNumber(cm[1]);
+  for (const candidate of countCandidates) {
+    reviews = countFromValue(candidate) ?? parseReviewCount(candidate);
+    if (reviews !== null) break;
+  }
+  if (reviews === null) {
+    for (const candidate of collectStrings(state)) {
+      reviews = parseReviewCount(candidate);
+      if (reviews !== null) break;
+    }
+  }
   return { rating, reviews };
 }
 
 function parseSeller(page) {
-  const w = widget(page, "webCurrentSeller");
-  if (!w) return null;
-  const name = w.sellerCell?.centerBlock?.title?.text || w.title?.text || null;
-  const rating = parseFloat(String(w.rating?.title?.text || "").replace(",", ".")) || null;
-  const url = cleanUrl(w.sellerCell?.common?.action?.link);
+  const state = widget(page, "webCurrentSeller");
+  if (!state) return null;
+  const name = textFrom(state.sellerCell?.centerBlock?.title) ?? textFrom(state.title);
   if (!name) return null;
+  const rating =
+    ratingFromValue(state.rating?.title?.text) ??
+    ratingFromValue(state.rating?.title) ??
+    ratingFromValue(state.rating);
+  const url = cleanUrl(state.sellerCell?.common?.action?.link);
   return { name, rating, url };
 }
 
+function decodeHtmlEntities(value) {
+  return value.replace(/&(#x[0-9a-f]+|#\d+|nbsp|amp|lt|gt|quot|apos);/giu, (entity, code) => {
+    const named = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+    if (!code.startsWith("#")) return named[code.toLowerCase()] || entity;
+    const number = code[1].toLowerCase() === "x" ? parseInt(code.slice(2), 16) : Number(code.slice(1));
+    return number > 0 && number <= 0x10ffff && (number < 0xd800 || number > 0xdfff)
+      ? String.fromCodePoint(number)
+      : entity;
+  });
+}
+
 function descriptionText(html) {
-  return html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&(#x[0-9a-f]+|#\d+|nbsp|amp|lt|gt|quot|apos);/gi, (entity, code) => {
-      const named = {nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'"};
-      if (!code.startsWith("#")) return named[code.toLowerCase()] || entity;
-      const n = code[1].toLowerCase() === "x" ? parseInt(code.slice(2), 16) : Number(code.slice(1));
-      return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : entity;
-    }).replace(/\s+/g, " ").trim();
+  if (typeof html !== "string") return "";
+  return text(
+    decodeHtmlEntities(
+      html
+        .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/giu, " ")
+        .replace(/<!--[\s\S]*?-->/gu, " ")
+        .replace(/<\/?[a-z][^>]*>/giu, " ")
+    )
+  ) || "";
+}
+
+function descriptionImages(html) {
+  if (typeof html !== "string") return [];
+  const images = [];
+  const matcher = /<img\b[^>]*\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>\x60]+))/giu;
+  for (const match of html.matchAll(matcher)) {
+    const source = imageUrl(match[1] ?? match[2] ?? match[3]);
+    if (source) images.push(source);
+  }
+  return images;
+}
+
+function walkDescription(value, texts, images, seen = new WeakSet()) {
+  if (Array.isArray(value)) {
+    for (const item of value) walkDescription(item, texts, images, seen);
+    return;
+  }
+  if (!isRecord(value) || seen.has(value)) return;
+  seen.add(value);
+
+  if (value.type === "text") {
+    const content = text(value.content);
+    if (content) texts.push(content);
+  }
+  const image =
+    imageUrl(value.img?.src) ??
+    imageUrl(value.image?.src) ??
+    (value.type === "image" ? imageUrl(value.src) ?? imageUrl(value.attrs?.src) : null);
+  if (image) images.push(image);
+
+  for (const child of Object.values(value)) {
+    if (child && typeof child === "object") walkDescription(child, texts, images, seen);
+  }
 }
 
 export function parseDescription(page2) {
   const texts = [];
   const images = [];
-  const walk = (n) => {
-    if (!n) return;
-    if (Array.isArray(n)) return n.forEach(walk);
-    if (typeof n !== "object") return;
-    if (n.type === "text" && typeof n.content === "string") texts.push(n.content.replace(/\s+/g, " ").trim());
-    if (typeof n.img?.src === "string") images.push(n.img.src);
-    for (const value of Object.values(n)) if (value && typeof value === "object") walk(value);
-  };
-  for (const w of widgets(page2, "webDescription")) {
-    let ra = w.richAnnotationJson;
-    if (typeof ra === "string") {
-      try { ra = JSON.parse(ra); } catch { ra = null; }
+  for (const state of widgets(page2, "webDescription")) {
+    const textStart = texts.length;
+    const imageStart = images.length;
+    const annotation = parseJsonValue(state.richAnnotationJson);
+    if (isRecord(annotation) || Array.isArray(annotation)) {
+      const root = isRecord(annotation) && Object.hasOwn(annotation, "content") ? annotation.content : annotation;
+      walkDescription(root, texts, images);
     }
-    const before = texts.filter(Boolean).length + images.length;
-    if (ra && typeof ra === "object") walk(ra.content || ra);
-    if (texts.filter(Boolean).length + images.length === before && typeof w.richAnnotation === "string") {
-      const html = w.richAnnotation;
-      texts.push(descriptionText(html));
-      for (const m of html.matchAll(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) images.push(m[1]);
+
+    if (typeof state.richAnnotation === "string") {
+      if (texts.length === textStart) {
+        const fallbackText = descriptionText(state.richAnnotation);
+        if (fallbackText) texts.push(fallbackText);
+      }
+      if (images.length === imageStart) images.push(...descriptionImages(state.richAnnotation));
     }
   }
-  return { text: texts.filter(Boolean).join(" ").trim(), images: [...new Set(images)] };
+  return { text: texts.join(" ").trim(), images: [...new Set(images)] };
 }
 
 /**
@@ -206,18 +490,35 @@ export function parseDescription(page2) {
  * гарантия, акции), поэтому отличаем именно по customs-duty или по слову
  * "пошлин" в тексте.
  */
+function dutyAmount(value) {
+  const matcher = /([+-]?\d(?:[\d\s\u00a0\u202f.,]*\d)?)\s*(?:₽|руб(?:\.|л[а-яё]*)?)/giu;
+  for (const match of value.matchAll(matcher)) {
+    const amount = priceToNumber(match[1]);
+    if (amount !== null) return amount;
+  }
+  return null;
+}
+
 export function parseDuty(page) {
-  if (!page) return null;
-  const all = widgets(page, "webIconWithText");
-  for (const w of all) {
-    const blob = JSON.stringify(w);
-    if (!/customs-duty|пошлин/i.test(blob)) continue;
-    // Сумма пошлины — берём первое число с ₽ или "руб" в любом тексте widget'а.
-    const m = blob.match(/(\d[\d\s  ]*\d)\s*(?:₽|руб)/i);
-    if (!m) continue;
-    const amount = priceToNumber(m[1]);
-    if (!amount) continue;
-    return { amount, note: "пошлина не входит в цену" };
+  for (const state of widgets(page, "webIconWithText")) {
+    const strings = collectStrings(state);
+    if (!strings.some((item) => /customs-duty|пошлин/iu.test(item))) continue;
+    for (const item of strings) {
+      if (/customs-duty|пошлин/iu.test(item)) {
+        const amount = dutyAmount(item);
+        if (amount !== null) return { amount, note: "пошлина не входит в цену" };
+      }
+    }
+    const amount = dutyAmount(strings.join(" "));
+    if (amount !== null) return { amount, note: "пошлина не входит в цену" };
+  }
+  return null;
+}
+
+function seoUrl(page) {
+  for (const link of asArray(page?.seo?.link).filter(isRecord)) {
+    const url = cleanUrl(link.href);
+    if (url) return url;
   }
   return null;
 }
@@ -226,28 +527,19 @@ export function parseDetails(basePage, page2) {
   const heading = widget(basePage, "webProductHeading");
   const price = widget(basePage, "webPrice");
   const gallery = widget(basePage, "webGallery");
-
-  const sku =
-    String(
-      gallery?.sku ||
-        (basePage?.layoutTrackingInfo &&
-          JSON.parse(basePage.layoutTrackingInfo || "{}").sku) ||
-        ""
-    ) ||
-    skuFromUrl(basePage?.seo?.link?.[0]?.href) ||
-    null;
-
-  const url =
-    cleanUrl(basePage?.seo?.link?.[0]?.href) ||
-    (sku ? `https://www.ozon.ru/product/${sku}/` : null);
+  const tracking = parseJsonValue(basePage?.layoutTrackingInfo);
+  const url = seoUrl(basePage);
+  const sku = normalizeSku(gallery?.sku) ?? normalizeSku(tracking?.sku) ?? skuFromUrl(url);
 
   const { rating, reviews } = parseProductScore(basePage);
-
   const images = [];
-  if (gallery?.coverImage) images.push(gallery.coverImage);
-  for (const im of gallery?.images || []) {
-    const src = im?.src || im?.image || im;
-    if (typeof src === "string") images.push(src);
+  const addImage = (value) => {
+    const source = imageUrl(value);
+    if (source) images.push(source);
+  };
+  addImage(gallery?.coverImage);
+  for (const image of asArray(gallery?.images)) {
+    addImage(isRecord(image) ? image.src ?? image.image : image);
   }
 
   const priceCard = priceToNumber(price?.cardPrice) ?? priceToNumber(price?.price);
@@ -255,19 +547,19 @@ export function parseDetails(basePage, page2) {
 
   return {
     sku,
-    name: heading?.title || basePage?.seo?.title || null,
-    url,
+    name: textFrom(heading?.title) ?? text(basePage?.seo?.title),
+    url: url || (sku ? "https://www.ozon.ru/product/" + sku + "/" : null),
     price: priceCard,
     priceRegular: priceToNumber(price?.price),
     oldPrice: priceToNumber(price?.originalPrice),
     duty: duty
       ? {
           amount: duty.amount,
-          total: priceCard ? priceCard + duty.amount : null,
+          total: priceCard !== null ? priceCard + duty.amount : null,
           note: duty.note,
         }
       : null,
-    available: price?.isAvailable ?? null,
+    available: booleanOrNull(price?.isAvailable),
     rating,
     reviews,
     seller: parseSeller(basePage),
@@ -279,36 +571,46 @@ export function parseDetails(basePage, page2) {
 
 // ── reviews ───────────────────────────────────────────────────────────────────
 
-function unixToDate(ts) {
-  if (!ts) return null;
-  const d = new Date(ts * 1000);
-  if (isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10);
+function unixToDate(value) {
+  const seconds =
+    typeof value === "number" && Number.isFinite(value)
+      ? value
+      : typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())
+        ? Number(value)
+        : null;
+  if (seconds === null || seconds < 0) return null;
+  const date = new Date(seconds * 1000);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+}
+
+function authorName(author) {
+  if (!isRecord(author)) return null;
+  const fullName = [text(author.firstName), text(author.lastName)].filter(Boolean).join(" ");
+  return text(author.title) ?? (fullName || null);
 }
 
 export function parseReviews(page, limit = 10) {
-  const w = widget(page, "webListReviews");
-  const raw = w?.reviews || w?.items || [];
+  const state = widget(page, "webListReviews");
+  const raw = Array.isArray(state?.reviews) ? state.reviews : asArray(state?.items);
   const { rating, reviews: total } = parseProductScore(page);
-
-  const reviews = raw.slice(0, limit).map((r) => {
-    const c = r.content || {};
-    const author =
-      r.author?.title ||
-      [r.author?.firstName, r.author?.lastName].filter(Boolean).join(" ") ||
-      (r.isAnonymous ? "Аноним" : null);
-    return {
-      author: author || null,
-      score: typeof c.score === "number" ? c.score : null,
-      comment: c.comment || "",
-      pros: c.positive || "",
-      cons: c.negative || "",
-      date: unixToDate(r.publishedAt || r.createdAt),
-      useful: r.usefulness?.useful ?? null,
-      purchased: r.isItemPurchased ?? null,
-      hasPhotos: Array.isArray(c.photos) && c.photos.length > 0,
-    };
-  });
+  const reviews = raw
+    .filter(isRecord)
+    .slice(0, normalizedLimit(limit, 10))
+    .map((review) => {
+      const content = isRecord(review.content) ? review.content : null;
+      const author = authorName(review.author) ?? (review.isAnonymous === true ? "Аноним" : null);
+      return {
+        author,
+        score: ratingFromValue(content?.score),
+        comment: optionalString(content, "comment"),
+        pros: optionalString(content, "positive"),
+        cons: optionalString(content, "negative"),
+        date: unixToDate(review.publishedAt ?? review.createdAt),
+        useful: countFromValue(review.usefulness?.useful),
+        purchased: booleanOrNull(review.isItemPurchased),
+        hasPhotos: Array.isArray(content?.photos) ? content.photos.length > 0 : null,
+      };
+    });
 
   return { rating, totalReviews: total, count: reviews.length, reviews };
 }

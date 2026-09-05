@@ -8,38 +8,15 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { search, details, reviews } from "./ozon.js";
 import { shutdown } from "./browser.js";
+import { createToolRunner } from "./tool-runner.js";
 
 const log = (...a) => console.error("[ozon-mcp]", ...a);
-const TOOL_TIMEOUT_MS = 55000;
-const MAX_TEXT = 60000;
-
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
-    ),
-  ]);
-}
-
+const runTool = createToolRunner();
 function tool(label, fn) {
-  return async (args) => {
-    try {
-      const result = await withTimeout(fn(args), TOOL_TIMEOUT_MS, label);
-      let text = JSON.stringify(result, null, 2);
-      if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT) + "\n…(truncated)";
-      return { content: [{ type: "text", text }] };
-    } catch (err) {
-      log(`${label} error:`, err?.message);
-      return {
-        content: [{ type: "text", text: `Error: ${err?.message || String(err)}` }],
-        isError: true,
-      };
-    }
-  };
+  return (args, extra) => runTool(label, signal => fn(args, { signal }), { signal: extra?.signal });
 }
 
-const server = new McpServer({ name: "ozon-mcp-server", version: "0.3.1" });
+const server = new McpServer({ name: "ozon-mcp-server", version: "0.3.2" });
 
 server.registerTool(
   "ozon_search",
@@ -50,7 +27,7 @@ server.registerTool(
       "price (RUB, numeric), old price, discount, rating, review count, brand, image and a clean " +
       "product URL.",
     inputSchema: {
-      query: z.string().min(1).describe('Search query, e.g. "iphone 15", "плед 150х200"'),
+      query: z.string().trim().min(1).max(2000).describe('Search query, e.g. "iphone 15", "плед 150х200"'),
       sort: z
         .enum(["popular", "price", "price_desc", "rating", "new", "discount"])
         .default("popular")
@@ -102,22 +79,34 @@ server.registerTool(
 );
 
 let cleaning = false;
-async function cleanup() {
+async function cleanup(exitCode = 0) {
   if (cleaning) return;
   cleaning = true;
   log("shutting down…");
+  const deadline = setTimeout(() => process.exit(1), 5000);
+  deadline.unref();
   await shutdown().catch(() => {});
-  process.exit(0);
+  clearTimeout(deadline);
+  process.exit(exitCode);
 }
-process.on("SIGINT", cleanup);
-process.on("SIGTERM", cleanup);
+process.on("SIGINT", () => cleanup());
+process.on("SIGTERM", () => cleanup());
 process.on("uncaughtException", (e) => {
-  log("uncaughtException:", e);
-  cleanup();
+  log("uncaughtException:", e?.name || "Error");
+  cleanup(1);
 });
-process.on("unhandledRejection", (r) => log("unhandledRejection:", r));
+process.on("unhandledRejection", () => {
+  log("unhandledRejection — stopping server");
+  cleanup(1);
+});
+process.stdin.on("end", () => cleanup());
 
 const transport = new StdioServerTransport();
-transport.onclose = cleanup;
-await server.connect(transport);
-log("ready on stdio (fork: headless=false, полный chromium, sequential details)");
+transport.onclose = () => cleanup();
+try {
+  await server.connect(transport);
+  log("ready on stdio");
+} catch {
+  log("MCP startup failed");
+  await cleanup(1);
+}
