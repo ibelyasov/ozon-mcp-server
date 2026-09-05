@@ -2,92 +2,80 @@
 
 [Русский](README.md)
 
-Search Ozon products, compare prices and specifications, and read customer reviews from your AI assistant. A local, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for shopping research on **Ozon.ru**.
+A local, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server that gives an AI assistant three tools for searching **Ozon.ru**, reading product details and reading reviews. Version 0.4.0 is written in Rust with `rmcp` and native `agent-browser` 0.36.0. The server and driver do not require Node.js.
 
-The browser runs in the background by default. A persistent local profile keeps your session and region between runs, and structured results include warnings when part of a product page could not be retrieved.
+The browser runs without a window by default. A local profile keeps cookies and the selected region between runs; the server cannot place orders or modify a cart, and it needs neither an Ozon Seller API key nor a paid scraping service.
 
-## What you can do
+> **Current 0.4.0 status (September 5, 2026):** the release Rust build passed a live headless run on macOS. MCP started with all three tools: search returned two products in 19.82 seconds; details returned a price of 6,859 RUB and a 4.9 rating for SKU `947750106` in 3.86 seconds; reviews returned two entries out of 2,618 in 1.90 seconds. A subsequent description check confirmed two images without separate description text. The full stdio session exited successfully in 25.78 seconds. Earlier HTTP 403 responses and a transient driver error remain historical limitations: this successful run does not guarantee future Ozon availability.
 
-- **Find products** by keyword, price range and sort order.
-- **Inspect a product** by URL or SKU: prices, availability, seller, rating, images, specifications and description, where available.
-- **Read reviews** with ratings, text, dates and available purchase/photo indicators.
+## Capabilities
 
-For example, ask your assistant:
+- `ozon_search` finds up to 36 products by query, price range and sort order.
+- `ozon_product_details` reads available prices, seller, rating, images, specifications and description by URL, SKU or slug.
+- `ozon_product_reviews` reads up to 30 available reviews.
 
-> Find wireless mice on Ozon under 4,000 ₽. Compare their specifications and summarize the reviews for the two most relevant options.
+Each successful call returns the same valid JSON as MCP `structuredContent` and text content. Unknown values remain `null`, and missing expected widgets produce warnings. Prices and availability depend on region, session and payment conditions.
 
-The server supplies the data; your assistant handles the comparison. It exposes three read-only tools and does not place orders or modify your cart. No Ozon Seller API key or paid scraping service is required.
+## Install 0.4.0
 
-## Designed for everyday use
-
-- **No browser window during normal use.** Full Chromium runs in new headless mode. A visible window is an explicit option for signing in, never an automatic fallback.
-- **A session that stays local.** Cookies and the selected region live in your browser profile; there is no hosted scraping backend.
-- **Partial data is visible.** Missing values remain `null` where appropriate. Description and page-loading problems produce warnings rather than silently appearing complete. If the internal API is blocked, the server reads public product widgets embedded in the regular Ozon page.
-- **Bounded requests.** Tools run sequentially, honour cancellation and timeouts, and return valid JSON or an explicit error.
-- **Offline regression coverage.** Parser and browser-lifecycle tests use synthetic responses and a mock browser.
-
-Ozon can still block requests or change its internal API. Version 0.3.3 was live-tested in headless mode on macOS with two separate profiles: search, product details including descriptions, and reviews. See [compatibility and known limitations](docs/behavior.md).
-
-## Install
-
-Requires **Node.js 20+** and Playwright's Chromium. A desktop session is only needed for optional manual sign-in.
+You need Rust 1.88+ and **exactly** `agent-browser` 0.36.0. The server rejects any other driver version at startup.
 
 ```sh
 git clone https://github.com/ibelyasov/ozon-mcp-server.git
 cd ozon-mcp-server
-npm ci
-npx playwright install chromium
+cargo build --release --locked
 ```
 
-Add the following to an MCP client that supports **stdio**, replacing the absolute paths with your own. Clients with a different configuration format can use the same command, arguments and environment variables.
+Install the native `agent-browser` 0.36.0 binary from its [official release page](https://github.com/vercel-labs/agent-browser/releases/tag/v0.36.0), or build it with Cargo:
+
+```sh
+cargo install agent-browser --version 0.36.0 --locked
+```
+
+Then install agent-browser's managed Chrome separately:
+
+```sh
+agent-browser install
+```
+
+To use an existing full Chrome installation instead, set `OZON_BROWSER_EXECUTABLE` to its existing executable.
+
+## Configure an MCP client
+
+Use the absolute path to the built stdio server. An absolute path to the pinned driver is recommended, especially when the MCP client starts with a restricted `PATH`.
 
 ```json
 {
   "mcpServers": {
     "ozon": {
-      "command": "node",
-      "args": ["/absolute/path/ozon-mcp-server/src/index.js"],
+      "command": "/absolute/path/ozon-mcp-server/target/release/ozon-mcp-server",
       "env": {
-        "OZON_HEADLESS": "true",
-        "OZON_USER_DATA_DIR": "/absolute/path/ozon-browser-profile"
+        "OZON_AGENT_BROWSER_BIN": "/absolute/path/to/agent-browser",
+        "OZON_HEADLESS": "true"
       }
     }
   }
 }
 ```
 
-If your client cannot find `node`, use its absolute executable path. Restart or reconnect the MCP after changing its configuration.
+The default profile is `~/.ozon-mcp-rust-profile`. Restart or reconnect the MCP after changing its configuration.
 
-### Optional sign-in
+### Visible manual session
 
-1. Set `OZON_HEADLESS=false`, reconnect the MCP and make a tool request to open Chromium.
-2. Sign in and check your region in that window.
-3. Stop the MCP, set `OZON_HEADLESS=true`, and reconnect using the same profile path.
+For manual sign-in or reliable region selection, set `OZON_HEADLESS=false`, reconnect the MCP, and call a tool. Check the account and region in the opened window, then stop the MCP and restore `OZON_HEADLESS=true` while keeping the same profile. Visible mode is never enabled automatically.
 
-Keep the profile outside the repository. It contains your session; do not publish it or share it between simultaneous MCP processes. Whether Ozon accepts that session in headless mode still depends on its current checks.
+`OZON_CITY` attempts to select a city through Ozon's interface. If it cannot apply the requested city, the request fails with `REGION_SELECTION_FAILED`; the server does not present the saved profile region as the requested one. Even successful selector actions do not prove which region Ozon saved, so manual verification in the persistent profile remains the reliable option.
 
-## Tools
-
-| Tool | Inputs | Result |
-|---|---|---|
-| `ozon_search` | `query`; optional `sort`, `priceMin`, `priceMax`, `limit` | Up to 36 product results with prices and links |
-| `ozon_product_details` | `product`: Ozon URL, SKU or product slug ending in a SKU | Product details and available description |
-| `ozon_product_reviews` | `product`; optional `limit` | Up to 30 reviews per call |
-
-Search sort values: `popular`, `price`, `price_desc`, `rating`, `new`, `discount`. Prices are in RUB; the selected region, account and payment conditions can affect them.
-
-[Configuration, warnings and resource limits →](docs/behavior.md)
+Keep the profile outside the repository because it may contain an account session. Only one MCP process may own a profile at a time.
 
 ## Development
 
 ```sh
-npm test
+cargo test --locked
 ```
 
-Tests run locally without opening Chromium, contacting Ozon or reading an account profile. They cover parsing, input validation, cancellation, retries and context cleanup; they do not establish live marketplace availability.
+The Rust target has nine ordinary offline tests for parsing, input validation, output bounds and fallback routing; all nine passed. A separate ignored-by-default real-Chromium test cancels endless JavaScript, closes the private browser and successfully restarts it; it passed in 8.00 seconds. Neither test path depends on Ozon or establishes marketplace availability. See [configuration and behavior](docs/behavior.md) for the opt-in command, isolation and resource limits.
 
 ## Credits and license
 
-Based on [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server) and the original [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server). This fork continues that work with background operation, parser corrections and request-lifecycle tests. Upstream Git history and author attribution are retained.
-
-MIT is declared in the upstream project metadata. This project is unofficial and is not affiliated with Ozon.
+Based on [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server) and the original [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server). Git history and author attribution are retained. MIT is declared in the upstream project metadata. This project is unofficial and is not affiliated with Ozon.

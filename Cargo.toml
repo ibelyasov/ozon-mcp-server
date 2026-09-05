@@ -1,0 +1,28 @@
+[package]
+name = "ozon-mcp-server"
+version = "0.4.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local read-only Ozon MCP server using agent-browser"
+license = "MIT"
+
+[[bin]]
+name = "ozon-mcp-server"
+path = "rust/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+fs2 = "0.4"
+futures-util = { version = "0.3", features = ["sink"] }
+percent-encoding = "2"
+regex = "1"
+rmcp = { version = "3.2", features = ["server", "transport-io"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "signal", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = "0.28"
+url = "2"
