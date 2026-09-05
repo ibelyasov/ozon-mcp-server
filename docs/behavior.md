@@ -1,6 +1,6 @@
 # Configuration and behavior
 
-[English overview](../README.md) · [Обзор на русском](../README.ru.md)
+[Обзор на русском](../README.md) · [English overview](../README.en.md)
 
 ## Browser settings
 

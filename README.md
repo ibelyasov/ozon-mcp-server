@@ -1,36 +1,36 @@
-# Ozon MCP — product search, prices and reviews
+# Ozon MCP — поиск товаров, цены и отзывы
 
-[Русский](README.ru.md)
+[English](README.en.md)
 
-Search Ozon products, compare prices and specifications, and read customer reviews from your AI assistant. A local, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server for shopping research on **Ozon.ru**.
+Ищите товары на Ozon, сравнивайте цены и характеристики, читайте отзывы через ИИ-ассистента. Локальный сервер [Model Context Protocol](https://modelcontextprotocol.io/) для выбора покупок на **Ozon.ru**, с инструментами только для чтения.
 
-The browser runs in the background by default. A persistent local profile keeps your session and region between runs, and structured results include warnings when part of a product page could not be retrieved.
+По умолчанию браузер работает в фоне без окна. Постоянный локальный профиль сохраняет сессию и регион между запусками, а результаты содержат предупреждения, если часть карточки не удалось загрузить.
 
-## What you can do
+## Что можно делать
 
-- **Find products** by keyword, price range and sort order.
-- **Inspect a product** by URL or SKU: prices, availability, seller, rating, images, specifications and description, where available.
-- **Read reviews** with ratings, text, dates and available purchase/photo indicators.
+- **Искать товары** по ключевым словам, диапазону цен и сортировке.
+- **Изучать карточку** по ссылке или артикулу: цены, наличие, продавца, рейтинг, изображения, характеристики и описание — если эти данные доступны.
+- **Читать отзывы** с оценками, текстом, датами и доступными признаками покупки и фотографий.
 
-For example, ask your assistant:
+Например, попросите ассистента:
 
-> Find wireless mice on Ozon under 4,000 ₽. Compare their specifications and summarize the reviews for the two most relevant options.
+> Найди на Ozon беспроводные мыши до 4 000 ₽. Сравни характеристики и кратко разбери отзывы на два наиболее подходящих варианта.
 
-The server supplies the data; your assistant handles the comparison. It exposes three read-only tools and does not place orders or modify your cart. No Ozon Seller API key or paid scraping service is required.
+Сервер получает данные, а сравнение выполняет ассистент. Доступны три инструмента только для чтения: они не оформляют заказы и не меняют корзину. Ключ Ozon Seller API и платный сервис парсинга не нужны.
 
-## Designed for everyday use
+## Для повседневной работы
 
-- **No browser window during normal use.** Full Chromium runs in new headless mode. A visible window is an explicit option for signing in, never an automatic fallback.
-- **A session that stays local.** Cookies and the selected region live in your browser profile; there is no hosted scraping backend.
-- **Partial data is visible.** Missing values remain `null` where appropriate. Description and page-loading problems produce warnings rather than silently appearing complete.
-- **Bounded requests.** Tools run sequentially, honour cancellation and timeouts, and return valid JSON or an explicit error.
-- **Offline regression coverage.** Parser and browser-lifecycle tests use synthetic responses and a mock browser.
+- **Без окна браузера при обычном использовании.** Полный Chromium работает в режиме new headless. Видимое окно включается явно для входа в аккаунт; автоматически при ошибках оно не открывается.
+- **Локальная сессия.** Cookies и выбранный регион хранятся в профиле браузера; промежуточного облачного сервиса парсинга нет.
+- **Видно, когда данные неполные.** Неизвестные значения, где предусмотрено, возвращаются как `null`. Проблемы загрузки описания и товарных блоков отмечаются предупреждениями.
+- **Ограниченные по времени запросы.** Инструменты работают последовательно, учитывают отмену и таймауты, возвращают корректный JSON либо явную ошибку.
+- **Проверки без аккаунта.** Регрессионные тесты парсеров и жизненного цикла браузера используют синтетические данные и заглушки.
 
-Ozon can still block requests or change its internal API. **Live Ozon access in the default headless mode has not yet been verified.** See [compatibility and known limitations](docs/behavior.md).
+Ozon может блокировать запросы или менять внутренний API. **Живой доступ к Ozon в фоновом режиме по умолчанию пока не проверен.** Подробнее — в [совместимости и ограничениях](docs/behavior.md).
 
-## Install
+## Установка
 
-Requires **Node.js 20+** and Playwright's Chromium. A desktop session is only needed for optional manual sign-in.
+Нужны **Node.js 20+** и Chromium от Playwright. Графическая сессия требуется только для необязательного ручного входа.
 
 ```sh
 git clone https://github.com/ibelyasov/ozon-mcp-server.git
@@ -39,7 +39,7 @@ npm ci
 npx playwright install chromium
 ```
 
-Add the following to an MCP client that supports **stdio**, replacing the absolute paths with your own. Clients with a different configuration format can use the same command, arguments and environment variables.
+Добавьте настройку в MCP-клиент с поддержкой **stdio**, заменив абсолютные пути своими. Если клиент использует другой формат конфигурации, команда, аргументы и переменные окружения остаются теми же.
 
 ```json
 {
@@ -56,38 +56,38 @@ Add the following to an MCP client that supports **stdio**, replacing the absolu
 }
 ```
 
-If your client cannot find `node`, use its absolute executable path. Restart or reconnect the MCP after changing its configuration.
+Если клиент не находит `node`, укажите абсолютный путь к исполняемому файлу. После изменения настройки перезапустите или переподключите MCP.
 
-### Optional sign-in
+### Вход в аккаунт, если нужен
 
-1. Set `OZON_HEADLESS=false`, reconnect the MCP and make a tool request to open Chromium.
-2. Sign in and check your region in that window.
-3. Stop the MCP, set `OZON_HEADLESS=true`, and reconnect using the same profile path.
+1. Задайте `OZON_HEADLESS=false`, переподключите MCP и выполните запрос инструмента, чтобы открыть Chromium.
+2. Войдите в аккаунт и проверьте регион в открытом окне.
+3. Остановите MCP, верните `OZON_HEADLESS=true` и переподключитесь с тем же путём профиля.
 
-Keep the profile outside the repository. It contains your session; do not publish it or share it between simultaneous MCP processes. Whether Ozon accepts that session in headless mode still depends on its current checks.
+Храните профиль вне репозитория. Он содержит сессию аккаунта: не публикуйте его и не используйте одновременно в нескольких процессах MCP. Принимает ли Ozon эту сессию в headless, зависит от его текущих проверок.
 
-## Tools
+## Инструменты
 
-| Tool | Inputs | Result |
+| Инструмент | Параметры | Результат |
 |---|---|---|
-| `ozon_search` | `query`; optional `sort`, `priceMin`, `priceMax`, `limit` | Up to 36 product results with prices and links |
-| `ozon_product_details` | `product`: Ozon URL, SKU or product slug ending in a SKU | Product details and available description |
-| `ozon_product_reviews` | `product`; optional `limit` | Up to 30 reviews per call |
+| `ozon_search` | `query`; необязательно `sort`, `priceMin`, `priceMax`, `limit` | До 36 товаров с ценами и ссылками |
+| `ozon_product_details` | `product`: ссылка Ozon, SKU или slug с артикулом в конце | Карточка и доступное описание |
+| `ozon_product_reviews` | `product`; необязательно `limit` | До 30 отзывов за вызов |
 
-Search sort values: `popular`, `price`, `price_desc`, `rating`, `new`, `discount`. Prices are in RUB; the selected region, account and payment conditions can affect them.
+Сортировки: `popular`, `price`, `price_desc`, `rating`, `new`, `discount`. Цены в рублях; на них могут влиять регион, аккаунт и условия оплаты.
 
-[Configuration, warnings and resource limits →](docs/behavior.md)
+[Настройки, предупреждения и ограничения ресурсов →](docs/behavior.md)
 
-## Development
+## Разработка
 
 ```sh
 npm test
 ```
 
-Tests run locally without opening Chromium, contacting Ozon or reading an account profile. They cover parsing, input validation, cancellation, retries and context cleanup; they do not establish live marketplace availability.
+Тесты не открывают Chromium, не обращаются к Ozon и не читают профиль аккаунта. Они проверяют парсинг, входные данные, отмену, повторы запросов и закрытие сессий; доступность маркетплейса в реальном времени они не подтверждают.
 
-## Credits and license
+## Авторы и лицензия
 
-Based on [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server) and the original [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server). This fork continues that work with background operation, parser corrections and request-lifecycle tests. Upstream Git history and author attribution are retained.
+Проект основан на [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server) и оригинальном [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server). Этот форк продолжает их работу: фоновый запуск, исправления парсеров и тесты жизненного цикла запросов. История Git и указание авторства сохранены.
 
-MIT is declared in the upstream project metadata. This project is unofficial and is not affiliated with Ozon.
+В метаданных исходных проектов указана MIT. Проект неофициальный и не связан с Ozon.
