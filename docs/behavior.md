@@ -15,7 +15,7 @@ The browser starts on the first request and closes after ten minutes without act
 
 ## Results and warnings
 
-The server reads Ozon's internal `composer-api`. It can only return fields present in the received response. Brand parsing requires explicit evidence; an unknown brand is `null`. Unknown purchase/photo indicators are also nullable, so missing evidence is not reported as `false`.
+The server first reads Ozon's internal `composer-api`. On HTTP 403/307 it navigates to the requested Ozon page and extracts an allowlist of embedded public product widgets. Navigation errors or redirects to a different product/page remain errors; profile, address and order widgets are excluded. It can only return fields present in the received response. Brand parsing requires explicit evidence; an unknown brand is `null`. Unknown purchase/photo indicators are also nullable, so missing evidence is not reported as `false`.
 
 | Warning/error | Meaning |
 |---|---|
@@ -26,7 +26,7 @@ The server reads Ozon's internal `composer-api`. It can only return fields prese
 | `REVIEWS_WIDGET_MISSING` | The expected reviews block is absent. |
 | `RESULT_TOO_LARGE` | The tool result exceeds the output limit; no truncated JSON is returned. |
 
-HTTP errors and challenge failures are reported as tool errors. No automatic visible browser is opened to resolve them.
+Unrecovered HTTP errors and challenge failures are reported as tool errors. No automatic visible browser is opened to resolve them.
 
 ## Resource limits
 
@@ -43,6 +43,7 @@ As of 2026-09-05:
 
 - **Version 0.3.1, headed mode:** MCP startup, product search, two product pages and review retrieval were exercised on macOS Apple Silicon. Description requests were intermittently blocked; a captured response confirmed successful description parsing.
 - **Version 0.3.2, default headless mode:** reviewed statically and covered by 31 passing offline tests with synthetic responses and a mock browser. No live Ozon or Chromium test was performed for this mode.
+- **Version 0.3.3, default headless mode:** live search, product details with descriptions, and reviews succeeded with two separate macOS profiles. Chromium keeps its native OS/version user agent with only the `HeadlessChrome` token normalized to `Chrome`; the page fallback recovered blocked composer requests. 36 offline tests cover lifecycle, parsers, fallback privacy, size limits and invalid redirects.
 - Windows and Linux compatibility has not been verified for this fork.
 
 These checks do not establish uninterrupted access, completeness across all product categories, or acceptance of a signed-in session in headless mode. Ozon may change its response format or anti-bot checks. Prices and availability can vary by region, session and payment conditions; consult the product page before buying.

@@ -19,6 +19,46 @@ const DEFAULT_LAUNCH_ARGS = [
   "--disable-background-networking",
 ];
 
+// Only public product widgets; never export profile/address/order widgets.
+const PRODUCT_WIDGETS = ["tileGridDesktop", "webShortCharacteristics",
+  "webSingleProductScore", "webReviewProductScore", "webCurrentSeller",
+  "webDescription", "webIconWithText", "webProductHeading", "webPrice",
+  "webGallery", "webListReviews"];
+
+export function isRequestedPage(requested, actual) {
+  const target = new URL(requested), final = new URL(actual);
+  if (target.origin !== final.origin) return false;
+  if (target.pathname === "/search/") {
+    // Ozon predicts a category for some searches while retaining the query.
+    const searchRoute = final.pathname === target.pathname ||
+      (/^\/category\/[^/]+\/$/.test(final.pathname) && final.searchParams.get("category_was_predicted") === "true");
+    return searchRoute && ["text", "sorting", "currency_price"]
+      .every(key => !target.searchParams.has(key) || target.searchParams.get(key) === final.searchParams.get(key));
+  }
+  const product = url => url.pathname.match(/^\/product\/(?:[^/]*-)?(\d+)\/(reviews\/)?$/);
+  const a = product(target), b = product(final);
+  if (a && b) return a[1] === b[1] && a[2] === b[2];
+  return target.pathname === final.pathname;
+}
+
+export function pageWidgetResponse({ widgetNames, maxBytes }) {
+  const allowed = new Set(widgetNames);
+  const widgetStates = Object.create(null);
+  let bytes = 0;
+  for (const element of document.querySelectorAll('[id^="state-"][data-state]')) {
+    const key = element.id.slice(6);
+    if (!allowed.has(key.split("-")[0])) continue;
+    const value = element.getAttribute("data-state");
+    bytes += new TextEncoder().encode(value).byteLength;
+    if (bytes > maxBytes) return { status: 200, tooLarge: true };
+    widgetStates[key] = value;
+  }
+  if (!Object.keys(widgetStates).length) return null;
+  const text = JSON.stringify({ widgetStates });
+  if (new TextEncoder().encode(text).byteLength > maxBytes) return { status: 200, tooLarge: true };
+  return { status: 200, text };
+}
+
 const noop = () => {};
 
 function abortReason(signal) {
@@ -313,6 +353,19 @@ export class BrowserRuntime {
       throw new Error("Browser session closed during startup");
     }
 
+    // Read the installed browser's UA rather than pinning an outdated version.
+    // Full headless Chromium otherwise advertises HeadlessChrome to Ozon.
+    if (this.headless) {
+      // Keep the CDP session attached for the context lifetime: detaching it
+      // immediately restores Chromium's default HeadlessChrome user agent.
+      const session = await context.newCDPSession(ticket.page);
+      const { userAgent } = await session.send("Browser.getVersion");
+      await session.send("Network.setUserAgentOverride", {
+        userAgent: userAgent.replace("HeadlessChrome/", "Chrome/"),
+        acceptLanguage: "ru-RU,ru;q=0.9",
+      });
+    }
+
     await ticket.page.goto(this.homeUrl, {
       waitUntil: "domcontentloaded",
       timeout: this.navigationTimeoutMs,
@@ -366,7 +419,7 @@ export class BrowserRuntime {
     if (!isUsable(ticket)) throw new Error("Browser session is not available");
     throwIfAborted(signal);
     const url = this.apiUrl + encodeURIComponent(path);
-    return this._withAbort(
+    const response = await this._withAbort(
       ticket.page.evaluate(
         boundedPageFetch,
         { requestUrl: url, timeoutMs: this.fetchTimeoutMs, maxBytes: this.maxResponseBytes }
@@ -374,6 +427,28 @@ export class BrowserRuntime {
       signal,
       () => this._closeTicket(ticket)
     );
+    if (response.status !== 403 && response.status !== 307) return response;
+
+    // Ozon may reject composer requests while serving the normal product page.
+    // Reuse its embedded public widgets, keeping the existing parser contract.
+    const target = new URL(path, this.homeUrl);
+    if (target.origin !== new URL(this.homeUrl).origin) throw new Error("Invalid Ozon page origin");
+    return this._withAbort((async () => {
+      const navigation = await ticket.page.goto(target.href, {
+        waitUntil: "domcontentloaded", timeout: this.navigationTimeoutMs,
+      });
+      if (navigation && navigation.status() >= 400) {
+        return { status: navigation.status(), text: "" };
+      }
+      await ticket.page.waitForTimeout(1500);
+      if (!isRequestedPage(target.href, ticket.page.url())) {
+        throw new Error("Ozon redirected to a different page; requested data is unavailable");
+      }
+      const extracted = await ticket.page.evaluate(pageWidgetResponse, {
+        widgetNames: PRODUCT_WIDGETS, maxBytes: this.maxResponseBytes,
+      });
+      return extracted || response;
+    })(), signal, () => this._closeTicket(ticket));
   }
 
   _withAbort(promise, signal, onAbort) {

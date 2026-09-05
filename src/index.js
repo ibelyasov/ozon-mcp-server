@@ -16,7 +16,7 @@ function tool(label, fn) {
   return (args, extra) => runTool(label, signal => fn(args, { signal }), { signal: extra?.signal });
 }
 
-const server = new McpServer({ name: "ozon-mcp-server", version: "0.3.2" });
+const server = new McpServer({ name: "ozon-mcp-server", version: "0.3.3" });
 
 server.registerTool(
   "ozon_search",

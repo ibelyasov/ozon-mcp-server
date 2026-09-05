@@ -22,11 +22,11 @@ The server supplies the data; your assistant handles the comparison. It exposes 
 
 - **No browser window during normal use.** Full Chromium runs in new headless mode. A visible window is an explicit option for signing in, never an automatic fallback.
 - **A session that stays local.** Cookies and the selected region live in your browser profile; there is no hosted scraping backend.
-- **Partial data is visible.** Missing values remain `null` where appropriate. Description and page-loading problems produce warnings rather than silently appearing complete.
+- **Partial data is visible.** Missing values remain `null` where appropriate. Description and page-loading problems produce warnings rather than silently appearing complete. If the internal API is blocked, the server reads public product widgets embedded in the regular Ozon page.
 - **Bounded requests.** Tools run sequentially, honour cancellation and timeouts, and return valid JSON or an explicit error.
 - **Offline regression coverage.** Parser and browser-lifecycle tests use synthetic responses and a mock browser.
 
-Ozon can still block requests or change its internal API. **Live Ozon access in the default headless mode has not yet been verified.** See [compatibility and known limitations](docs/behavior.md).
+Ozon can still block requests or change its internal API. Version 0.3.3 was live-tested in headless mode on macOS with two separate profiles: search, product details including descriptions, and reviews. See [compatibility and known limitations](docs/behavior.md).
 
 ## Install
 

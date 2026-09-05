@@ -5,6 +5,8 @@ import {
   BrowserRuntime,
   COMPOSER_API_URL,
   boundedPageFetch,
+  pageWidgetResponse,
+  isRequestedPage,
   browserOptionsFromEnvironment,
 } from "../src/browser-runtime.js";
 
@@ -26,10 +28,13 @@ function makePage(results = []) {
   const evaluateStarted = deferred();
   const page = {
     evaluateCalls: [],
-    async goto() {},
+    currentUrl: "https://www.ozon.ru/",
+    async goto(url) { this.currentUrl = url; },
+    url() { return this.currentUrl; },
     async waitForTimeout() {},
     async title() { return "Ozon"; },
     evaluate(_fn, args) {
+      if (args?.widgetNames) return Promise.resolve(null);
       this.evaluateCalls.push(args);
       evaluateStarted.resolve();
       const result = results.shift();
@@ -51,6 +56,17 @@ function makeContext(page) {
   };
   return {
     closeCalls: 0,
+    cdpCalls: [],
+    cdpDetached: false,
+    async newCDPSession() {
+      return {
+        send: async (method, args) => {
+          this.cdpCalls.push({ method, args });
+          return { userAgent: "Mozilla/5.0 HeadlessChrome/148.0.0.0 Safari/537.36" };
+        },
+        detach: async () => { this.cdpDetached = true; },
+      };
+    },
     browser: () => browser,
     newPage: async () => page,
     async close() {
@@ -119,6 +135,14 @@ test("uses one persistent full-Chromium context and sends a bounded same-origin 
   assert.equal(launchOptions.channel, "chromium");
   assert.equal(launchOptions.chromiumSandbox, true);
   assert.equal(launchOptions.headless, true);
+  assert.deepEqual(context.cdpCalls, [
+    { method: "Browser.getVersion", args: undefined },
+    { method: "Network.setUserAgentOverride", args: {
+      userAgent: "Mozilla/5.0 Chrome/148.0.0.0 Safari/537.36",
+      acceptLanguage: "ru-RU,ru;q=0.9",
+    } },
+  ]);
+  assert.equal(context.cdpDetached, false);
   assert.ok(!launchOptions.args.includes("--no-sandbox"));
   assert.ok(!launchOptions.args.includes("--disable-setuid-sandbox"));
   assert.deepEqual(page.evaluateCalls[0], {
@@ -297,4 +321,68 @@ test("page-side fetch rejects a streamed body that crosses the byte limit", asyn
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+
+test("page fallback exports only public widgets and enforces its byte limit", () => {
+  const previous = globalThis.document;
+  globalThis.document = { querySelectorAll: () => [
+    { id: "state-addressBookBarWeb-1", getAttribute: () => '{"private":"address"}' },
+    { id: "state-tileGridDesktop-2", getAttribute: () => '{"items":[]}' },
+  ] };
+  try {
+    const args = { widgetNames: ["tileGridDesktop"], maxBytes: 1024 };
+    const result = pageWidgetResponse(args);
+    assert.deepEqual(JSON.parse(result.text), { widgetStates: { "tileGridDesktop-2": '{"items":[]}' } });
+    assert.equal(pageWidgetResponse({ ...args, maxBytes: 5 }).tooLarge, true);
+  } finally { globalThis.document = previous; }
+});
+
+test("composer 403 falls back to the requested page without relaunching", async () => {
+  const { page } = makePage([{ status: 403, text: "blocked" }]);
+  const evaluate = page.evaluate.bind(page);
+  const destinations = [];
+  page.goto = async url => { destinations.push(url); page.currentUrl = url; };
+  page.evaluate = (fn, args) => args?.widgetNames
+    ? Promise.resolve({ status: 200, text: '{"widgetStates":{"tileGridDesktop-1":"{}"}}' })
+    : evaluate(fn, args);
+  const context = makeContext(page);
+  const { runtime, launches } = makeRuntime([context]);
+  try {
+    const result = await runtime.fetchJson("/search/?text=lamp");
+    assert.ok(result.widgetStates["tileGridDesktop-1"]);
+    assert.equal(launches.length, 1);
+    assert.equal(destinations.at(-1), "https://www.ozon.ru/search/?text=lamp");
+  } finally { await runtime.shutdown(); }
+});
+
+test("headed mode leaves the browser's native user agent unchanged", async () => {
+  const { page } = makePage([{ status: 200, text: '{}' }]);
+  const context = makeContext(page);
+  const { runtime } = makeRuntime([context], { headless: false });
+  try {
+    await runtime.fetchJson("/search/?text=lamp");
+    assert.deepEqual(context.cdpCalls, []);
+  } finally { await runtime.shutdown(); }
+});
+
+
+test("page fallback rejects redirects to recommendations or another product", () => {
+  const origin = "https://www.ozon.ru";
+  assert.equal(isRequestedPage(origin + "/search/?text=mouse", origin + "/"), false);
+  assert.equal(isRequestedPage(origin + "/search/?text=mouse", origin + "/category/mice-123/?category_was_predicted=true&text=mouse"), true);
+  assert.equal(isRequestedPage(origin + "/search/?text=mouse", origin + "/category/mice-123/?category_was_predicted=true&text=lamp"), false);
+  assert.equal(isRequestedPage(origin + "/search/?text=mouse", origin + "/search/?text=lamp"), false);
+  assert.equal(isRequestedPage(origin + "/product/123/", origin + "/product/mouse-123/"), true);
+  assert.equal(isRequestedPage(origin + "/product/123/reviews/", origin + "/product/mouse-123/"), false);
+  assert.equal(isRequestedPage(origin + "/product/123/", origin + "/product/124/"), false);
+});
+
+test("page fallback cannot turn a 404 with widgets into a success", async () => {
+  const { page } = makePage([{ status: 403, text: "blocked" }]);
+  page.goto = async url => { page.currentUrl = url; return { status: () => url.includes("search") ? 404 : 200 }; };
+  const context = makeContext(page);
+  const { runtime } = makeRuntime([context]);
+  try { await assert.rejects(runtime.fetchJson("/search/?text=lamp", { retries: 0 }), /HTTP 404/); }
+  finally { await runtime.shutdown(); }
 });
