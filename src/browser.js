@@ -7,7 +7,7 @@
 //   1) headless: false — открывается ВИДИМОЕ окно полного chromium. Variti
 //      палит chrome-headless-shell (lite-сборку без UI), а полный chromium
 //      с настоящим рендерингом проходит challenge.
-//   2) Windows UA вместо Linux — соответствует реальной системе (Lenovo).
+//   2) Native Chromium user agent for the running OS (including macOS).
 //   3) launchPersistentContext: cookies/storage/userData живут между
 //      запусками в OZON_USER_DATA_DIR (по умолчанию ~/.ozon-mcp-userdata).
 //      Один раз выбрал свой город — навсегда.
@@ -45,10 +45,7 @@ const LAUNCH_ARGS = [
     : []),
 ];
 
-const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
-
+// Local macOS adaptation: use Chromium native user agent.
 const log = (...a) => console.error("[browser]", ...a);
 
 // persistent context — браузер и контекст объединены в один объект; browser
@@ -74,7 +71,6 @@ async function launch() {
     headless: false,
     args: LAUNCH_ARGS,
     viewport: { width: 1920, height: 1080 },
-    userAgent: USER_AGENT,
     locale: "ru-RU",
   });
   context.browser()?.on("disconnected", () => {

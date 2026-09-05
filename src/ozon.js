@@ -43,6 +43,7 @@ export async function details({ product }) {
   // Стоит дополнительной секунды, зато всегда возвращает данные.
   const basePage = await fetchJson(path);
   let page2 = null;
+  let descriptionFetchFailed = false;
   const page2Url = `${path}?layout_container=pdpPage2column&layout_page_index=2`;
   try {
     page2 = await fetchJson(page2Url);
@@ -51,8 +52,12 @@ export async function details({ product }) {
     // 403/307 с shutdown'ом сессии; если и второй раз не пришло — отдадим
     // карточку без описания, чтобы не валить весь details.
     page2 = null;
+    descriptionFetchFailed = true;
   }
-  return parseDetails(basePage, page2);
+  const result = parseDetails(basePage, page2);
+  if (descriptionFetchFailed) result.warnings = ["DESCRIPTION_FETCH_FAILED"];
+  else if (!result.description.text && !result.description.images.length) result.warnings = ["DESCRIPTION_EMPTY"];
+  return result;
 }
 
 export async function reviews({ product, limit = 10 }) {

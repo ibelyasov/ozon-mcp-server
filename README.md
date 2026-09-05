@@ -1,54 +1,68 @@
-# ozon-mcp-server (форк)
+# Ozon MCP Server
 
-MCP-сервер для покупательского поиска на Ozon.ru: товары, карточки, отзывы.
+Покупательский MCP для поиска товаров, карточек и отзывов Ozon. Форк [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server), основанного на [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server).
 
-Это **форк** [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server) с четырьмя минимальными правками — для устойчивой работы с реального Windows-десктопа в 2026:
+## Изменения этого форка
 
-1. `browser.js` — `chromium.launch({ headless: false })` + полный chromium (вместо `chrome-headless-shell`). Variti в 2026 палит lite-сборку headless-shell, а полный chromium с настоящим рендерингом проходит challenge.
-2. `browser.js` — UA Windows вместо Linux. Соответствует реальной системе.
-3. `browser.js` — `chromium.launchPersistentContext()` вместо `launch + newContext`: cookies, localStorage и выбранный регион живут между запусками в `OZON_USER_DATA_DIR` (по умолчанию `~/.ozon-mcp-userdata`).
-4. `ozon.js` — `details()` запросы делает последовательно вместо `Promise.all`. Variti режет два одновременных fetch на тот же продукт как бота → стабильный HTTP 403. Также — fallback на пустое описание, если page2 всё-таки не отдалась.
+- Нативный User-Agent Chromium вместо принудительного Windows User-Agent; запуск проверен на macOS Apple Silicon.
+- Бренд определяется по блоку с явным признаком «Бренд проверен». Цена за звёзды и другие подписи больше не принимаются за бренд. Если явных данных нет, возвращается `null`.
+- Описание читается из `richAnnotation` (HTML/обычный текст) и `richAnnotationJson`. Вложенный JSON-текст не дублируется; знаки сравнения сохраняются.
+- При сбое дополнительного запроса карточка возвращается с `warnings: ["DESCRIPTION_FETCH_FAILED"]`. Если запрос успешен, но описание не извлечено — `DESCRIPTION_EMPTY`.
+- Автономные регрессионные тесты на синтетических данных, без cookies и аккаунтов.
 
 ## Установка
 
-```jsonc
-// ~/.claude.json → mcpServers
-"ozon": {
-  "type": "stdio",
-  "command": "npx",
-  "args": ["-y", "github:Pir0manT/ozon-mcp-server"],
-  "env": {
-    "OZON_CITY": "Ростов-на-Дону",
-    "OZON_HIDE_WINDOW": "1"
+Требуется Node.js 20+ и графическая сессия для Chromium.
+
+```sh
+git clone https://github.com/ibelyasov/ozon-mcp-server.git
+cd ozon-mcp-server
+npm ci
+npx playwright install chromium
+npm test
+```
+
+Пример настройки MCP по stdio (замените абсолютный путь на свой):
+
+```json
+{
+  "mcpServers": {
+    "ozon": {
+      "command": "node",
+      "args": ["/absolute/path/ozon-mcp-server/src/index.js"],
+      "env": {
+        "OZON_HIDE_WINDOW": "0",
+        "OZON_USER_DATA_DIR": "/absolute/path/ozon-browser-profile"
+      }
+    }
   }
 }
 ```
 
-Перед первым использованием выполнить:
+Профиль храните вне репозитория. При необходимости войдите в Ozon вручную в открытом окне. Профиль содержит сессию аккаунта; его нельзя публиковать или использовать одновременно в нескольких процессах MCP.
 
-```bash
-npx playwright@1.60.0 install chromium chromium-headless-shell
-```
+## Инструменты
 
-## Env-переменные
+| Инструмент | Назначение |
+|---|---|
+| `ozon_search` | Поиск по запросу, сортировке и диапазону цен |
+| `ozon_product_details` | Карточка по SKU, URL или slug |
+| `ozon_product_reviews` | Отзывы по SKU, URL или slug |
 
-| Переменная | По умолчанию | Что делает |
-|---|---|---|
-| `OZON_CITY` | (не задано) | После warmup попытается через UI выставить регион. Если у Ozon вёрстка изменилась — гасит warning, продолжает. Лучше задать вместе с persistent context. |
-| `OZON_HIDE_WINDOW` | `1` | Окно chromium запускается за пределами экрана. Если `0` — окно видно (нужно для ручного выбора региона при первом запуске). |
-| `OZON_USER_DATA_DIR` | `~/.ozon-mcp-userdata` | Куда сохранять cookies/storage между запусками. |
+## Настройки браузера
 
-## Один раз настроить регион вручную
+- `OZON_USER_DATA_DIR`: постоянный профиль; по умолчанию `~/.ozon-mcp-userdata`.
+- `OZON_HIDE_WINDOW=0`: видимое окно, рекомендуется для первоначальной настройки и диагностики. Значение `1` пытается разместить окно за пределами экрана; поведение зависит от ОС.
+- `OZON_CITY`: попытка выбрать город через интерфейс; селекторы могут устареть. Надёжнее проверить регион вручную.
 
-Если автоматический `OZON_CITY` не сработал (Ozon мог поменять вёрстку):
+## Ограничения и проверка
 
-1. В `.claude.json` временно: `"OZON_HIDE_WINDOW": "0"`
-2. `/mcp` → reconnect ozon → сделать любой запрос
-3. В открытом окне chromium кликнуть на текущий регион в шапке и выбрать свой
-4. Закрыть окно (или подождать idle timeout 10 мин)
-5. Cookies сохранятся в `OZON_USER_DATA_DIR`
-6. Вернуть `"OZON_HIDE_WINDOW": "1"` — дальше всё работает с правильными ценами автоматически
+Сервер использует внутренний composer-api Ozon и зависит от текущей разметки и антибота. Это не официальный API и не гарантия постоянной доступности.
 
-## Лицензия
+На 2026-09-05 на macOS Apple Silicon проверены запуск MCP, поиск и карточки двух товаров после авторизации. Бренд в живом поиске извлекается корректно. Описание извлекается из полученного ответа Ozon, но повторные дополнительные запросы периодически блокируются: тогда возвращается `DESCRIPTION_FETCH_FAILED`. Исправление парсера не устраняет сетевые блокировки.
 
-MIT (как у оригинала). Спасибо [@eduard256](https://github.com/eduard256) за исходную реализацию.
+Цены и наличие зависят от региона и сессии; проверяйте карточку перед покупкой. Тесты парсера не доказывают доступность Ozon. Исходные ответы аккаунта и браузерные профили в репозиторий не включены.
+
+## Лицензия и происхождение
+
+Исходные проекты декларируют MIT в README/package.json. Авторство исходного сервера — eduard256; браузерные изменения форка — Pir0manT (Andrey Sergeyev). Этот форк сохраняет историю Git и указание происхождения.

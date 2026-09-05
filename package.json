@@ -1,14 +1,15 @@
 {
   "name": "ozon-mcp-server",
-  "version": "0.3.0",
-  "description": "MCP-сервер для Ozon.ru. Форк eduard256/ozon-mcp-server с двумя минимальными правками: (1) headless: false + полный chromium (lite headless-shell палит Variti), (2) details — последовательные fetch вместо Promise.all (Variti режет два параллельных запроса на один продукт).",
+  "version": "0.3.1",
+  "description": "Ozon buyer MCP: macOS-compatible Chromium, verified brand parsing and HTML/JSON product descriptions",
   "type": "module",
   "bin": {
     "ozon-mcp-server": "src/index.js"
   },
   "main": "src/index.js",
   "scripts": {
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "node --test"
   },
   "keywords": [
     "mcp",
@@ -26,5 +27,9 @@
     "@modelcontextprotocol/sdk": "^1.6.1",
     "playwright": "1.60.0",
     "zod": "^3.25.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ibelyasov/ozon-mcp-server.git"
   }
 }

@@ -73,15 +73,16 @@ function parseSearchItem(it) {
     if (texts[1]) reviews = priceToNumber(texts[1]);
   }
 
-  const BADGE = /^(стало дешевле|оригинал|хит|новинка|акция|распродажа|выбор|бестселлер|ozon|premium|самовывоз|скидка)/i;
+  // Financial/reward labels also contain text; only accept explicit brand evidence.
   let brand = null;
-  const labelLists = ms
-    .filter((s) => s.labelListV2 && !JSON.stringify(s.labelListV2).includes("ic_s_star"))
-    .map((s) => s.labelListV2);
-  for (const ll of labelLists) {
-    const cand = (ll.items || []).find((x) => x.type === "text")?.text?.text?.trim();
-    if (cand && !BADGE.test(cand)) {
-      brand = cand;
+  for (const state of ms) {
+    const ll = state.labelListV2;
+    if (!ll || ll.testInfo?.automatizationId !== "tile-list-labels") continue;
+    const texts = (ll.items || []).filter((x) => x.type === "text")
+      .map((x) => x.text?.text?.trim()).filter(Boolean);
+    const verifiedIndex = texts.findIndex((text) => /^бренд проверен$/i.test(text));
+    if (verifiedIndex > 0) {
+      brand = texts[verifiedIndex - 1];
       break;
     }
   }
@@ -160,37 +161,42 @@ function parseSeller(page) {
   return { name, rating, url };
 }
 
+function descriptionText(html) {
+  return html.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&(#x[0-9a-f]+|#\d+|nbsp|amp|lt|gt|quot|apos);/gi, (entity, code) => {
+      const named = {nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', apos: "'"};
+      if (!code.startsWith("#")) return named[code.toLowerCase()] || entity;
+      const n = code[1].toLowerCase() === "x" ? parseInt(code.slice(2), 16) : Number(code.slice(1));
+      return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : entity;
+    }).replace(/\s+/g, " ").trim();
+}
+
 export function parseDescription(page2) {
-  if (!page2) return { text: "", images: [] };
-  const w = widgets(page2, "webDescription").find((x) => x.richAnnotationJson);
-  if (!w) return { text: "", images: [] };
-  let ra = w.richAnnotationJson;
-  if (typeof ra === "string") {
-    try {
-      ra = JSON.parse(ra);
-    } catch {
-      return { text: "", images: [] };
-    }
-  }
   const texts = [];
   const images = [];
   const walk = (n) => {
     if (!n) return;
     if (Array.isArray(n)) return n.forEach(walk);
     if (typeof n !== "object") return;
-    if (n.type === "text" && typeof n.content === "string") texts.push(n.content);
-    if (n.img?.src) images.push(n.img.src);
-    if (Array.isArray(n.items))
-      n.items.forEach((it) => {
-        if (it?.type === "text" && typeof it.content === "string") texts.push(it.content);
-      });
-    for (const k in n) if (n[k] && typeof n[k] === "object") walk(n[k]);
+    if (n.type === "text" && typeof n.content === "string") texts.push(n.content.replace(/\s+/g, " ").trim());
+    if (typeof n.img?.src === "string") images.push(n.img.src);
+    for (const value of Object.values(n)) if (value && typeof value === "object") walk(value);
   };
-  walk(ra.content || ra);
-  return {
-    text: texts.join(" ").replace(/\s+/g, " ").trim(),
-    images: [...new Set(images)],
-  };
+  for (const w of widgets(page2, "webDescription")) {
+    let ra = w.richAnnotationJson;
+    if (typeof ra === "string") {
+      try { ra = JSON.parse(ra); } catch { ra = null; }
+    }
+    const before = texts.filter(Boolean).length + images.length;
+    if (ra && typeof ra === "object") walk(ra.content || ra);
+    if (texts.filter(Boolean).length + images.length === before && typeof w.richAnnotation === "string") {
+      const html = w.richAnnotation;
+      texts.push(descriptionText(html));
+      for (const m of html.matchAll(/<img\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi)) images.push(m[1]);
+    }
+  }
+  return { text: texts.filter(Boolean).join(" ").trim(), images: [...new Set(images)] };
 }
 
 /**

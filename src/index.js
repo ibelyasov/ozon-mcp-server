@@ -39,7 +39,7 @@ function tool(label, fn) {
   };
 }
 
-const server = new McpServer({ name: "ozon-mcp-server", version: "0.3.0" });
+const server = new McpServer({ name: "ozon-mcp-server", version: "0.3.1" });
 
 server.registerTool(
   "ozon_search",
