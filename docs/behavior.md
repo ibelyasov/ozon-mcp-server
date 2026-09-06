@@ -11,11 +11,17 @@ This page describes the Rust 0.4.0 server built with `rmcp` and `agent-browser` 
 | `OZON_AGENT_BROWSER_BIN` | `agent-browser` from `PATH` | Optional absolute path to the pinned native driver. The executable must report exactly `agent-browser 0.36.0`; another version stops server startup. |
 | `OZON_BROWSER_EXECUTABLE` | Unset | Optional path to an existing full Chrome executable. If unset, agent-browser uses the Chrome installed by `agent-browser install`. |
 | `OZON_HEADLESS` | `true` | Only the case-insensitive value `false` enables a visible browser. There is no automatic visible fallback. |
-| `OZON_USER_DATA_DIR` | `~/.ozon-mcp-rust-profile` | Persistent profile for cookies, storage and region. It is exclusively locked by one MCP process. |
+| `OZON_USER_DATA_DIR` | `~/.ozon-mcp-rust-profile` | Preferred persistent profile for cookies, storage and region. If occupied, the process leases the first free persistent fallback slot under `base/.ozon-mcp-profiles/`. |
 | `OZON_CITY` | Unset | Selects a city through current Ozon UI selectors. Failure returns `REGION_SELECTION_FAILED`; successful selector actions still require manual verification of the saved region. |
 | `OZON_HIDE_WINDOW` | Ignored | Deprecated. Use `OZON_HEADLESS`; the server only emits a diagnostic when this variable is present. |
 
 The browser starts on the first tool call. Agent-browser receives a ten-minute idle timeout, and the server replaces a session before reuse after roughly that interval. `OZON_HEADLESS=false` is an explicit manual session; errors never open a window automatically.
+
+### Persistent profile leasing
+
+Each server process first attempts to exclusively lock the configured `OZON_USER_DATA_DIR`. If another process owns it, the server tries `base/.ozon-mcp-profiles/1`, `2`, and so on, selecting the first free slot among at most 1,024 fallbacks. It owns that exclusive profile lock for its lifetime and does not delete active locks; slots become available for reuse after their owner exits.
+
+Every slot is an independent persistent browser profile. Cookies, sign-in and region are not copied into a fresh slot. A Codex session is not guaranteed to receive the same slot after a reconnect. For reliable manual sign-in or region selection, configure a dedicated `OZON_USER_DATA_DIR` and avoid concurrent processes using that dedicated base.
 
 The driver runs from a private temporary directory with an empty private config, an empty plugin list, WebMCP disabled and a cleared environment containing only a small system allowlist. Ambient agent-browser plugins, providers and user configuration are not loaded. Neither the Rust server nor the native driver needs a Node.js runtime.
 
@@ -77,6 +83,12 @@ Browser startup is cancellation-shielded only while the server acquires ownershi
 
 ## Compatibility and verification
 
+On September 6, 2026, acceptance for concurrent profile leasing passed:
+
+- All 32 ordinary Rust tests passed.
+- Eight simultaneous stdio clients each completed `initialize` and `tools/list` in 0.412 seconds overall.
+- The ignored real-Chromium test started two local headless browsers with isolated profiles and verified their independent shutdown in 2.17 seconds. It made no Ozon requests.
+
 As of September 5, 2026:
 
 - Rust 0.4.0 server startup and MCP tool listing passed.
@@ -98,12 +110,14 @@ OZON_BROWSER_EXECUTABLE=/absolute/path/to/full-chrome \
 cargo test --locked cancelled_evaluation_closes_private_browser_and_can_restart -- --ignored
 ```
 
+To run the concurrent browser-isolation check, keep the same disposable profile and pinned executable variables and replace the test filter with `concurrent_profiles_keep_browsers_independent`.
+
 ## Troubleshooting
 
 - **Driver version error:** install exactly agent-browser 0.36.0 or point `OZON_AGENT_BROWSER_BIN` at that binary.
 - **Chrome missing:** run `agent-browser install`, or set `OZON_BROWSER_EXECUTABLE` to an existing full Chrome executable.
 - **Browser unexpectedly opens:** remove `OZON_HEADLESS=false` and restart old MCP processes. No error path enables visible mode.
-- **Profile is locked:** stop the other MCP process that owns the same profile. Do not delete an active profile to bypass its lock.
+- **Unexpected account or region:** a concurrent process may have caused this server to lease a different persistent slot. Slots do not copy cookies or login state. For reliable manual setup, use a dedicated `OZON_USER_DATA_DIR` without concurrent users; never delete an active lock.
 - **Region selection fails:** start an explicit visible session, select the region manually, then reuse that profile in headless mode.
 - **HTTP 403 or blocked page:** the server reports the failure. A visible login may help but is not a guaranteed workaround.
 

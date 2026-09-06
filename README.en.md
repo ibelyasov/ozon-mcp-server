@@ -60,15 +60,17 @@ Use the absolute path to the built stdio server. An absolute path to the pinned 
 }
 ```
 
-The default profile is `~/.ozon-mcp-rust-profile`. Restart or reconnect the MCP after changing its configuration.
+The default primary profile is `~/.ozon-mcp-rust-profile`. The server first tries to lease the configured `OZON_USER_DATA_DIR`; if another process already owns it, the server selects the first free persistent slot at `base/.ozon-mcp-profiles/1`, `2`, and so on (up to 1,024 fallback slots). Each process holds its profile's exclusive lock until exit and never deletes an active lock. Freed slots are reused.
+
+Cookies, sign-in and region are independent in every slot: a fresh slot does not copy authentication from the primary profile. Reconnecting Codex does not guarantee the same slot. Restart or reconnect the MCP after changing its configuration.
 
 ### Visible manual session
 
-For manual sign-in or reliable region selection, set `OZON_HEADLESS=false`, reconnect the MCP, and call a tool. Check the account and region in the opened window, then stop the MCP and restore `OZON_HEADLESS=true` while keeping the same profile. Visible mode is never enabled automatically.
+For manual sign-in or reliable region selection, set a dedicated `OZON_USER_DATA_DIR` together with `OZON_HEADLESS=false`, reconnect the MCP, and call a tool. Do not run concurrent processes against that dedicated base. Check the account and region in the opened window, then stop the MCP and restore `OZON_HEADLESS=true` while keeping the same profile. Visible mode is never enabled automatically.
 
 `OZON_CITY` attempts to select a city through Ozon's interface. If it cannot apply the requested city, the request fails with `REGION_SELECTION_FAILED`; the server does not present the saved profile region as the requested one. Even successful selector actions do not prove which region Ozon saved, so manual verification in the persistent profile remains the reliable option.
 
-Keep the profile outside the repository because it may contain an account session. Only one MCP process may own a profile at a time.
+Keep profiles outside the repository because they may contain account sessions.
 
 ## Development
 

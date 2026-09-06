@@ -4,7 +4,8 @@ use futures_util::SinkExt;
 use serde_json::{Value, json};
 use std::{
     fs::File,
-    path::PathBuf,
+    io::ErrorKind,
+    path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -16,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 const DRIVER_VERSION: &str = "agent-browser 0.36.0";
 const MAX_CLI_BYTES: usize = 12 * 1024 * 1024;
+const MAX_PROFILE_SLOTS: usize = 1024;
 const HOME: &str = "https://www.ozon.ru/";
 
 pub struct Browser {
@@ -46,31 +48,13 @@ impl Browser {
                 .find(|p| p.is_file())
                 .context("agent-browser is missing; install 0.36.0 or set OZON_AGENT_BROWSER_BIN")?
         };
-        let profile = std::env::var_os("OZON_USER_DATA_DIR")
+        let base_profile = std::env::var_os("OZON_USER_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                     .join(".ozon-mcp-rust-profile")
             });
-        let mut directories = std::fs::DirBuilder::new();
-        directories.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            directories.mode(0o700);
-        }
-        directories
-            .create(&profile)
-            .context("Cannot create Ozon profile directory")?;
-        let profile = std::fs::canonicalize(profile)?;
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(profile.join(".ozon-mcp.lock"))?;
-        lock.try_lock_exclusive()
-            .context("Ozon profile is already owned by another MCP process")?;
+        let (profile, lock) = lease_profile(&base_profile)?;
         // A short private path is necessary for macOS Unix socket length limits.
         let runtime = tempfile::Builder::new()
             .prefix("ozon-")
@@ -466,6 +450,94 @@ impl Browser {
     }
 }
 
+fn lease_profile(base: &Path) -> Result<(PathBuf, File)> {
+    ensure_private_directory(base).context("Cannot create Ozon profile directory")?;
+    let base = std::fs::canonicalize(base).context("Cannot resolve Ozon profile directory")?;
+    if let Some(lock) = try_lock_profile(&base)
+        .with_context(|| format!("Cannot lock Ozon profile directory {}", base.display()))?
+    {
+        return Ok((base, lock));
+    }
+
+    let pool = base.join(".ozon-mcp-profiles");
+    ensure_private_pool_directory(&pool).context("Cannot create Ozon profile pool")?;
+    for slot in 1..=MAX_PROFILE_SLOTS {
+        let profile = pool.join(slot.to_string());
+        ensure_private_pool_directory(&profile)
+            .with_context(|| format!("Cannot create Ozon profile slot {slot}"))?;
+        let profile = std::fs::canonicalize(&profile)
+            .with_context(|| format!("Cannot resolve Ozon profile slot {slot}"))?;
+        if let Some(lock) = try_lock_profile(&profile)
+            .with_context(|| format!("Cannot lock Ozon profile slot {slot}"))?
+        {
+            return Ok((profile, lock));
+        }
+    }
+    bail!("All {MAX_PROFILE_SLOTS} Ozon profile slots are already in use")
+}
+
+fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    let mut directories = std::fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directories.mode(0o700);
+    }
+    directories.create(path)?;
+    Ok(())
+}
+
+fn ensure_private_pool_directory(path: &Path) -> std::io::Result<()> {
+    let existed = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "profile pool path must not be a symbolic link",
+            ));
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    ensure_private_directory(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "profile pool path must not be a symbolic link",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if existed && metadata.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "existing profile pool directory must have private permissions",
+            ));
+        }
+        if !existed {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+fn try_lock_profile(profile: &Path) -> std::io::Result<Option<File>> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(profile.join(".ozon-mcp.lock"))?;
+    match lock.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn is_requested_page(requested: &str, actual: &str) -> bool {
     let (Ok(target), Ok(final_url)) = (url::Url::parse(requested), url::Url::parse(actual)) else {
         return false;
@@ -583,6 +655,100 @@ fn is_navigation_metadata(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_leases_use_distinct_slots_and_reuse_released_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("profile");
+        let (base_profile, base_lock) = lease_profile(&base).unwrap();
+        let (first_slot, first_lock) = lease_profile(&base).unwrap();
+        let (second_slot, second_lock) = lease_profile(&base).unwrap();
+
+        assert_eq!(base_profile, std::fs::canonicalize(&base).unwrap());
+        assert_eq!(first_slot, base_profile.join(".ozon-mcp-profiles/1"));
+        assert_eq!(second_slot, base_profile.join(".ozon-mcp-profiles/2"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(base_profile.join(".ozon-mcp-profiles"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&first_slot).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+
+        drop(base_lock);
+        let (reused_base, _reused_base_lock) = lease_profile(&base).unwrap();
+        assert_eq!(reused_base, base_profile);
+
+        drop(first_lock);
+        let (reused_slot, _reused_lock) = lease_profile(&base).unwrap();
+        assert_eq!(reused_slot, first_slot);
+        assert!(first_slot.join(".ozon-mcp.lock").is_file());
+        drop(second_lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_lease_preserves_existing_base_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("profile");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (_profile, _lock) = lease_profile(&base).unwrap();
+        assert_eq!(
+            std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn profile_lease_does_not_fallback_after_non_contention_error() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("profile");
+        ensure_private_directory(&base).unwrap();
+        std::fs::create_dir(base.join(".ozon-mcp.lock")).unwrap();
+
+        let error = lease_profile(&base).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot lock Ozon profile directory")
+        );
+        assert!(!base.join(".ozon-mcp-profiles").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_lease_rejects_symlinked_pool() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("profile");
+        let outside = root.path().join("outside");
+        ensure_private_directory(&outside).unwrap();
+        let (_base_profile, _base_lock) = lease_profile(&base).unwrap();
+        symlink(&outside, base.join(".ozon-mcp-profiles")).unwrap();
+
+        let error = lease_profile(&base).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot create Ozon profile pool")
+        );
+        assert!(!outside.join(".ozon-mcp.lock").exists());
+    }
+
     #[test]
     fn fallback_must_match_product_or_search() {
         assert!(is_requested_page(
@@ -788,5 +954,59 @@ mod tests {
             json!(42)
         );
         browser.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires pinned agent-browser, Chrome, and an explicit disposable OZON_USER_DATA_DIR"]
+    async fn concurrent_profiles_keep_browsers_independent() {
+        assert!(
+            std::env::var_os("OZON_USER_DATA_DIR").is_some(),
+            "Use a disposable test profile"
+        );
+        let mut first = Browser::from_env().await.unwrap();
+        let mut second = Browser::from_env().await.unwrap();
+        let first_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+        let result = async {
+            ensure!(first.profile != second.profile, "Profiles must be distinct");
+            let (first_launch, second_launch) =
+                tokio::join!(first.launch(&first_cancel), second.launch(&second_cancel));
+            first_launch?;
+            second_launch?;
+
+            ensure!(
+                first
+                    .evaluate("globalThis.__ozonMcpProfileMarker = 'first'", &first_cancel)
+                    .await?
+                    == json!("first"),
+                "First browser marker was not retained"
+            );
+            ensure!(
+                second
+                    .evaluate(
+                        "globalThis.__ozonMcpProfileMarker = 'second'",
+                        &second_cancel,
+                    )
+                    .await?
+                    == json!("second"),
+                "Second browser marker was not retained"
+            );
+
+            first.shutdown().await?;
+            ensure!(
+                second
+                    .evaluate("globalThis.__ozonMcpProfileMarker", &second_cancel)
+                    .await?
+                    == json!("second"),
+                "Second browser stopped with the first browser"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let first_shutdown = first.shutdown().await;
+        let second_shutdown = second.shutdown().await;
+        result.unwrap();
+        first_shutdown.unwrap();
+        second_shutdown.unwrap();
     }
 }
