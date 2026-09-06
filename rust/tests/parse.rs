@@ -1,4 +1,4 @@
-use super::{parse_description, parse_details, parse_reviews, parse_search};
+use super::{parse_description, parse_details, parse_reviews, parse_search, parse_search_items};
 use serde_json::json;
 
 #[test]
@@ -35,6 +35,8 @@ fn search_skips_malformed_widgets_and_parses_fractional_counts() {
                 "sku": "901", "name": "Test product", "price": 1234.5,
                 "oldPrice": 1299.99, "discount": null, "rating": 4.8,
                 "reviews": 1200, "brand": null,
+                "currency": "RUB", "priceType": "unknown", "priceLabel": null,
+                "deliveryLabel": null, "seller": null,
                 "url": "https://www.ozon.ru/product/example-901/", "image": null
             }]
         })
@@ -105,4 +107,73 @@ fn description_falls_back_from_malformed_json_and_deduplicates_images() {
             "text": "Fresh & clean", "images": ["/same.jpg"]
         })
     );
+}
+
+#[test]
+fn search_preserves_missing_prices_and_all_grid_source_order() {
+    let page = json!({"widgetStates": {
+        "tileGridDesktop-z": {"items": [{"sku": "2"}, {"sku": "1", "mainState": [
+            {"type": "priceV2", "priceV2": {"price": [
+                {"textStyle": "PRICE", "text": "unavailable"},
+                {"textStyle": "ORIGINAL_PRICE", "text": "500 ₽"}
+            ]}}
+        ]}]},
+        "tileGridDesktop-a": {"items": [{"sku": "2"}, {"sku": "invalid"}]}
+    }});
+    let items = parse_search_items(&page);
+    assert_eq!(
+        items
+            .iter()
+            .map(|v| v["sku"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["2", "1", "2"]
+    );
+    for item in &items {
+        assert!(item["price"].is_null());
+        assert!(item["oldPrice"].is_null());
+        assert!(item["deliveryLabel"].is_null());
+        assert!(item["seller"].is_null());
+    }
+    assert_eq!(parse_search(&page, 2)["count"], 2);
+}
+
+#[test]
+fn search_price_delivery_and_seller_context_is_narrow() {
+    let mut item = json!({"sku": "123", "mainState": [
+        {"type": "priceV2", "priceV2": {
+            "price": [{"textStyle": "PRICE", "text": "100 ₽"}],
+            "priceStyle": {"styleType": "CARD_PRICE"}
+        }},
+        {"labelListV2": {"testInfo": {"automatizationId": "tile-list-rating"}, "items": [
+            {"type": "icon", "icon": {"icon": {"icon": "ic_s_ozon_circle_filled_compact"}}},
+            {"type": "text", "text": {"text": "Ozon"}}
+        ]}}
+    ], "multiButton": {"ozonButton": {"addToCart": {"actionButton": {
+        "title": "  Завтра  ", "common": {"action": {"id": "not-output"}}
+    }}}}});
+    let parse = |item| {
+        parse_search_items(&json!({"widgetStates": {"tileGridDesktop-0": {"items": [item]}}}))
+            .remove(0)
+    };
+    let parsed = parse(item.clone());
+    assert_eq!(parsed["price"], 100.0);
+    assert_eq!(parsed["currency"], "RUB");
+    assert_eq!(parsed["priceType"], "ozon_card");
+    assert_eq!(parsed["priceLabel"], "Цена с Ozon Картой");
+    assert_eq!(parsed["deliveryLabel"], "Завтра");
+    // The Ozon badge does not establish the merchant identity.
+    assert!(parsed["seller"].is_null());
+    assert!(!parsed.to_string().contains("not-output"));
+    item["mainState"][0]["priceV2"]["priceStyle"]["styleType"] = json!("SALE_PRICE");
+    item["mainState"][1]["labelListV2"]["items"][0]["icon"]["icon"]["icon"] = json!("unrecognized");
+    item["multiButton"]["ozonButton"]["addToCart"]["actionButton"]["title"] =
+        json!("x".repeat(121));
+    let parsed = parse(item.clone());
+    assert_eq!(parsed["priceType"], "unknown");
+    assert!(parsed["priceLabel"].is_null());
+    assert!(parsed["deliveryLabel"].is_null());
+    assert!(parsed["seller"].is_null());
+    item["multiButton"]["ozonButton"]["addToCart"]["actionButton"]["title"] =
+        json!({"text": "Завтра"});
+    assert!(parse(item)["deliveryLabel"].is_null());
 }

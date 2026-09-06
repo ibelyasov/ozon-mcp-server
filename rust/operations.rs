@@ -7,9 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{browser::Browser, parse};
 
-fn popular() -> String {
-    "popular".into()
-}
 fn search_limit() -> usize {
     12
 }
@@ -25,13 +22,24 @@ fn sort_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SearchArgs {
+    /// Search text. Provide exactly one of query, searchUrl or nextCursor.
     #[schemars(length(min = 1, max = 2000))]
-    pub query: String,
-    #[serde(default = "popular")]
+    pub query: Option<String>,
+    /// Public Ozon search/category URL copied from a returned facet or sort option.
+    /// Mutually exclusive with query and nextCursor; optional sort/price overrides refine it.
+    #[schemars(length(min = 1, max = 24000))]
+    pub search_url: Option<String>,
+    /// Copy a returned nextCursor unchanged. Combine only with limit and includeFacets,
+    /// never query, searchUrl, sort or price parameters.
+    #[schemars(length(min = 1, max = 48000))]
+    pub next_cursor: Option<String>,
+    /// Include observed facets, sort options and active filters.
+    /// Defaults to true for initial requests and false for nextCursor requests.
+    pub include_facets: Option<bool>,
     #[schemars(schema_with = "sort_schema")]
-    pub sort: String,
+    pub sort: Option<String>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
     pub price_min: Option<u64>,
     #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
@@ -165,51 +173,11 @@ pub async fn search(
     args: SearchArgs,
     cancel: &CancellationToken,
 ) -> Result<Value> {
-    ensure!(
-        !args.query.trim().is_empty() && args.query.encode_utf16().count() <= 2000,
-        "query must contain 1–2000 characters"
-    );
-    ensure!(
-        matches!(
-            args.sort.as_str(),
-            "popular" | "price" | "price_desc" | "rating" | "new" | "discount"
-        ),
-        "Invalid sort"
-    );
-    ensure!(
-        (1..=36).contains(&args.limit),
-        "limit must be between 1 and 36"
-    );
-    for price in [args.price_min, args.price_max].into_iter().flatten() {
-        ensure!(
-            price <= 9_007_199_254_740_991,
-            "Prices must be nonnegative safe integers"
-        );
-    }
-    if let (Some(min), Some(max)) = (args.price_min, args.price_max) {
-        ensure!(min <= max, "priceMin must not exceed priceMax");
-    }
-    let path = {
-        let mut params = url::form_urlencoded::Serializer::new(String::new());
-        params
-            .append_pair("text", args.query.trim())
-            .append_pair("from_global", "true");
-        if args.sort != "popular" {
-            params.append_pair("sorting", &args.sort);
-        }
-        if args.price_min.is_some() || args.price_max.is_some() {
-            let min = args.price_min.unwrap_or(0);
-            let max = args.price_max.unwrap_or(min.max(99_999_999));
-            params.append_pair("currency_price", &format!("{min}.000;{max}.000"));
-        }
-        format!("/search/?{}", params.finish())
-    };
+    let request = crate::search::prepare(&args)?;
     check_cancel(cancel)?;
-    let page = browser.fetch_json(&path, cancel).await?;
+    let page = browser.fetch_json(&request.path(), cancel).await?;
     check_cancel(cancel)?;
-    let mut result = parse::parse_search(&page, args.limit);
-    result["query"] = json!(args.query.trim());
-    result["sort"] = json!(args.sort);
+    let mut result = crate::search::finish(&page, &args, request)?;
     if !has_widget(&page, "tileGridDesktop") {
         warn(&mut result, "SEARCH_WIDGET_MISSING");
     }

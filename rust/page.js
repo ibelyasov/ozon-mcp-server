@@ -13,6 +13,132 @@ const publicWidgetNames = new Set([
     "webGallery",
     "webListReviews",
 ]);
+const searchWidgetNames = new Set([
+    "filtersDesktop", "searchResultsSort", "searchResultsFiltersActive",
+    "infiniteVirtualPaginator", "categoryBrandList",
+]);
+const filterTypes = new Set([
+    "categoryFilter", "boolFilter", "checkboxesFilter", "rangeFilter",
+    "multipleRangesFilter", "colorFilter",
+]);
+function scalars(value, keys) {
+    const result = {};
+    for (const key of keys) {
+        const field = value[key];
+        if (typeof field === "string" || typeof field === "boolean" ||
+            (typeof field === "number" && Number.isFinite(field)))
+            result[key] = field;
+    }
+    return result;
+}
+function records(value) {
+    return Array.isArray(value) ? value.filter((v) => isRecord(v) && !Array.isArray(v)) : [];
+}
+function display(value, result) {
+    for (const key of ["title", "description"]) {
+        if (typeof value[key] === "string")
+            result[key] = value[key];
+        else if (isRecord(value[key]) && typeof value[key].text === "string") {
+            result[key] = { text: value[key].text };
+        }
+    }
+}
+function filterFields(value, depth = 0) {
+    const result = scalars(value, ["isSelected", "isActive", "isRadio", "hasManyValues",
+        "minValue", "maxValue", "fromValue", "toValue"]);
+    display(value, result);
+    if (Array.isArray(value.categories))
+        result.categories = records(value.categories).map((v) => {
+            const item = scalars(v, ["isActive", "level", "urlValue"]);
+            display(v, item);
+            return item;
+        });
+    if (Array.isArray(value.sections))
+        result.sections = records(value.sections).map((section) => ({
+            items: records(section.items).map((v) => {
+                const item = scalars(v, ["key", "isSelected"]);
+                display(v, item);
+                return item;
+            }),
+        }));
+    if (Array.isArray(value.colorIcons))
+        result.colorIcons = records(value.colorIcons).map((v) => {
+            const item = scalars(v, ["key", "isSelected"]);
+            display(v, item);
+            return item;
+        });
+    if (isRecord(value.openingButtons)) {
+        const buttons = {};
+        for (const key of ["showAllButton", "hideAllButton"]) {
+            if (isRecord(value.openingButtons[key]))
+                buttons[key] = {};
+        }
+        result.openingButtons = buttons;
+    }
+    if (depth === 0) {
+        for (const key of ["rangeFilter", "checkboxesFilter"]) {
+            if (isRecord(value[key]))
+                result[key] = filterFields(value[key], depth + 1);
+        }
+    }
+    return result;
+}
+function linkedItem(value, keys) {
+    const result = scalars(value, keys);
+    if (isRecord(value.action) && typeof value.action.link === "string") {
+        result.action = { link: value.action.link };
+    }
+    return result;
+}
+function projectSearchWidget(name, raw) {
+    let value = raw;
+    try {
+        if (typeof raw === "string")
+            value = JSON.parse(raw);
+    }
+    catch {
+        return undefined;
+    }
+    if (!isRecord(value) || Array.isArray(value))
+        return undefined;
+    switch (name) {
+        case "filtersDesktop":
+            if (!Array.isArray(value.sections))
+                return undefined;
+            return { sections: records(value.sections).map((section) => ({
+                    filters: records(section.filters).flatMap((filter) => {
+                        const type = filter.type;
+                        if (typeof type !== "string" || !filterTypes.has(type) ||
+                            !isRecord(filter[type]) || Array.isArray(filter[type]))
+                            return [];
+                        return [{ ...scalars(filter, ["type", "key"]), [type]: filterFields(filter[type]) }];
+                    }),
+                })) };
+        case "searchResultsSort":
+            if (!isRecord(value.sortButton) || !Array.isArray(value.sortButton.options))
+                return undefined;
+            return { sortButton: { options: records(value.sortButton.options)
+                        .map((v) => linkedItem(v, ["name", "isSelected"])) } };
+        case "searchResultsFiltersActive":
+            if (!Array.isArray(value.activeFilters))
+                return undefined;
+            return { activeFilters: records(value.activeFilters).map((v) => {
+                    const item = scalars(v, ["key", "name", "ftype"]);
+                    if (Array.isArray(v.activeValues)) {
+                        item.activeValues = records(v.activeValues)
+                            .map((entry) => scalars(entry, ["title", "disableUri"]));
+                    }
+                    return item;
+                }) };
+        case "infiniteVirtualPaginator":
+            return scalars(value, ["nextPage", "prevPage", "size", "layoutContainer", "fetchType"]);
+        case "categoryBrandList":
+            if (!Array.isArray(value.brands))
+                return undefined;
+            return { brands: records(value.brands).map((v) => linkedItem(v, ["text"])) };
+        default: return undefined;
+    }
+}
 const maxBytes = 4 * 1024 * 1024;
 function isRecord(value) {
     return typeof value === "object" && value !== null;
@@ -36,8 +162,14 @@ function filterPage(page) {
     const widgetStates = Object.create(null);
     if (isRecord(page.widgetStates)) {
         for (const [key, value] of Object.entries(page.widgetStates)) {
-            if (publicWidgetNames.has(widgetName(key)))
+            const name = widgetName(key);
+            if (publicWidgetNames.has(name))
                 widgetStates[key] = value;
+            else if (searchWidgetNames.has(name)) {
+                const projected = projectSearchWidget(name, value);
+                if (projected !== undefined)
+                    widgetStates[key] = projected;
+            }
         }
     }
     const result = { widgetStates };
@@ -78,7 +210,7 @@ async function ozonPage(rawOptions) {
         let bytes = 0;
         for (const element of document.querySelectorAll('[id^="state-"][data-state]')) {
             const key = element.id.slice(6);
-            if (!publicWidgetNames.has(widgetName(key)))
+            if (!publicWidgetNames.has(widgetName(key)) && !searchWidgetNames.has(widgetName(key)))
                 continue;
             const value = element.getAttribute("data-state");
             if (value === null)

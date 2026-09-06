@@ -21,11 +21,27 @@ The driver runs from a private temporary directory with an empty private config,
 
 ## Data path and results
 
-The server first fetches Ozon's internal `composer-api` inside the Ozon tab. When that request returns HTTP 403 or 307, it may navigate to the exact requested Ozon page and extract an allowlist of public product widgets. A different origin, product, review page or search is rejected. Profile, address and order widgets are excluded from returned data.
+The server first fetches Ozon's internal `composer-api` inside the Ozon tab. When that request returns HTTP 403 or 307, it may navigate to the exact requested Ozon page and extract an allowlist of public product and search widgets. Search metadata is projected to explicit display, filter and navigation fields; tracking and unrelated nested data are excluded. A different origin, product, review page or search is rejected. Profile, address and order widgets are excluded from returned data.
 
 For `BROWSER_COMMAND_FAILED` only, a read-only request gets one retry in a confirmed fresh browser session, still inside the 55-second tool deadline. HTTP errors and challenges are returned directly; there is no HTTP retry loop.
 
 Successful tools return the same JSON object as MCP `structuredContent` and text content. The server never truncates JSON: oversized results fail explicitly. It can only return fields present in the received page; unknown values remain `null` where defined.
+
+Search items include `rating` (product rating) and `reviews` (review count). The search tool description tells assistants to consider both together when comparing products, and to treat `null` as unknown rather than zero. The `popular` sort uses Ozon's ordering; it does not expose a numeric popularity score or sales count. Assistants can use `ozon_product_reviews` to read available review text when useful for the comparison.
+
+### Search refinement and continuation
+
+`ozon_search` accepts exactly one starting mode: `query`, a returned `searchUrl`, or a returned `nextCursor`. Existing query, sort, price and limit calls remain supported. Unknown argument names are rejected. `sort` and `priceMin`/`priceMax` may override a `searchUrl` and reset pagination; they cannot accompany `nextCursor`.
+
+Each call fetches one Ozon page and returns at most `limit` items (1–36, default 12). `nextCursor` first continues any unreturned items on that page, then follows the observed Ozon next-page link. It removes fragment-only transport parameters so a browser fallback can load a complete page. A cursor suppresses repeated SKUs across its chain, is bounded to 500 unique SKUs and 100 calls, and is not a snapshot: changing Ozon ordering can still affect coverage between calls. Do not edit cursor contents. `CONTINUATION_LIMIT_REACHED` means the bounded chain stopped, not that Ozon has no more matches. `CONTINUATION_STALLED` means Ozon returned a link back to the same page.
+
+`count` is the number of returned items. `coverage` describes the current page, parsed item offsets, returned items and unique SKUs seen in this cursor chain; it is not a marketplace-wide count. `total` stays `null` without a verified source. `hasNext: null` means the response does not establish whether another page exists. A missing search widget remains a warning, not proof of zero matches.
+
+Initial searches include available `facets`, `sortOptions` and `activeFilters`. Follow their `searchUrl` links to apply or remove a selection. Facets cover observed categories, booleans, checkbox/radio values, ranges and colors, including brand, delivery and category-specific characteristics when Ozon supplies them. Range metadata includes the current selection when available; custom price bounds use `priceMin`/`priceMax`. Available values can be collapsed by Ozon or capped in the response: inspect `hasMoreValues`, `optionsTruncated` and `facets.truncated` instead of assuming completeness. Cursor calls omit these optional blocks by default; set `includeFacets: true` to request them. `SEARCH_METADATA_TRUNCATED` indicates optional metadata was dropped to bound the response.
+
+Search products include nullable `price`, `priceLabel`, `deliveryLabel` and `seller`, with `currency: "RUB"` and `priceType`. An observed `CARD_PRICE` style is labelled `ozon_card`; other price conditions remain `unknown`. The price-filter description can explicitly say that it filters prices with an Ozon Card. A missing price no longer discards an otherwise identifiable product. `matchesPriceRange` compares the displayed price with the requested `currency_price` bounds: it is `true`/`false` when both are known and `null` otherwise. `PRICE_OUTSIDE_REQUESTED_RANGE` warns that Ozon returned a displayed price outside its active native filter; products are not silently discarded or reordered. A delivery label is Ozon's displayed text, not a guaranteed arrival date. The server does not infer a seller from an ambiguous badge: use product details for available seller and alternative payment prices. Search context reports `region: null` and `regionVerified: false` because neither the saved profile nor successful city selector actions establish the actual region.
+
+For comparisons, start with search, refine using returned facets, continue only as far as needed, then read details for shortlisted products to check required characteristics, seller and price conditions. Read review text when useful, considering `rating` together with `reviews`. Report unknown requirements and the actual search coverage.
 
 Product details request the secondary description page whenever the base page has no nonempty text, including when the base contains description images only. The merged result prefers nonempty base text, otherwise uses secondary text, and returns the deduplicated union of images from both pages.
 
@@ -64,9 +80,10 @@ Browser startup is cancellation-shielded only while the server acquires ownershi
 As of September 5, 2026:
 
 - Rust 0.4.0 server startup and MCP tool listing passed.
-- All nine ordinary Rust offline tests passed. They cover parsers and local contract boundaries and have no Ozon dependency.
+- All 29 ordinary Rust offline tests and 10 browser-script tests passed after the search upgrade. They cover parsers, search continuation and refinement, URL/redirect boundaries and public metadata projection without contacting Ozon.
 - The ignored-by-default real-Chromium test `cancelled_evaluation_closes_private_browser_and_can_restart` passed in 8.00 seconds. It cancelled endless JavaScript, closed the captured private browser and successfully launched and used a replacement, without contacting Ozon.
 - The release 0.4.0 stdio server completed a successful live headless run on macOS with all three advertised tools and exit code 0 in 25.78 seconds. Search returned two items in 19.82 seconds, including Logitech MX Master 3S SKU `947750106` at 6,859 RUB. Details for that SKU returned rating 4.9 but no description text in 3.86 seconds. A later description check confirmed two images and no text, with `DESCRIPTION_TEXT_EMPTY`, in 3.88 seconds. Reviews returned two entries out of 2,618 in 1.90 seconds; their aggregate rating was unavailable (`null`).
+- Search-upgrade live acceptance verified local page overflow plus pages 2 and 3, yielding 24 distinct SKUs. A subsequent 38.47-second headless MCP run passed brand application/removal, delivery, price/sort, verified-brand and Bluetooth facets, then product details and reviews, exiting with code 0. One displayed price fell below the active native minimum; the server correctly reported `matchesPriceRange: false` and `PRICE_OUTSIDE_REQUESTED_RANGE`. These probes cover the tested mouse category and profile, not every category or region. The final output-only `score` to `popular` alias was checked offline after this live run.
 - Earlier runs received HTTP 403 responses and one transient `BROWSER_COMMAND_FAILED`. Those results remain historical evidence that Ozon access can change; the successful run does not guarantee future availability.
 - Windows and Linux compatibility for this fork remains unverified.
 

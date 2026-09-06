@@ -1,6 +1,7 @@
 mod browser;
 mod operations;
 mod parse;
+mod search;
 
 use anyhow::Result;
 use browser::Browser;
@@ -112,7 +113,7 @@ fn output_schema() -> Arc<serde_json::Map<String, Value>> {
 
 #[tool_router]
 impl Ozon {
-    #[tool(name = "ozon_search", output_schema = output_schema(), description = "Search Ozon products by query, sort (popular, price, price_desc, rating, new, discount), priceMin/priceMax in RUB and limit (1-36, default 12). Returns available prices, ratings and canonical product URLs.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
+    #[tool(name = "ozon_search", output_schema = output_schema(), description = "Search Ozon products. Start with query, or follow a returned facet/sort searchUrl; continue with nextCursor alone (plus limit/includeFacets). limit 1-36, default 12, applies to one fetched page; follow nextCursor to see more. sort: popular, price, price_desc, rating, new, discount; priceMin/priceMax in RUB. sort/price overrides on searchUrl reset pagination. Available facets contain refinement links and selected values; missing or truncated facets are not an exhaustive catalog. rating is product rating, reviews is review count: compare both, treating null as unknown, not zero. popular is Ozon ordering, not a numeric popularity or sales measure. Check priceType/priceLabel, matchesPriceRange and deliveryLabel; native Ozon filters may return out-of-range displayed prices. Region is unverified. count is returned items, not total matches. For shortlisted products use ozon_product_details to verify characteristics, seller and payment prices, and ozon_product_reviews to read review text. Report search coverage and unknown fields; search results can change between calls.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
     async fn search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
@@ -120,7 +121,7 @@ impl Ozon {
     ) -> CallToolResult {
         self.run(Operation::Search(args), request).await
     }
-    #[tool(name = "ozon_product_details", output_schema = output_schema(), description = "Read an Ozon product by SKU, product URL or slug. Returns available price, seller, images, characteristics and description; warnings indicate missing data.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
+    #[tool(name = "ozon_product_details", output_schema = output_schema(), description = "Read an Ozon product by SKU, product URL or slug. Returns available price, seller, images, characteristics and description; warnings indicate missing data. Use on shortlisted search results to verify required characteristics, seller and price conditions before recommending a product.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
     async fn details(
         &self,
         Parameters(args): Parameters<DetailsArgs>,

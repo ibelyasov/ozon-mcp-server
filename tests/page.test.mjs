@@ -223,3 +223,70 @@ test("distinguishes timeout aborts and rejects another origin", async () => {
   );
   assert.deepEqual(jsonValue(wrongOrigin), { error: "INVALID_ORIGIN" });
 });
+
+const searchWidgets = {
+  "filtersDesktop-1": { sections: [{ filters: [
+    { type: "categoryFilter", key: "category", categoryFilter: { title: "Category", categories: [{ title: "Mice", level: 1, isActive: true, urlValue: "/category/mice/" }] } },
+    { type: "checkboxesFilter", key: "brand", checkboxesFilter: { title: "Brand", sections: [{ items: [{ key: "42", title: { text: "Brand A" }, isSelected: true }] }], openingButtons: { showAllButton: { action: { link: "execute-secret" } } }, hasManyValues: true } },
+    { type: "multipleRangesFilter", key: "currency_price", multipleRangesFilter: { rangeFilter: { title: "Price", description: { text: "Card price" }, minValue: 10, maxValue: 100, fromValue: 20, toValue: 80 }, checkboxesFilter: { sections: [{ items: [{ key: "10;100", title: { text: "All" } }] }] } } },
+    { type: "boolFilter", key: "sale", boolFilter: { title: "Sale", isSelected: false } },
+    { type: "colorFilter", key: "color", colorFilter: { title: "Color", colorIcons: [{ key: "1", description: "Black", isSelected: true }] } },
+  ] }] },
+  "searchResultsSort-1": { sortButton: { options: [{ name: "Popular", isSelected: true, action: { link: "/search/?sorting=score" } }] } },
+  "searchResultsFiltersActive-1": { activeFilters: [{ key: "brand", name: "Brand", ftype: "RESPONSE_FILTER_TYPE_MULTI", activeValues: [{ title: "Brand A", disableUri: "/search/" }] }] },
+  "infiniteVirtualPaginator-1": { nextPage: "/search/?page=2", prevPage: "", size: 10, layoutContainer: "default", fetchType: "virtualScroll" },
+  "categoryBrandList-1": { brands: [{ text: "Brand A", action: { link: "/category/mice/brand-a/" } }] },
+};
+
+function withPrivateMarkers(value) {
+  if (Array.isArray(value)) return value.map(withPrivateMarkers);
+  if (value && typeof value === "object") return {
+    ...Object.fromEntries(Object.entries(value).map(([k, v]) => [k, withPrivateMarkers(v)])),
+    trackingInfo: { secret: "PRIVATE_MARKER" },
+    cellTrackingInfo: { filterValue: "PRIVATE_MARKER" },
+    abFeatures: "PRIVATE_MARKER",
+    searchBar: { history: "PRIVATE_MARKER" },
+    account: "PRIVATE_MARKER",
+  };
+  return value;
+}
+
+for (const mode of ["fetch", "widgets"]) {
+  test(`${mode} projects search metadata at every nesting level`, async () => {
+    const marked = withPrivateMarkers(searchWidgets);
+    const states = Object.fromEntries(Object.entries(marked).map(([k, v], index) =>
+      [k, mode === "widgets" || index % 2 ? JSON.stringify(v) : v]));
+    const value = jsonValue(await evaluate(
+      mode === "fetch" ? { mode, path: "/search/" } : { mode },
+      mode === "fetch" ? { fetch: async () => response(JSON.stringify({ widgetStates: states })) }
+        : { document: { querySelectorAll: () => Object.entries(states).map(([key, state]) => ({ id: `state-${key}`, getAttribute: () => state })) } },
+    ));
+    const expected = structuredClone(searchWidgets);
+    expected["filtersDesktop-1"].sections[0].filters[1].checkboxesFilter.openingButtons.showAllButton = {};
+    assert.deepEqual(value, { page: { widgetStates: expected } });
+    assert.equal(JSON.stringify(value).includes("PRIVATE_MARKER"), false);
+    assert.equal(JSON.stringify(value).includes("execute-secret"), false);
+  });
+
+  test(`${mode} safely ignores malformed optional metadata`, async () => {
+    const states = {
+      "webPrice-1": '{"price":"100"}',
+      "filtersDesktop-1": '{invalid',
+      "searchResultsSort-1": { sortButton: { options: null } },
+      "categoryBrandList-1": [],
+      "searchResultsFiltersActive-1": null,
+      "infiniteVirtualPaginator-1": { nextPage: { private: "PRIVATE_MARKER" } },
+      "filtersDesktop-2": { sections: [null, [], { filters: [null, { type: "account", account: { title: "PRIVATE_MARKER" } }, { type: "boolFilter", boolFilter: [] }] }] },
+    };
+    const value = jsonValue(await evaluate(
+      mode === "fetch" ? { mode, path: "/search/" } : { mode },
+      mode === "fetch" ? { fetch: async () => response(JSON.stringify({ widgetStates: states })) }
+        : { document: { querySelectorAll: () => Object.entries(states).map(([key, state]) => ({ id: `state-${key}`, getAttribute: () => typeof state === "string" ? state : JSON.stringify(state) })) } },
+    ));
+    assert.deepEqual(value, { page: { widgetStates: {
+      "webPrice-1": '{"price":"100"}',
+      "infiniteVirtualPaginator-1": {},
+      "filtersDesktop-2": { sections: [{ filters: [] }] },
+    } } });
+  });
+}

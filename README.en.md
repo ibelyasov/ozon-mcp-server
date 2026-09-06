@@ -10,9 +10,11 @@ The browser runs without a window by default. A local profile keeps cookies and 
 
 ## Capabilities
 
-- `ozon_search` finds up to 36 products by query, price range and sort order.
+- `ozon_search` searches by query, price and sort, returning available Ozon facets and a continuation cursor. Up to 36 products per call include ratings, review counts, price conditions and available delivery labels.
 - `ozon_product_details` reads available prices, seller, rating, images, specifications and description by URL, SKU or slug.
 - `ozon_product_reviews` reads up to 30 available reviews.
+
+Follow returned facet `searchUrl` links to refine a search and `nextCursor` to continue it. Available filters depend on the category and Ozon response; incomplete coverage and unknown conditions remain explicit. Use details and reviews to verify shortlisted products. See [search parameters and limitations](docs/behavior.md#search-refinement-and-continuation).
 
 Each successful call returns the same valid JSON as MCP `structuredContent` and text content. Unknown values remain `null`, and missing expected widgets produce warnings. Prices and availability depend on region, session and payment conditions.
 
@@ -87,7 +89,7 @@ npm test
 cargo test --locked
 ```
 
-The Rust target has nine ordinary offline tests for parsing, input validation, output bounds and fallback routing; all nine passed. A separate ignored-by-default real-Chromium test cancels endless JavaScript, closes the private browser and successfully restarts it; it passed in 8.00 seconds. Neither test path depends on Ozon or establishes marketplace availability. See [configuration and behavior](docs/behavior.md) for the opt-in command, isolation and resource limits.
+After the search upgrade, all 29 ordinary Rust tests and 10 browser-script tests passed, covering parsing, facets, continuation, URL boundaries and public metadata extraction. A separate ignored-by-default real-Chromium test cancels endless JavaScript, closes the private browser and successfully restarts it; it passed in 8.00 seconds. Neither test path depends on Ozon or establishes marketplace availability. See [configuration and behavior](docs/behavior.md) for the opt-in command, isolation and resource limits.
 
 ## Credits and license
 

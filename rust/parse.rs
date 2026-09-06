@@ -305,19 +305,33 @@ fn parse_search_item(item: &Value) -> Option<Value> {
             .iter()
             .find(|p| p.get("textStyle").and_then(Value::as_str) == Some("PRICE"))
             .and_then(|p| p.get("text")),
-    )?;
+    );
     let old_price = price_to_number(
         prices
             .iter()
             .find(|p| p.get("textStyle").and_then(Value::as_str) == Some("ORIGINAL_PRICE"))
             .and_then(|p| p.get("text")),
     )
-    .filter(|old| *old > price);
+    .filter(|old| price.is_some_and(|current| *old > current));
     let name = states
         .iter()
         .find(|s| s.get("id").and_then(Value::as_str) == Some("name"))
         .and_then(|s| text_from(s.get("textDS")));
 
+    let price_type = match price_block
+        .and_then(|p| p.get("priceStyle"))
+        .and_then(|p| p.get("styleType"))
+        .and_then(Value::as_str)
+    {
+        Some("CARD_PRICE") => "ozon_card",
+        _ => "unknown",
+    };
+    let price_label = (price_type == "ozon_card").then_some("Цена с Ozon Картой");
+    let delivery_label = item
+        .get("multiButton")
+        .and_then(|v| v.pointer("/ozonButton/addToCart/actionButton/title"))
+        .and_then(text)
+        .filter(|label| label.chars().count() <= 120);
     let mut rating = None;
     let mut reviews = None;
     if let Some(items) = states.iter().find_map(|state| {
@@ -390,7 +404,9 @@ fn parse_search_item(item: &Value) -> Option<Value> {
         .or_else(|| tile_image.and_then(|tile| image_url(tile.get("coverImage"))));
 
     Some(json!({
-        "sku": sku, "name": name, "price": number_value(price),
+        "sku": sku, "name": name, "price": price.map(number_value),
+        "currency": "RUB", "priceType": price_type, "priceLabel": price_label,
+        "deliveryLabel": delivery_label, "seller": null,
         "oldPrice": old_price.map(number_value),
         "discount": price_block.and_then(|p| p.get("discount")).and_then(|v| match v { Value::String(s) if !s.trim().is_empty() => Some(Value::String(s.trim().to_owned())), Value::Number(_) => Some(v.clone()), _ => None }),
         "rating": rating.map(number_value), "reviews": reviews, "brand": brand,
@@ -398,14 +414,17 @@ fn parse_search_item(item: &Value) -> Option<Value> {
     }))
 }
 
-pub fn parse_search(page: &Value, limit: usize) -> Value {
-    let items: Vec<Value> = widget(page, "tileGridDesktop")
-        .and_then(|grid| grid.get("items").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
+pub fn parse_search_items(page: &Value) -> Vec<Value> {
+    widgets(page, "tileGridDesktop")
         .iter()
+        .filter_map(|grid| grid.get("items").and_then(Value::as_array))
+        .flatten()
         .filter_map(parse_search_item)
-        .take(limit)
-        .collect();
+        .collect()
+}
+
+pub fn parse_search(page: &Value, limit: usize) -> Value {
+    let items: Vec<Value> = parse_search_items(page).into_iter().take(limit).collect();
     json!({ "count": items.len(), "items": items })
 }
 

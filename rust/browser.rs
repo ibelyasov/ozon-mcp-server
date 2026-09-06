@@ -473,15 +473,49 @@ fn is_requested_page(requested: &str, actual: &str) -> bool {
     if target.origin() != final_url.origin() {
         return false;
     }
-    if target.path() == "/search/" {
-        let a: std::collections::HashMap<_, _> = target.query_pairs().collect();
-        let b: std::collections::HashMap<_, _> = final_url.query_pairs().collect();
-        return (final_url.path() == "/search/"
-            || (final_url.path().starts_with("/category/")
-                && b.get("category_was_predicted").is_some_and(|v| v == "true")))
-            && ["text", "sorting", "currency_price"]
-                .iter()
-                .all(|key| a.get(*key).is_none_or(|v| b.get(*key) == Some(v)));
+    if target.path() == "/search/" || target.path().starts_with("/category/") {
+        if has_duplicate_query_key(&target, "sorting")
+            || has_duplicate_query_key(&final_url, "sorting")
+        {
+            return false;
+        }
+        let predicted_category = target.path() == "/search/"
+            && final_url.path().starts_with("/category/")
+            && final_url
+                .query_pairs()
+                .any(|(key, value)| key == "category_was_predicted" && value == "true");
+        let allowed_path = if target.path() == "/search/" {
+            final_url.path() == "/search/" || predicted_category
+        } else {
+            target.path() == final_url.path()
+        };
+        let mut requested_query = semantic_query(&target);
+        let actual_query = semantic_query(&final_url);
+        if allowed_path && requested_query == actual_query {
+            return true;
+        }
+
+        // Ozon canonicalizes a single numeric brand facet into the final category
+        // path segment. Accept only that exact representation change.
+        let Some(brand) = single_numeric_brand(&requested_query) else {
+            return false;
+        };
+        let brand_pair = ("brand".to_owned(), brand.clone());
+        requested_query.remove(&brand_pair);
+        let category_path_matches = if target.path() == "/search/" {
+            predicted_category
+        } else {
+            target.path() == final_url.path()
+                || final_url
+                    .path()
+                    .trim_end_matches('/')
+                    .strip_suffix(&format!("-{brand}"))
+                    .and_then(|path| path.rsplit_once('/'))
+                    .is_some_and(|(parent, _)| parent == target.path().trim_end_matches('/'))
+        };
+        return category_path_matches
+            && category_path_has_brand(final_url.path(), &brand)
+            && requested_query == actual_query;
     }
     let re = regex::Regex::new(r"^/product/(?:[^/]*-)?([0-9]+)/(reviews/)?$").unwrap();
     match (re.captures(target.path()), re.captures(final_url.path())) {
@@ -491,6 +525,59 @@ fn is_requested_page(requested: &str, actual: &str) -> bool {
         }
         _ => target.path() == final_url.path(),
     }
+}
+
+fn has_duplicate_query_key(url: &url::Url, expected: &str) -> bool {
+    url.query_pairs()
+        .filter(|(key, _)| key == expected)
+        .nth(1)
+        .is_some()
+}
+
+fn single_numeric_brand(
+    query: &std::collections::BTreeMap<(String, String), usize>,
+) -> Option<String> {
+    let mut brands = query.iter().filter(|((key, _), _)| key == "brand");
+    let ((_, brand), count) = brands.next()?;
+    (brands.next().is_none()
+        && *count == 1
+        && !brand.is_empty()
+        && brand.bytes().all(|byte| byte.is_ascii_digit()))
+    .then(|| brand.clone())
+}
+
+fn category_path_has_brand(path: &str, brand: &str) -> bool {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| {
+            segment == brand
+                || segment
+                    .strip_suffix(brand)
+                    .is_some_and(|prefix| prefix.ends_with('-'))
+        })
+}
+
+fn semantic_query(url: &url::Url) -> std::collections::BTreeMap<(String, String), usize> {
+    let mut pairs = std::collections::BTreeMap::new();
+    for (key, value) in url.query_pairs() {
+        if is_navigation_metadata(&key) {
+            continue;
+        }
+        if key == "sorting" && matches!(value.as_ref(), "score" | "popular") {
+            continue;
+        }
+        let value = value.into_owned();
+        *pairs.entry((key.into_owned(), value)).or_default() += 1;
+    }
+    pairs
+}
+
+fn is_navigation_metadata(key: &str) -> bool {
+    matches!(
+        key,
+        "__rr" | "category_was_predicted" | "deny_category_prediction" | "from_global" | "at"
+    )
 }
 
 #[cfg(test)]
@@ -513,6 +600,160 @@ mod tests {
         assert!(!is_requested_page(
             "https://www.ozon.ru/product/123/",
             "https://evil.example/product/123/"
+        ));
+    }
+
+    #[test]
+    fn search_redirect_preserves_all_semantic_query_pairs() {
+        let requested = "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=2&search_page_state=abc";
+        assert!(is_requested_page(
+            requested,
+            "https://www.ozon.ru/search/?search_page_state=abc&page=2&delivery=tomorrow&brand=logitech&text=mouse"
+        ));
+        for actual in [
+            "https://www.ozon.ru/search/?text=mouse&delivery=tomorrow&page=2&search_page_state=abc",
+            "https://www.ozon.ru/search/?text=mouse&brand=other&delivery=tomorrow&page=2&search_page_state=abc",
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech&page=2&search_page_state=abc",
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=3&search_page_state=abc",
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=2&search_page_state=changed",
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=2&search_page_state=abc&color=black",
+        ] {
+            assert!(!is_requested_page(requested, actual), "accepted {actual}");
+        }
+    }
+
+    #[test]
+    fn search_redirect_compares_duplicate_query_pairs_as_a_multiset() {
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=a&brand=b",
+            "https://www.ozon.ru/search/?brand=b&text=mouse&brand=a"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=a&brand=b",
+            "https://www.ozon.ru/search/?text=mouse&brand=b&brand=b"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=a&brand=a",
+            "https://www.ozon.ru/search/?text=mouse&brand=a"
+        ));
+    }
+
+    #[test]
+    fn search_redirect_allows_only_known_navigation_metadata() {
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
+            "https://www.ozon.ru/search/?brand=logitech&text=mouse&__rr=1&deny_category_prediction=true&from_global=true&at=analytics-token"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech&tracking_token=123"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech&utm_source=unknown"
+        ));
+    }
+
+    #[test]
+    fn search_redirect_normalizes_only_default_sort() {
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&sorting=popular",
+            "https://www.ozon.ru/search/?text=mouse&sorting=score"
+        ));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse",
+            "https://www.ozon.ru/search/?text=mouse&sorting=score"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse",
+            "https://www.ozon.ru/search/?text=mouse&sorting=price"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&sorting=rating",
+            "https://www.ozon.ru/search/?text=mouse"
+        ));
+        for actual in [
+            "https://www.ozon.ru/search/?text=mouse&sorting=price&sorting=score",
+            "https://www.ozon.ru/search/?text=mouse&sorting=score&sorting=price",
+            "https://www.ozon.ru/search/?text=mouse&sorting=rating&sorting=popular",
+            "https://www.ozon.ru/search/?text=mouse&sorting=popular&sorting=rating",
+        ] {
+            assert!(!is_requested_page(
+                "https://www.ozon.ru/search/?text=mouse&sorting=price",
+                actual
+            ));
+        }
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&sorting=price&sorting=score",
+            "https://www.ozon.ru/search/?text=mouse&sorting=price"
+        ));
+    }
+
+    #[test]
+    fn search_prediction_requires_marker_and_matching_semantics() {
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&text=mouse&category_was_predicted=true"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&text=mouse"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
+            "https://www.ozon.ru/category/mice-15871/?brand=other&text=mouse&category_was_predicted=true"
+        ));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=26303256",
+            "https://www.ozon.ru/category/mice-15871/logitech-26303256/?text=mouse&category_was_predicted=true"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=26303256&brand=other",
+            "https://www.ozon.ru/category/mice-15871/logitech-26303256/?text=mouse&category_was_predicted=true"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=mouse&brand=26303256",
+            "https://www.ozon.ru/category/mice-15871/other-42/?text=mouse&category_was_predicted=true"
+        ));
+    }
+
+    #[test]
+    fn category_redirect_requires_exact_path_and_semantics() {
+        assert!(is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
+            "https://www.ozon.ru/category/mice-15871/?page=2&brand=logitech&__rr=1"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
+            "https://www.ozon.ru/category/keyboards-15872/?brand=logitech&page=2"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=3"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
+            "https://www.ozon.ru/search/?brand=logitech&page=2"
+        ));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=26303256&page=2",
+            "https://www.ozon.ru/category/mice-15871/logitech-26303256/?page=2"
+        ));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=26303256&sorting=score",
+            "https://www.ozon.ru/category/mice-15871/logitech-26303256/"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=26303256&sorting=price",
+            "https://www.ozon.ru/category/mice-15871/logitech-26303256/"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=26303256&sorting=rating",
+            "https://www.ozon.ru/category/mice-15871/logitech-26303256/"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mice-15871/?brand=26303256&page=2",
+            "https://www.ozon.ru/category/keyboards-15872/logitech-26303256/?page=2"
         ));
     }
 
