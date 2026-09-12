@@ -33,6 +33,10 @@ For `BROWSER_COMMAND_FAILED` only, a read-only request gets one retry in a confi
 
 Successful tools return the same JSON object as MCP `structuredContent` and text content. The server never truncates JSON: oversized results fail explicitly. It can only return fields present in the received page; unknown values remain `null` where defined.
 
+Tool output schemas are derived from the same Rust types that serialize the results. Optional warnings on product details and reviews remain absent when there is nothing to report; unknown data fields remain `null`. Optional search metadata and the final MCP response use the same serialized UTF-16 size measurement. The separate driver and page byte limits protect their own transport resources.
+
+Widget readers skip malformed instances and continue to later usable instances of the same widget. Readers of paginators, filters, sort options, grids and review lists also check the required field or container shape, so a wrong-shape object cannot hide a later usable instance. Explicit empty containers retain their meaning; a missing or malformed container is not evidence of an empty result.
+
 Search items include `rating` (product rating) and `reviews` (review count). The search tool description tells assistants to consider both together when comparing products, and to treat `null` as unknown rather than zero. The `popular` sort uses Ozon's ordering; it does not expose a numeric popularity score or sales count. Assistants can use `ozon_product_reviews` to read available review text when useful for the comparison.
 
 ### Search refinement and continuation
@@ -71,17 +75,39 @@ Unrecovered HTTP errors and browser command failures are tool errors. Raw page r
 ## Concurrency, timeouts and cancellation
 
 - Up to eight calls are admitted per server process, including the active call; a single browser mutex permits one actual browser operation at a time.
+- Arguments are validated before admission or browser access. Invalid requests do not close a healthy browser. Cancelling a queued request does not interrupt the active request.
 - The whole tool deadline is 55 seconds including queue time.
 - Normal agent-browser commands have a 45-second deadline; page evaluation commands have 40 seconds.
 - The in-page Ozon fetch aborts after 35 seconds.
 - An accepted Ozon page response is limited to 4 MiB. Driver JSON is separately bounded, and the final result is limited to 60,000 UTF-16 code units.
 - Agent-browser receives a ten-minute idle timeout.
 
-On cancellation, failure or timeout, the server closes only the private browser whose local CDP endpoint it captured and validated. It sends the standard CDP `Browser.close` command to that loopback endpoint, then asks agent-browser to close the session. This narrow interrupt path is not a general CDP implementation or a second browser driver. If shutdown cannot be confirmed, the session is poisoned and subsequent work fails closed instead of sharing an uncertain browser.
+When cancellation, a timeout or uncertain browser state requires cleanup, the server closes only the private browser whose local CDP endpoint it captured and validated. It sends the standard CDP `Browser.close` command to that loopback endpoint, then asks agent-browser to close the session. This narrow interrupt path is not a general CDP implementation or a second browser driver. If shutdown cannot be confirmed, the session is poisoned and subsequent work fails closed instead of sharing an uncertain browser.
+
+Reset decisions use typed browser failures rather than error-message text. Browser failures that leave session state uncertain require cleanup; ordinary validation and marketplace responses do not by themselves invalidate a healthy session. The one fresh-session retry remains restricted to `BROWSER_COMMAND_FAILED`.
 
 Browser startup is cancellation-shielded only while the server acquires ownership: opening the private browser is bounded to 15 seconds and capturing its validated local CDP endpoint to another 5 seconds. Client cancellation is reported immediately, while the admitted queue slot and browser lock remain owned until this bounded acquisition and cleanup finish. This prevents a detached browser from being orphaned before the server knows which endpoint it may close.
 
 ## Compatibility and verification
+
+### Internal architecture
+
+The server remains one Rust binary. Its modules hide different kinds of knowledge:
+
+- `main` adapts typed requests/results and schemas to MCP.
+- `executor` owns admission, deadlines, cancellation, tracked work and cleanup ordering. A dropped MCP handler cancels the work without releasing ownership before cleanup finishes.
+- `operations` and `search` validate and execute marketplace scenarios through the internal `PageSource` interface. Production uses Ozon pages; offline scenario tests use scripted pages.
+- `model` defines public result types; `parse` converts external widget data and owns product-description merging; `widgets` applies one decoding and instance-selection policy.
+- `ozon_pages` owns Ozon preparation, region selection, composer requests, accepted fallback pages and retry policy.
+- `browser` owns the pinned driver, persistent profile lease, session state, private endpoint and shutdown.
+- `page_outcome` validates the TypeScript/Rust bridge, while `browser_error` classifies browser failures. Shared synthetic fixtures exercise accepted and rejected bridge outcomes in both languages.
+- `response` measures serialized public results and enforces the final response budget.
+
+External Ozon data remains dynamic inside extraction and parsing. Cross-module product/search/review results are typed; public JSON is produced at the MCP edge. The generated `page.js` stays checked in so Cargo builds and the installed server do not require Node.js.
+
+CI checks generated JavaScript freshness and browser-script tests, plus Rust formatting, tests and Clippy. Browser lifecycle tests remain opt-in and use disposable profiles; ordinary tests do not contact Ozon.
+
+On September 12, 2026, local architecture-refactor checks passed on Rust 1.95.0: 52 ordinary Rust tests, 11 browser-script tests, generated JavaScript freshness, formatting, Clippy with warnings denied, and a debug build. A stdio check verified all three tools' typed output schemas and rejected invalid requests without launching Chrome. Both opt-in Chromium lifecycle tests passed with disposable profiles (11.42 seconds total). These checks did not contact Ozon. The new Rust 1.88 CI job has not been run locally.
 
 On September 6, 2026, acceptance for concurrent profile leasing passed:
 

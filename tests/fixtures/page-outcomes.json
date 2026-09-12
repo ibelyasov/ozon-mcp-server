@@ -1,0 +1,35 @@
+{
+  "valid": [
+    {
+      "kind": "page",
+      "outcome": {
+        "page": {
+          "widgetStates": { "webPrice-1": { "price": "100" } },
+          "seo": { "title": null, "link": [{ "href": "/product/1" }] },
+          "layoutTrackingInfo": { "sku": 123 }
+        }
+      }
+    },
+    { "kind": "status", "outcome": { "status": 403 } },
+    { "kind": "error", "outcome": { "error": "CAPTCHA_OR_BLOCKED" } },
+    { "kind": "error", "outcome": { "error": "FETCH_FAILED" } },
+    { "kind": "error", "outcome": { "error": "FETCH_TIMEOUT" } },
+    { "kind": "error", "outcome": { "error": "INVALID_OPTIONS" } },
+    { "kind": "error", "outcome": { "error": "INVALID_ORIGIN" } },
+    { "kind": "error", "outcome": { "error": "INVALID_RESPONSE" } },
+    { "kind": "error", "outcome": { "error": "RESPONSE_TOO_LARGE" } }
+  ],
+  "invalid": [
+    null,
+    {},
+    { "unknown": true },
+    { "error": "FUTURE_ERROR" },
+    { "status": "403" },
+    { "page": { "widgetStates": [] } },
+    { "page": { "widgetStates": {}, "private": true } },
+    { "page": { "widgetStates": {}, "seo": null } },
+    { "page": { "widgetStates": {}, "layoutTrackingInfo": null } },
+    { "page": { "widgetStates": {} }, "status": 200 },
+    { "error": "FETCH_FAILED", "status": 503 }
+  ]
+}

@@ -1,8 +1,16 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
-use serde_json::{Map, Number, Value, json};
-use std::collections::HashSet;
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, HashSet};
 use url::Url;
+
+use crate::{
+    model::{
+        Description, Discount, Duty, NumericValue, PriceType, ProductDetails, Review, ReviewPage,
+        SearchItem, Seller,
+    },
+    widgets::WidgetSet,
+};
 
 const OZON_ORIGIN: &str = "https://www.ozon.ru";
 
@@ -31,29 +39,12 @@ fn parse_json_value(value: Option<&Value>) -> Option<Value> {
     serde_json::from_str(value.as_str()?).ok()
 }
 
-fn widget_name(key: &str) -> &str {
-    key.split('-').next().unwrap_or("")
-}
-
-fn widgets(page: &Value, name: &str) -> Vec<Value> {
-    page.get("widgetStates")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|states| states.iter())
-        .filter(|(key, _)| widget_name(key) == name)
-        .filter_map(|(_, value)| parse_json_value(Some(value)))
-        .filter(Value::is_object)
-        .collect()
-}
-
-fn widget(page: &Value, name: &str) -> Option<Value> {
-    widgets(page, name).into_iter().next()
-}
-
-fn number_value(number: f64) -> Value {
-    Number::from_f64(number)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
+fn widget_matching(
+    page: &Value,
+    name: &str,
+    predicate: impl FnMut(&Value) -> bool,
+) -> Option<Value> {
+    WidgetSet::new(page).first_matching(name, predicate)
 }
 
 fn valid_grouped_integer(value: &str) -> bool {
@@ -280,7 +271,26 @@ fn has_star_icon(value: Option<&Value>) -> bool {
     strings.iter().any(|item| item.contains("ic_s_star"))
 }
 
-fn parse_search_item(item: &Value) -> Option<Value> {
+fn discount(value: Option<&Value>) -> Option<Discount> {
+    match value? {
+        Value::String(value) if !value.trim().is_empty() => {
+            Some(Discount::Text(value.trim().to_owned()))
+        }
+        Value::Number(number) => {
+            let value = if let Some(value) = number.as_u64() {
+                NumericValue::Unsigned(value)
+            } else if let Some(value) = number.as_i64() {
+                NumericValue::Signed(value)
+            } else {
+                NumericValue::Float(number.as_f64()?)
+            };
+            Some(Discount::Number(value))
+        }
+        _ => None,
+    }
+}
+
+fn parse_search_item(item: &Value) -> Option<SearchItem> {
     let item = item.as_object()?;
     let states: Vec<&Map<String, Value>> = item
         .get("mainState")
@@ -323,10 +333,10 @@ fn parse_search_item(item: &Value) -> Option<Value> {
         .and_then(|p| p.get("styleType"))
         .and_then(Value::as_str)
     {
-        Some("CARD_PRICE") => "ozon_card",
-        _ => "unknown",
+        Some("CARD_PRICE") => PriceType::OzonCard,
+        _ => PriceType::Unknown,
     };
-    let price_label = (price_type == "ozon_card").then_some("Цена с Ozon Картой");
+    let price_label = (price_type == PriceType::OzonCard).then(|| "Цена с Ozon Картой".to_owned());
     let delivery_label = item
         .get("multiButton")
         .and_then(|v| v.pointer("/ozonButton/addToCart/actionButton/title"))
@@ -403,29 +413,37 @@ fn parse_search_item(item: &Value) -> Option<Value> {
         .next()
         .or_else(|| tile_image.and_then(|tile| image_url(tile.get("coverImage"))));
 
-    Some(json!({
-        "sku": sku, "name": name, "price": price.map(number_value),
-        "currency": "RUB", "priceType": price_type, "priceLabel": price_label,
-        "deliveryLabel": delivery_label, "seller": null,
-        "oldPrice": old_price.map(number_value),
-        "discount": price_block.and_then(|p| p.get("discount")).and_then(|v| match v { Value::String(s) if !s.trim().is_empty() => Some(Value::String(s.trim().to_owned())), Value::Number(_) => Some(v.clone()), _ => None }),
-        "rating": rating.map(number_value), "reviews": reviews, "brand": brand,
-        "url": url, "image": image
-    }))
+    Some(SearchItem {
+        sku,
+        name,
+        price,
+        currency: "RUB".to_owned(),
+        price_type,
+        price_label,
+        delivery_label,
+        seller: None,
+        old_price,
+        discount: discount(price_block.and_then(|p| p.get("discount"))),
+        rating,
+        reviews,
+        brand,
+        url,
+        image,
+        matches_price_range: None,
+    })
 }
 
-pub fn parse_search_items(page: &Value) -> Vec<Value> {
-    widgets(page, "tileGridDesktop")
-        .iter()
-        .filter_map(|grid| grid.get("items").and_then(Value::as_array))
+pub fn parse_search_items(page: &Value) -> Vec<SearchItem> {
+    WidgetSet::new(page)
+        .all_valid("tileGridDesktop")
+        .filter_map(|mut grid| {
+            grid.get_mut("items")
+                .and_then(Value::as_array_mut)
+                .map(std::mem::take)
+        })
         .flatten()
-        .filter_map(parse_search_item)
+        .filter_map(|item| parse_search_item(&item))
         .collect()
-}
-
-pub fn parse_search(page: &Value, limit: usize) -> Value {
-    let items: Vec<Value> = parse_search_items(page).into_iter().take(limit).collect();
-    json!({ "count": items.len(), "items": items })
 }
 
 fn rs_text(value: Option<&Value>) -> String {
@@ -450,9 +468,11 @@ fn first_rs_text(values: &[Option<&Value>]) -> Option<String> {
     })
 }
 
-fn parse_short_characteristics(page: &Value) -> Value {
-    let mut out = Map::new();
-    let state = widget(page, "webShortCharacteristics");
+fn parse_short_characteristics(page: &Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let state = widget_matching(page, "webShortCharacteristics", |value| {
+        value.get("characteristics").is_some_and(Value::is_array)
+    });
     for characteristic in state
         .as_ref()
         .and_then(|s| s.get("characteristics"))
@@ -473,15 +493,29 @@ fn parse_short_characteristics(page: &Value) -> Value {
             characteristic.get("valueRs"),
         ]);
         if let (Some(title), Some(value)) = (title, value) {
-            out.insert(title, Value::String(value));
+            out.insert(title, value);
         }
     }
-    Value::Object(out)
+    out
 }
 
 fn parse_product_score(page: &Value) -> (Option<f64>, Option<u64>) {
-    let Some(state) =
-        widget(page, "webSingleProductScore").or_else(|| widget(page, "webReviewProductScore"))
+    let score_shape = |value: &Value| {
+        [
+            "rating",
+            "ratingValue",
+            "text",
+            "reviews",
+            "reviewCount",
+            "reviewsCount",
+            "totalReviews",
+        ]
+        .iter()
+        .any(|key| value.get(*key).is_some())
+            || value.pointer("/title/text").is_some()
+    };
+    let Some(state) = widget_matching(page, "webSingleProductScore", score_shape)
+        .or_else(|| widget_matching(page, "webReviewProductScore", score_shape))
     else {
         return (None, None);
     };
@@ -511,20 +545,17 @@ fn parse_product_score(page: &Value) -> (Option<f64>, Option<u64>) {
     (rating, reviews)
 }
 
-fn parse_seller(page: &Value) -> Value {
-    let Some(state) = widget(page, "webCurrentSeller") else {
-        return Value::Null;
-    };
-    let Some(name) = text_from(state.pointer("/sellerCell/centerBlock/title"))
-        .or_else(|| text_from(state.get("title")))
-    else {
-        return Value::Null;
-    };
+fn parse_seller(page: &Value) -> Option<Seller> {
+    let state = widget_matching(page, "webCurrentSeller", |value| {
+        value.pointer("/sellerCell/centerBlock/title").is_some() || value.get("title").is_some()
+    })?;
+    let name = text_from(state.pointer("/sellerCell/centerBlock/title"))
+        .or_else(|| text_from(state.get("title")))?;
     let rating = rating_from_value(state.pointer("/rating/title/text"))
         .or_else(|| rating_from_value(state.pointer("/rating/title")))
         .or_else(|| rating_from_value(state.get("rating")));
     let url = clean_url(state.pointer("/sellerCell/common/action/link"));
-    json!({ "name": name, "rating": rating.map(number_value), "url": url })
+    Some(Seller { name, rating, url })
 }
 
 fn decode_html_entities(value: &str) -> String {
@@ -610,10 +641,10 @@ fn walk_description(value: &Value, texts: &mut Vec<String>, images: &mut Vec<Str
     }
 }
 
-pub fn parse_description(page: &Value) -> Value {
+pub fn parse_description(page: &Value) -> Description {
     let mut texts = Vec::new();
     let mut images = Vec::new();
-    for state in widgets(page, "webDescription") {
+    for state in WidgetSet::new(page).all_valid("webDescription") {
         let text_start = texts.len();
         let image_start = images.len();
         if let Some(annotation) = parse_json_value(state.get("richAnnotationJson"))
@@ -636,7 +667,10 @@ pub fn parse_description(page: &Value) -> Value {
     }
     let mut seen = HashSet::new();
     images.retain(|image| seen.insert(image.clone()));
-    json!({ "text": texts.join(" ").trim(), "images": images })
+    Description {
+        text: texts.join(" ").trim().to_owned(),
+        images,
+    }
 }
 
 fn parse_duty(page: &Value) -> Option<(f64, &'static str)> {
@@ -644,7 +678,7 @@ fn parse_duty(page: &Value) -> Option<(f64, &'static str)> {
         Regex::new(r"(?iu)([+-]?\d(?:[\d\s\u{00a0}\u{202f}.,]*\d)?)\s*(?:₽|руб(?:\.|л[а-яё]*)?)")
             .unwrap();
     let marker = Regex::new(r"(?iu)customs-duty|пошлин").unwrap();
-    for state in widgets(page, "webIconWithText") {
+    for state in WidgetSet::new(page).all_valid("webIconWithText") {
         let mut strings = Vec::new();
         collect_strings(&state, &mut strings);
         if !strings.iter().any(|s| marker.is_match(s)) {
@@ -678,10 +712,20 @@ fn seo_url(page: &Value) -> Option<String> {
         .find_map(|link| clean_url(link.get("href")))
 }
 
-pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> Value {
-    let heading = widget(base_page, "webProductHeading");
-    let price = widget(base_page, "webPrice");
-    let gallery = widget(base_page, "webGallery");
+pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails {
+    let heading = widget_matching(base_page, "webProductHeading", |value| {
+        value.get("title").is_some()
+    });
+    let price = widget_matching(base_page, "webPrice", |value| {
+        ["cardPrice", "price", "originalPrice", "isAvailable"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+    });
+    let gallery = widget_matching(base_page, "webGallery", |value| {
+        ["sku", "coverImage", "images"]
+            .iter()
+            .any(|key| value.get(*key).is_some())
+    });
     let tracking = parse_json_value(base_page.get("layoutTrackingInfo"));
     let url = seo_url(base_page);
     let sku = normalize_sku(gallery.as_ref().and_then(|v| v.get("sku")))
@@ -716,21 +760,49 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> Value {
     images.truncate(10);
     let card_price = price_to_number(price.as_ref().and_then(|v| v.get("cardPrice")))
         .or_else(|| price_to_number(price.as_ref().and_then(|v| v.get("price"))));
-    let duty = parse_duty(base_page).map(|(amount, note)| json!({ "amount": number_value(amount), "total": card_price.map(|p| number_value(p + amount)), "note": note }));
+    let duty = parse_duty(base_page).map(|(amount, note)| Duty {
+        amount,
+        total: card_price.map(|price| price + amount),
+        note: note.to_owned(),
+    });
     let name = text_from(heading.as_ref().and_then(|v| v.get("title")))
         .or_else(|| base_page.pointer("/seo/title").and_then(text));
     let final_url = url.or_else(|| {
         sku.as_ref()
             .map(|sku| format!("https://www.ozon.ru/product/{sku}/"))
     });
-    json!({
-        "sku": sku, "name": name, "url": final_url, "price": card_price.map(number_value),
-        "priceRegular": price_to_number(price.as_ref().and_then(|v| v.get("price"))).map(number_value),
-        "oldPrice": price_to_number(price.as_ref().and_then(|v| v.get("originalPrice"))).map(number_value),
-        "duty": duty, "available": price.as_ref().and_then(|v| v.get("isAvailable")).and_then(Value::as_bool),
-        "rating": rating.map(number_value), "reviews": reviews, "seller": parse_seller(base_page), "images": images,
-        "characteristics": parse_short_characteristics(base_page), "description": parse_description(page2.unwrap_or(&Value::Null))
-    })
+    let mut description = parse_description(base_page);
+    if let Some(page2) = page2 {
+        let secondary = parse_description(page2);
+        if !description.has_text() {
+            description.text = secondary.text;
+        }
+        for image in secondary.images {
+            if !description.images.contains(&image) {
+                description.images.push(image);
+            }
+        }
+    }
+    ProductDetails {
+        sku,
+        name,
+        url: final_url,
+        price: card_price,
+        price_regular: price_to_number(price.as_ref().and_then(|v| v.get("price"))),
+        old_price: price_to_number(price.as_ref().and_then(|v| v.get("originalPrice"))),
+        duty,
+        available: price
+            .as_ref()
+            .and_then(|v| v.get("isAvailable"))
+            .and_then(Value::as_bool),
+        rating,
+        reviews,
+        seller: parse_seller(base_page),
+        images,
+        characteristics: parse_short_characteristics(base_page),
+        description,
+        warnings: Vec::new(),
+    }
 }
 
 fn unix_to_date(value: Option<&Value>) -> Option<String> {
@@ -763,28 +835,61 @@ fn author_name(author: Option<&Value>) -> Option<String> {
     })
 }
 
-pub fn parse_reviews(page: &Value, limit: usize) -> Value {
-    let state = widget(page, "webListReviews");
+pub fn parse_reviews(page: &Value, limit: usize) -> ReviewPage {
+    let state = widget_matching(page, "webListReviews", |value| {
+        value.get("reviews").is_some_and(Value::is_array)
+            || value.get("items").is_some_and(Value::is_array)
+    });
     let raw = state.as_ref().and_then(|v| {
         v.get("reviews")
             .and_then(Value::as_array)
             .or_else(|| v.get("items").and_then(Value::as_array))
     });
     let (rating, total) = parse_product_score(page);
-    let reviews: Vec<Value> = raw.into_iter().flatten().filter(|v| v.is_object()).take(limit).map(|review| {
-        let content = review.get("content").filter(|v| v.is_object());
-        let author = author_name(review.get("author")).or_else(|| (review.get("isAnonymous").and_then(Value::as_bool) == Some(true)).then(|| "Аноним".to_owned()));
-        let optional_string = |key| content.and_then(|c| c.get(key)).and_then(Value::as_str).map(str::to_owned);
-        json!({
-            "author": author, "score": rating_from_value(content.and_then(|c| c.get("score"))).map(number_value),
-            "comment": optional_string("comment"), "pros": optional_string("positive"), "cons": optional_string("negative"),
-            "date": unix_to_date(review.get("publishedAt").or_else(|| review.get("createdAt"))),
-            "useful": count_from_value(review.pointer("/usefulness/useful")),
-            "purchased": review.get("isItemPurchased").and_then(Value::as_bool),
-            "hasPhotos": content.and_then(|c| c.get("photos")).and_then(Value::as_array).map(|photos| !photos.is_empty())
+    let reviews: Vec<Review> = raw
+        .into_iter()
+        .flatten()
+        .filter(|v| v.is_object())
+        .take(limit)
+        .map(|review| {
+            let content = review.get("content").filter(|v| v.is_object());
+            let author = author_name(review.get("author")).or_else(|| {
+                (review.get("isAnonymous").and_then(Value::as_bool) == Some(true))
+                    .then(|| "Аноним".to_owned())
+            });
+            let optional_string = |key| {
+                content
+                    .and_then(|c| c.get(key))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            Review {
+                author,
+                score: rating_from_value(content.and_then(|c| c.get("score"))),
+                comment: optional_string("comment"),
+                pros: optional_string("positive"),
+                cons: optional_string("negative"),
+                date: unix_to_date(
+                    review
+                        .get("publishedAt")
+                        .or_else(|| review.get("createdAt")),
+                ),
+                useful: count_from_value(review.pointer("/usefulness/useful")),
+                purchased: review.get("isItemPurchased").and_then(Value::as_bool),
+                has_photos: content
+                    .and_then(|c| c.get("photos"))
+                    .and_then(Value::as_array)
+                    .map(|photos| !photos.is_empty()),
+            }
         })
-    }).collect();
-    json!({ "rating": rating.map(number_value), "totalReviews": total, "count": reviews.len(), "reviews": reviews })
+        .collect();
+    ReviewPage {
+        rating,
+        total_reviews: total,
+        count: reviews.len(),
+        reviews,
+        warnings: Vec::new(),
+    }
 }
 
 #[cfg(test)]

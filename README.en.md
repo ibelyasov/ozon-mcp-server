@@ -88,8 +88,12 @@ npm test
 `check:page` checks types and verifies that `page.js` matches its source. Commit both files together; CI repeats this check and the browser script's offline tests.
 
 ```sh
+cargo fmt --all -- --check
 cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 ```
+
+CI also runs Rust tests on the minimum supported version 1.88.0, and formatting, tests and Clippy on 1.95.0. See the [module architecture and request execution rules](docs/behavior.md#internal-architecture).
 
 After the search upgrade, all 29 ordinary Rust tests and 10 browser-script tests passed, covering parsing, facets, continuation, URL boundaries and public metadata extraction. A separate ignored-by-default real-Chromium test cancels endless JavaScript, closes the private browser and successfully restarts it; it passed in 8.00 seconds. Neither test path depends on Ozon or establishes marketplace availability. See [configuration and behavior](docs/behavior.md) for the opt-in command, isolation and resource limits.
 

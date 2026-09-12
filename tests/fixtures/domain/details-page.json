@@ -1,0 +1,12 @@
+{
+  "seo": {
+    "title": "Example",
+    "link": [{ "href": "/product/example-901/" }]
+  },
+  "widgetStates": {
+    "webProductHeading-a": { "title": "Example" },
+    "webPrice-a": { "cardPrice": "10,50 ₽", "isAvailable": false },
+    "webSingleProductScore-a": { "rating": "4,5", "reviewsCount": "0" },
+    "webDescription-a": { "richAnnotation": "Useful text<img src='/one.jpg'>" }
+  }
+}

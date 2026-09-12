@@ -2,17 +2,60 @@
 //! Paginator links are promoted from widget-fragment to full-document requests
 //! by removing only paginator_token, layout_page_index and layout_container.
 //! Observed page numbers and semantic continuation state remain unchanged.
-use crate::{operations::SearchArgs, parse};
+use crate::{
+    model::{
+        ActiveFilter, ActiveFilterValue, Facet, FacetOption, FacetRange, Facets, NumericValue,
+        SearchContext, SearchCoverage, SearchItem, SearchResponse, SortOption, Warning,
+    },
+    page_source::PageSource,
+    parse,
+    response::{METADATA_BUDGET_UNITS, serialized_utf16_len},
+    widgets::WidgetSet,
+};
 use anyhow::{Result, ensure};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashSet;
+use tokio_util::sync::CancellationToken;
 
 const MAX_URL: usize = 24_000;
 const MAX_CURSOR: usize = 48_000;
 const MAX_SEEN: usize = 500;
 const MAX_CALLS: usize = 100;
 const MAX_OFFSET: usize = 10000;
+
+fn search_limit() -> usize {
+    12
+}
+
+fn sort_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["popular", "price", "price_desc", "rating", "new", "discount"]
+    })
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SearchArgs {
+    #[schemars(length(min = 1, max = 2000))]
+    pub query: Option<String>,
+    #[schemars(length(min = 1, max = 24000))]
+    pub search_url: Option<String>,
+    #[schemars(length(min = 1, max = 48000))]
+    pub next_cursor: Option<String>,
+    pub include_facets: Option<bool>,
+    #[schemars(schema_with = "sort_schema")]
+    pub sort: Option<String>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub price_min: Option<u64>,
+    #[schemars(range(min = 0, max = 9_007_199_254_740_991_u64))]
+    pub price_max: Option<u64>,
+    #[serde(default = "search_limit")]
+    #[schemars(range(min = 1, max = 36))]
+    pub limit: usize,
+}
 
 fn safe_key(key: &str) -> bool {
     !key.is_empty()
@@ -168,21 +211,21 @@ fn reset(base: &str) -> Option<String> {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Request {
+struct PreparedSearchRequest {
     version: u8,
     url: String,
     offset: usize,
     seen: Vec<String>,
     calls: usize,
 }
-impl Request {
-    pub fn path(&self) -> String {
+impl PreparedSearchRequest {
+    fn path(&self) -> String {
         self.url
             .trim_start_matches("https://www.ozon.ru")
             .to_owned()
     }
 }
-pub fn prepare(args: &SearchArgs) -> Result<Request> {
+fn prepare_request(args: &SearchArgs) -> Result<PreparedSearchRequest> {
     ensure!(
         (1..=36).contains(&args.limit),
         "limit must be between 1 and 36"
@@ -197,7 +240,7 @@ pub fn prepare(args: &SearchArgs) -> Result<Request> {
             "nextCursor cannot be combined with query, searchUrl, sort or price"
         );
         ensure!(cursor.len() <= MAX_CURSOR, "Cursor too large");
-        let mut request: Request = serde_json::from_str(cursor)?;
+        let mut request: PreparedSearchRequest = serde_json::from_str(cursor)?;
         ensure!(
             request.version == 1
                 && request.offset <= MAX_OFFSET
@@ -270,7 +313,7 @@ pub fn prepare(args: &SearchArgs) -> Result<Request> {
         )
         .ok_or_else(|| anyhow::anyhow!("Invalid price URL"))?;
     }
-    Ok(Request {
+    Ok(PreparedSearchRequest {
         version: 1,
         url: normalize_search_url(&current)?,
         offset: 0,
@@ -278,24 +321,40 @@ pub fn prepare(args: &SearchArgs) -> Result<Request> {
         calls: 0,
     })
 }
-fn widget(page: &Value, name: &str) -> Option<Value> {
-    page["widgetStates"]
-        .as_object()?
-        .iter()
-        .find(|(key, _)| key.split('-').next() == Some(name))
-        .and_then(|(_, v)| {
-            if let Some(s) = v.as_str() {
-                serde_json::from_str(s).ok()
-            } else {
-                Some(v.clone())
-            }
-        })
+
+pub struct PreparedSearch {
+    args: SearchArgs,
+    request: PreparedSearchRequest,
 }
-fn label(v: &Value) -> Value {
+
+impl PreparedSearch {
+    pub fn prepare(args: SearchArgs) -> Result<Self> {
+        let request = prepare_request(&args)?;
+        Ok(Self { args, request })
+    }
+
+    pub async fn execute(
+        self,
+        source: &mut impl PageSource,
+        cancel: &CancellationToken,
+    ) -> Result<SearchResponse> {
+        ensure!(!cancel.is_cancelled(), "Request cancelled");
+        let page = source.fetch_json(&self.request.path(), cancel).await?;
+        ensure!(!cancel.is_cancelled(), "Request cancelled");
+        let mut result = finish(&page, &self.args, self.request)?;
+        if !WidgetSet::new(&page).has_matching("tileGridDesktop", |value| {
+            value.get("items").is_some_and(Value::is_array)
+        }) {
+            result.warnings.push(Warning::SearchWidgetMissing);
+        }
+        Ok(result)
+    }
+}
+
+fn label(v: &Value) -> Option<String> {
     v.as_str()
         .or_else(|| v["text"].as_str())
-        .map(|s| json!(s.chars().take(500).collect::<String>()))
-        .unwrap_or(Value::Null)
+        .map(|s| s.chars().take(500).collect())
 }
 fn items(v: &Value) -> Vec<&Value> {
     v["sections"]
@@ -328,7 +387,9 @@ fn refinement_base(base: &str, key: &str, selected: &[String]) -> String {
     u.into()
 }
 fn disable_link(page: &Value, key: &str, title: &Value) -> Option<String> {
-    let w = widget(page, "searchResultsFiltersActive")?;
+    let w = WidgetSet::new(page).first_matching("searchResultsFiltersActive", |value| {
+        value.get("activeFilters").is_some_and(Value::is_array)
+    })?;
     let target = label(title);
     w["activeFilters"]
         .as_array()?
@@ -341,10 +402,21 @@ fn disable_link(page: &Value, key: &str, title: &Value) -> Option<String> {
         .and_then(|u| reset(&u))
 }
 
-fn facets(page: &Value, base: &str) -> Value {
-    let Some(w) = widget(page, "filtersDesktop") else {
-        return Value::Null;
-    };
+fn numeric(value: &Value) -> Option<NumericValue> {
+    let number = value.as_number()?;
+    if let Some(value) = number.as_u64() {
+        Some(NumericValue::Unsigned(value))
+    } else if let Some(value) = number.as_i64() {
+        Some(NumericValue::Signed(value))
+    } else {
+        number.as_f64().map(NumericValue::Float)
+    }
+}
+
+fn facets(page: &Value, base: &str) -> Option<Facets> {
+    let w = WidgetSet::new(page).first_matching("filtersDesktop", |value| {
+        value.get("sections").is_some_and(Value::is_array)
+    })?;
     let filters: Vec<_> = w["sections"]
         .as_array()
         .into_iter()
@@ -377,31 +449,51 @@ fn facets(page: &Value, base: &str) -> Value {
         } else {
             body
         };
-        let mut f = json!({"type":kind,"key":key,"title":label(&title_body["title"]),"description":label(&title_body["description"])});
+        let mut facet = Facet {
+            kind: kind.to_owned(),
+            key: key.to_owned(),
+            title: label(&title_body["title"]),
+            description: label(&title_body["description"]),
+            range: None,
+            selected: None,
+            search_url: None,
+            options: None,
+            options_truncated: None,
+            is_radio: None,
+            has_more_values: None,
+        };
         if matches!(kind, "multipleRangesFilter" | "rangeFilter") {
-            let mut range = json!({});
-            for field in ["minValue", "maxValue", "fromValue", "toValue"] {
-                if title_body[field].is_number() {
-                    range[field] = title_body[field].clone();
-                }
-            }
-            f["range"] = range;
+            facet.range = Some(FacetRange {
+                min_value: numeric(&title_body["minValue"]),
+                max_value: numeric(&title_body["maxValue"]),
+                from_value: numeric(&title_body["fromValue"]),
+                to_value: numeric(&title_body["toValue"]),
+            });
         }
         let mut options = vec![];
         let mut count = 0;
         if kind == "boolFilter" {
             let selected = body["isSelected"].as_bool().unwrap_or(false);
-            f["selected"] = json!(selected);
-            f["searchUrl"] = json!(refine(
+            facet.selected = Some(selected);
+            facet.search_url = Some(refine(
                 base,
                 key,
-                if selected { None } else { Some("true") }
+                if selected { None } else { Some("true") },
             ));
         } else if kind == "categoryFilter" {
             for c in body["categories"].as_array().into_iter().flatten() {
                 count += 1;
                 if options.len() < 20 {
-                    options.push(json!({"label":label(&c["title"]),"selected":c["isActive"].as_bool().unwrap_or(false),"level":c["level"],"searchUrl":c["urlValue"].as_str().and_then(observed_url).and_then(|u|reset(&u))}));
+                    options.push(FacetOption {
+                        value: None,
+                        label: label(&c["title"]),
+                        selected: c["isActive"].as_bool().unwrap_or(false),
+                        level: Some(numeric(&c["level"])),
+                        search_url: c["urlValue"]
+                            .as_str()
+                            .and_then(observed_url)
+                            .and_then(|u| reset(&u)),
+                    });
                 }
             }
         } else {
@@ -461,30 +553,39 @@ fn facets(page: &Value, base: &str) -> Value {
                         },
                     )
                 });
-                options.push(json!({"value":value,"label":label(item.get("title").unwrap_or(&item["description"])),"selected":active,"searchUrl":target}));
+                options.push(FacetOption {
+                    value: Some(value.to_owned()),
+                    label: label(item.get("title").unwrap_or(&item["description"])),
+                    selected: active,
+                    level: None,
+                    search_url: target,
+                });
             }
-            f["isRadio"] = json!(radio);
-            f["hasMoreValues"] = json!(
+            facet.is_radio = Some(radio);
+            facet.has_more_values = Some(
                 checks["hasManyValues"].as_bool().unwrap_or(false)
-                    || checks["openingButtons"].get("showAllButton").is_some()
+                    || checks["openingButtons"].get("showAllButton").is_some(),
             );
         }
         if kind != "boolFilter" {
-            f["options"] = json!(options);
-            f["optionsTruncated"] = json!(count > 20);
+            facet.options = Some(options);
+            facet.options_truncated = Some(count > 20);
         }
-        let size = serde_json::to_string(&f).unwrap_or_default().len();
+        let size = serde_json::to_string(&facet).unwrap_or_default().len();
         if out.len() >= 40 || bytes + size > 24000 {
             truncated = true;
             break;
         }
         bytes += size;
-        out.push(f);
+        out.push(facet);
     }
-    json!({"items":out,"truncated":truncated})
+    Some(Facets {
+        items: out,
+        truncated,
+    })
 }
 
-fn annotate_price_range(products: &mut [Value], request_url: &url::Url) -> bool {
+fn annotate_price_range(products: &mut [SearchItem], request_url: &url::Url) -> bool {
     let bounds = request_url
         .query_pairs()
         .find(|(k, _)| k == "currency_price")
@@ -497,18 +598,51 @@ fn annotate_price_range(products: &mut [Value], request_url: &url::Url) -> bool 
     let mut outside = false;
     for product in products {
         let matches = bounds.and_then(|(min, max)| {
-            product["price"]
-                .as_f64()
+            product
+                .price
                 .filter(|p| p.is_finite())
                 .map(|p| p >= min && p <= max)
         });
         outside |= matches == Some(false);
-        product["matchesPriceRange"] = json!(matches);
+        product.matches_price_range = Some(matches);
     }
     outside
 }
 
-pub fn finish(page: &Value, args: &SearchArgs, mut request: Request) -> Result<Value> {
+fn trim_metadata(result: &mut SearchResponse) -> Result<()> {
+    if serialized_utf16_len(result)? <= METADATA_BUDGET_UNITS {
+        return Ok(());
+    }
+    let has_metadata = result
+        .facets
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|facets| !facets.items.is_empty())
+        || result
+            .active_filters
+            .as_ref()
+            .is_some_and(|filters| !filters.is_empty())
+        || result
+            .sort_options
+            .as_ref()
+            .is_some_and(|options| !options.is_empty());
+    if has_metadata {
+        result.facets = Some(Some(Facets {
+            items: Vec::new(),
+            truncated: true,
+        }));
+        result.active_filters = Some(Vec::new());
+        result.sort_options = Some(Vec::new());
+        result.warnings.push(Warning::SearchMetadataTruncated);
+    }
+    Ok(())
+}
+
+fn finish(
+    page: &Value,
+    args: &SearchArgs,
+    mut request: PreparedSearchRequest,
+) -> Result<SearchResponse> {
     let all = parse::parse_search_items(page);
     let start = request.offset;
     let mut seen: HashSet<_> = request.seen.iter().cloned().collect();
@@ -517,20 +651,19 @@ pub fn finish(page: &Value, args: &SearchArgs, mut request: Request) -> Result<V
     while offset < all.len() && products.len() < args.limit && seen.len() < MAX_SEEN {
         let item = &all[offset];
         offset += 1;
-        let sku = item["sku"]
-            .as_str()
-            .map(str::to_owned)
-            .or_else(|| item["sku"].as_u64().map(|n| n.to_string()));
-        if let Some(sku) =
-            sku.filter(|s| !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_digit()))
+        let sku = item.sku.clone();
+        if !sku.is_empty()
+            && sku.len() <= 32
+            && sku.bytes().all(|b| b.is_ascii_digit())
+            && seen.insert(sku.clone())
         {
-            if seen.insert(sku.clone()) {
-                request.seen.push(sku);
-                products.push(item.clone());
-            }
+            request.seen.push(sku);
+            products.push(item.clone());
         }
     }
-    let paginator = widget(page, "infiniteVirtualPaginator");
+    let paginator = WidgetSet::new(page).first_matching("infiniteVirtualPaginator", |value| {
+        value.get("nextPage").is_some_and(Value::is_string)
+    });
     let observed_next = paginator
         .as_ref()
         .and_then(|p| p["nextPage"].as_str())
@@ -547,7 +680,13 @@ pub fn finish(page: &Value, args: &SearchArgs, mut request: Request) -> Result<V
     };
     // Sort links carry canonical category/brand selections, but reset paging.
     // Use them only as refinement bases, never as continuation locations.
-    let facet_base = widget(page, "searchResultsSort")
+    let sort_shape = |value: &Value| {
+        value
+            .pointer("/sortButton/options")
+            .is_some_and(Value::is_array)
+    };
+    let facet_base = WidgetSet::new(page)
+        .first_matching("searchResultsSort", sort_shape)
         .and_then(|w| {
             w["sortButton"]["options"]
                 .as_array()
@@ -563,12 +702,12 @@ pub fn finish(page: &Value, args: &SearchArgs, mut request: Request) -> Result<V
         .and_then(|(_, v)| v.parse::<u64>().ok())
         .unwrap_or(1);
     request.calls += 1;
-    let mut warnings = vec!["SEARCH_RESULTS_MAY_CHANGE_BETWEEN_CALLS"];
+    let mut warnings = vec![Warning::SearchResultsMayChangeBetweenCalls];
     if stalled {
-        warnings.push("CONTINUATION_STALLED");
+        warnings.push(Warning::ContinuationStalled);
     }
     if observed_next.is_some() && next_url.is_none() && !stalled {
-        warnings.push("UNSAFE_PAGINATOR_URL_IGNORED");
+        warnings.push(Warning::UnsafePaginatorUrlIgnored);
     }
     let capped = seen.len() >= MAX_SEEN || request.calls >= MAX_CALLS || offset > MAX_OFFSET;
     let next_cursor = if has_next == Some(true) && !capped {
@@ -582,12 +721,12 @@ pub fn finish(page: &Value, args: &SearchArgs, mut request: Request) -> Result<V
         if encoded.len() <= MAX_CURSOR {
             Some(encoded)
         } else {
-            warnings.push("CONTINUATION_LIMIT_REACHED");
+            warnings.push(Warning::ContinuationLimitReached);
             None
         }
     } else {
         if capped && has_next == Some(true) {
-            warnings.push("CONTINUATION_LIMIT_REACHED");
+            warnings.push(Warning::ContinuationLimitReached);
         }
         None
     };
@@ -608,36 +747,133 @@ pub fn finish(page: &Value, args: &SearchArgs, mut request: Request) -> Result<V
         })
         .unwrap_or_else(|| "popular".into());
     if annotate_price_range(&mut products, &u) {
-        warnings.push("PRICE_OUTSIDE_REQUESTED_RANGE");
+        warnings.push(Warning::PriceOutsideRequestedRange);
     }
-    let mut result = json!({"items":products,"count":products.len(),"query":query,"sort":sort,"searchUrl":current,"nextCursor":next_cursor,"hasNext":has_next,"total":null,"context":{"region":null,"regionVerified":false},"coverage":{"page":page_num,"fetchedPagesThisCall":1,"parsedItems":all.len(),"parsedOffsetStart":start,"parsedOffsetEnd":offset,"returned":products.len(),"uniqueSeen":seen.len(),"callsInChain":request.calls},"warnings":warnings});
+    let count = products.len();
+    let mut result = SearchResponse {
+        items: products,
+        count,
+        query,
+        sort,
+        search_url: current,
+        next_cursor,
+        has_next,
+        total: None,
+        context: SearchContext {
+            region: None,
+            region_verified: false,
+        },
+        coverage: SearchCoverage {
+            page: page_num,
+            fetched_pages_this_call: 1,
+            parsed_items: all.len(),
+            parsed_offset_start: start,
+            parsed_offset_end: offset,
+            returned: count,
+            unique_seen: seen.len(),
+            calls_in_chain: request.calls,
+        },
+        warnings,
+        facets: None,
+        sort_options: None,
+        active_filters: None,
+    };
     if args.include_facets.unwrap_or(args.next_cursor.is_none()) {
-        result["facets"] = facets(page, &facet_base);
-        let sort_widget = widget(page, "sort").or_else(|| widget(page, "searchResultsSort"));
+        result.facets = Some(facets(page, &facet_base));
+        let sort_widget = WidgetSet::new(page)
+            .first_matching("sort", sort_shape)
+            .or_else(|| WidgetSet::new(page).first_matching("searchResultsSort", sort_shape));
         let sort_widget = sort_widget.or_else(|| {
-            page["widgetStates"]
-                .as_object()
-                .and_then(|m| m.values().find(|v| v.get("sortButton").is_some()).cloned())
+            WidgetSet::new(page).first_valid_where(|value| value.get("sortButton").is_some())
         });
-        result["sortOptions"]=json!(sort_widget.as_ref().map(|w|w["sortButton"]["options"].as_array().into_iter().flatten().take(12).map(|o|json!({"label":label(&o["name"]),"selected":o["isSelected"].as_bool().unwrap_or(false),"searchUrl":o["action"]["link"].as_str().and_then(observed_url).and_then(|u|reset(&u))})).collect::<Vec<_>>()).unwrap_or_default());
-        result["activeFilters"]=json!(widget(page,"searchResultsFiltersActive").map(|w|w["activeFilters"].as_array().into_iter().flatten().take(30).map(|f|json!({"key":label(&f["key"]),"name":label(&f["name"]),"type":label(&f["ftype"]),"values":f["activeValues"].as_array().into_iter().flatten().take(20).map(|v|json!({"label":label(&v["title"]),"searchUrl":v["disableUri"].as_str().and_then(observed_url).and_then(|u|reset(&u))})).collect::<Vec<_>>()})).collect::<Vec<_>>()).unwrap_or_default());
+        result.sort_options = Some(
+            sort_widget
+                .as_ref()
+                .map(|w| {
+                    w["sortButton"]["options"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(12)
+                        .map(|o| SortOption {
+                            label: label(&o["name"]),
+                            selected: o["isSelected"].as_bool().unwrap_or(false),
+                            search_url: o["action"]["link"]
+                                .as_str()
+                                .and_then(observed_url)
+                                .and_then(|u| reset(&u)),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        result.active_filters = Some(
+            WidgetSet::new(page)
+                .first_matching("searchResultsFiltersActive", |value| {
+                    value.get("activeFilters").is_some_and(Value::is_array)
+                })
+                .map(|w| {
+                    w["activeFilters"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .take(30)
+                        .map(|f| ActiveFilter {
+                            key: label(&f["key"]),
+                            name: label(&f["name"]),
+                            kind: label(&f["ftype"]),
+                            values: f["activeValues"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .take(20)
+                                .map(|v| ActiveFilterValue {
+                                    label: label(&v["title"]),
+                                    search_url: v["disableUri"]
+                                        .as_str()
+                                        .and_then(observed_url)
+                                        .and_then(|u| reset(&u)),
+                                })
+                                .collect(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
     }
     // Metadata is optional; trim it before allowing a response to grow large.
-    if serde_json::to_vec(&result)?.len() > 58_000 {
-        result["facets"] = json!({"items":[],"truncated":true});
-        result["activeFilters"] = json!([]);
-        result["sortOptions"] = json!([]);
-        result["warnings"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("SEARCH_METADATA_TRUNCATED"));
-    }
+    trim_metadata(&mut result)?;
     Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+
+    struct OnePage(Value);
+
+    impl PageSource for OnePage {
+        async fn fetch_json(&mut self, _: &str, _: &CancellationToken) -> Result<Value> {
+            Ok(self.0.clone())
+        }
+
+        async fn shutdown(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn finish(page: &Value, args: &SearchArgs, request: PreparedSearchRequest) -> Result<Value> {
+        Ok(serde_json::to_value(super::finish(page, args, request)?)?)
+    }
+
+    fn prepare(args: &SearchArgs) -> Result<PreparedSearchRequest> {
+        super::prepare_request(args)
+    }
+
+    fn facets(page: &Value, base: &str) -> Value {
+        serde_json::to_value(super::facets(page, base)).unwrap()
+    }
     fn args(v: Value) -> SearchArgs {
         serde_json::from_value(v).unwrap()
     }
@@ -647,6 +883,86 @@ mod tests {
             p["widgetStates"]["infiniteVirtualPaginator-x"] = json!({"nextPage":next});
         }
         p
+    }
+
+    #[test]
+    fn public_search_matches_golden_contract() {
+        let page: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/domain/search-page.json"))
+                .unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/domain/search-response.json"
+        ))
+        .unwrap();
+        let args = args(json!({"query": "x"}));
+        assert_eq!(
+            finish(&page, &args, prepare(&args).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn scenario_uses_valid_widgets_after_malformed_instances() {
+        let page = json!({"widgetStates": {
+            "tileGridDesktop-a": {},
+            "tileGridDesktop-b": {"items": [{"sku": "1", "mainState": []}]},
+            "infiniteVirtualPaginator-a": {},
+            "infiniteVirtualPaginator-b": {"nextPage": ""},
+            "filtersDesktop-a": {},
+            "filtersDesktop-b": {"sections": [{"filters": [{
+                "type": "boolFilter", "key": "is_promo",
+                "boolFilter": {"title": "Promo"}
+            }]}]}
+        }});
+        let response = PreparedSearch::prepare(args(json!({"query": "x"})))
+            .unwrap()
+            .execute(&mut OnePage(page), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(response.count, 1);
+        assert_eq!(response.has_next, Some(false));
+        assert_eq!(response.facets.unwrap().unwrap().items.len(), 1);
+        assert!(!response.warnings.contains(&Warning::SearchWidgetMissing));
+    }
+
+    #[tokio::test]
+    async fn malformed_only_grid_is_reported_missing() {
+        let page = json!({"widgetStates": {"tileGridDesktop-a": {}}});
+        let response = PreparedSearch::prepare(args(json!({"query": "x"})))
+            .unwrap()
+            .execute(&mut OnePage(page), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(response.warnings.contains(&Warning::SearchWidgetMissing));
+    }
+
+    #[test]
+    fn metadata_trim_only_reports_fields_actually_removed() {
+        let args = args(json!({"query": "x", "includeFacets": false}));
+        let mut without_metadata =
+            super::finish(&page(&[1], None), &args, prepare(&args).unwrap()).unwrap();
+        without_metadata.search_url = "😀".repeat(METADATA_BUDGET_UNITS / 2);
+        trim_metadata(&mut without_metadata).unwrap();
+        assert!(without_metadata.facets.is_none());
+        assert!(
+            !without_metadata
+                .warnings
+                .contains(&Warning::SearchMetadataTruncated)
+        );
+
+        let mut with_metadata = without_metadata;
+        with_metadata.sort_options = Some(vec![SortOption {
+            label: Some("observed".into()),
+            selected: true,
+            search_url: None,
+        }]);
+        trim_metadata(&mut with_metadata).unwrap();
+        assert_eq!(with_metadata.sort_options, Some(Vec::new()));
+        assert!(
+            with_metadata
+                .warnings
+                .contains(&Warning::SearchMetadataTruncated)
+        );
     }
     #[test]
     fn urls_are_scoped_before_normalization() {
@@ -817,12 +1133,30 @@ mod tests {
 
     #[test]
     fn displayed_prices_are_checked_without_filtering_or_reordering() {
+        let product = |sku: &str, price| SearchItem {
+            sku: sku.to_owned(),
+            name: None,
+            price,
+            currency: "RUB".to_owned(),
+            price_type: crate::model::PriceType::Unknown,
+            price_label: None,
+            delivery_label: None,
+            seller: None,
+            old_price: None,
+            discount: None,
+            rating: None,
+            reviews: None,
+            brand: None,
+            url: None,
+            image: None,
+            matches_price_range: None,
+        };
         let mut products = vec![
-            json!({"sku":"1","price":99}),
-            json!({"price":100}),
-            json!({"price":200}),
-            json!({"price":201}),
-            json!({"price":null}),
+            product("1", Some(99.0)),
+            product("2", Some(100.0)),
+            product("3", Some(200.0)),
+            product("4", Some(201.0)),
+            product("5", None),
         ];
         let u =
             url::Url::parse("https://www.ozon.ru/search/?currency_price=100.000;200.000").unwrap();
@@ -830,17 +1164,11 @@ mod tests {
         assert_eq!(
             products
                 .iter()
-                .map(|p| p["matchesPriceRange"].clone())
+                .map(|p| p.matches_price_range.flatten())
                 .collect::<Vec<_>>(),
-            vec![
-                json!(false),
-                json!(true),
-                json!(true),
-                json!(false),
-                Value::Null
-            ]
+            vec![Some(false), Some(true), Some(true), Some(false), None]
         );
-        assert_eq!(products[0]["sku"], "1");
+        assert_eq!(products[0].sku, "1");
         assert_eq!(products.len(), 5);
         for url in [
             "https://www.ozon.ru/search/",
@@ -851,7 +1179,7 @@ mod tests {
                 &mut products,
                 &url::Url::parse(url).unwrap()
             ));
-            assert!(products.iter().all(|p| p["matchesPriceRange"].is_null()));
+            assert!(products.iter().all(|p| p.matches_price_range == Some(None)));
         }
     }
 

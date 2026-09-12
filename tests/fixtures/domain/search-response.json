@@ -1,0 +1,44 @@
+{
+  "items": [
+    {
+      "sku": "901",
+      "name": "Example",
+      "price": null,
+      "currency": "RUB",
+      "priceType": "unknown",
+      "priceLabel": null,
+      "deliveryLabel": null,
+      "seller": null,
+      "oldPrice": null,
+      "discount": null,
+      "rating": null,
+      "reviews": null,
+      "brand": null,
+      "url": "https://www.ozon.ru/product/example-901/",
+      "image": null,
+      "matchesPriceRange": null
+    }
+  ],
+  "count": 1,
+  "query": "x",
+  "sort": "popular",
+  "searchUrl": "https://www.ozon.ru/search/?text=x&from_global=true",
+  "nextCursor": null,
+  "hasNext": false,
+  "total": null,
+  "context": { "region": null, "regionVerified": false },
+  "coverage": {
+    "page": 1,
+    "fetchedPagesThisCall": 1,
+    "parsedItems": 1,
+    "parsedOffsetStart": 0,
+    "parsedOffsetEnd": 1,
+    "returned": 1,
+    "uniqueSeen": 1,
+    "callsInChain": 1
+  },
+  "warnings": ["SEARCH_RESULTS_MAY_CHANGE_BETWEEN_CALLS"],
+  "facets": null,
+  "sortOptions": [],
+  "activeFilters": []
+}

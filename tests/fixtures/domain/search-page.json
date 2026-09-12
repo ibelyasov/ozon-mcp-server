@@ -1,0 +1,16 @@
+{
+  "widgetStates": {
+    "tileGridDesktop-a": {
+      "items": [
+        {
+          "sku": "901",
+          "action": { "link": "/product/example-901/" },
+          "mainState": [
+            { "id": "name", "textDS": { "text": "Example" } }
+          ]
+        }
+      ]
+    },
+    "infiniteVirtualPaginator-a": { "nextPage": "" }
+  }
+}

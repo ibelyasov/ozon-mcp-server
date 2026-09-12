@@ -1,0 +1,16 @@
+{
+  "widgetStates": {
+    "webSingleProductScore-a": { "rating": "5", "reviewsCount": "1" },
+    "webListReviews-a": {
+      "reviews": [
+        {
+          "author": { "firstName": "Ada" },
+          "content": { "score": 5, "comment": "Works", "photos": [] },
+          "publishedAt": 1704067200,
+          "usefulness": { "useful": 0 },
+          "isItemPurchased": false
+        }
+      ]
+    }
+  }
+}

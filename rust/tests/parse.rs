@@ -1,5 +1,55 @@
-use super::{parse_description, parse_details, parse_reviews, parse_search, parse_search_items};
-use serde_json::json;
+use super::{
+    parse_description as typed_description, parse_details as typed_details,
+    parse_reviews as typed_reviews, parse_search_items as typed_search_items,
+};
+use serde_json::{Value, json};
+
+fn parse_description(page: &Value) -> Value {
+    serde_json::to_value(typed_description(page)).unwrap()
+}
+
+fn parse_details(base: &Value, secondary: Option<&Value>) -> Value {
+    serde_json::to_value(typed_details(base, secondary)).unwrap()
+}
+
+fn parse_reviews(page: &Value, limit: usize) -> Value {
+    serde_json::to_value(typed_reviews(page, limit)).unwrap()
+}
+
+fn parse_search_items(page: &Value) -> Vec<Value> {
+    typed_search_items(page)
+        .into_iter()
+        .map(|item| serde_json::to_value(item).unwrap())
+        .collect()
+}
+
+fn parse_search(page: &Value, limit: usize) -> Value {
+    let items: Vec<Value> = parse_search_items(page).into_iter().take(limit).collect();
+    json!({"count": items.len(), "items": items})
+}
+
+fn fixture(name: &str) -> Value {
+    let source = match name {
+        "details-page" => include_str!("../../tests/fixtures/domain/details-page.json"),
+        "details-response" => include_str!("../../tests/fixtures/domain/details-response.json"),
+        "reviews-page" => include_str!("../../tests/fixtures/domain/reviews-page.json"),
+        "reviews-response" => include_str!("../../tests/fixtures/domain/reviews-response.json"),
+        _ => panic!("unknown fixture"),
+    };
+    serde_json::from_str(source).unwrap()
+}
+
+#[test]
+fn public_details_and_reviews_match_golden_contracts() {
+    assert_eq!(
+        parse_details(&fixture("details-page"), None),
+        fixture("details-response")
+    );
+    assert_eq!(
+        parse_reviews(&fixture("reviews-page"), 10),
+        fixture("reviews-response")
+    );
+}
 
 #[test]
 fn search_skips_malformed_widgets_and_parses_fractional_counts() {
@@ -91,6 +141,21 @@ fn reviews_preserves_variant_specific_unknowns() {
     assert_eq!(parsed["reviews"][1]["author"], "Аноним");
     assert_eq!(parsed["reviews"][1]["purchased"], json!(null));
     assert_eq!(parsed["reviews"][1]["hasPhotos"], json!(null));
+}
+
+#[test]
+fn reviews_skip_wrong_shape_but_preserve_explicit_empty_list() {
+    let page = json!({"widgetStates": {
+        "webListReviews-a": {},
+        "webListReviews-b": {"reviews": [{"isAnonymous": true, "content": {}}]}
+    }});
+    assert_eq!(parse_reviews(&page, 10)["count"], 1);
+
+    let empty = json!({"widgetStates": {
+        "webListReviews-a": {"reviews": []},
+        "webListReviews-b": {"reviews": [{"isAnonymous": true, "content": {}}]}
+    }});
+    assert_eq!(parse_reviews(&empty, 10)["count"], 0);
 }
 
 #[test]

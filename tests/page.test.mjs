@@ -4,11 +4,60 @@ import test from "node:test";
 import vm from "node:vm";
 
 const source = readFileSync(new URL("../rust/page.js", import.meta.url), "utf8");
+const outcomeFixtures = JSON.parse(
+  readFileSync(new URL("fixtures/page-outcomes.json", import.meta.url), "utf8"),
+);
 const encoder = new TextEncoder();
 
 function jsonValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
+
+function exactKeys(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => key in value);
+}
+
+function validPageOutcome(value) {
+  if (exactKeys(value, ["error"])) {
+    return [
+      "CAPTCHA_OR_BLOCKED",
+      "FETCH_FAILED",
+      "FETCH_TIMEOUT",
+      "INVALID_OPTIONS",
+      "INVALID_ORIGIN",
+      "INVALID_RESPONSE",
+      "RESPONSE_TOO_LARGE",
+    ].includes(value.error);
+  }
+  if (exactKeys(value, ["status"])) {
+    return Number.isSafeInteger(value.status) && value.status >= 0;
+  }
+  if (!exactKeys(value, ["page"]) || value.page === null ||
+      typeof value.page !== "object" || Array.isArray(value.page)) return false;
+  const allowed = new Set(["widgetStates", "seo", "layoutTrackingInfo"]);
+  if (Object.keys(value.page).some((key) => !allowed.has(key)) ||
+      value.page.widgetStates === null ||
+      typeof value.page.widgetStates !== "object" ||
+      Array.isArray(value.page.widgetStates)) return false;
+  if ("seo" in value.page &&
+      (!exactKeys(value.page.seo, ["title", "link"]) ||
+       !(value.page.seo.title === null || typeof value.page.seo.title === "string") ||
+       !Array.isArray(value.page.seo.link) ||
+       !value.page.seo.link.every((link) =>
+         exactKeys(link, ["href"]) && typeof link.href === "string"))) return false;
+  return !("layoutTrackingInfo" in value.page) ||
+    exactKeys(value.page.layoutTrackingInfo, ["sku"]);
+}
+
+test("shared page outcomes accept all variants and reject malformed unknowns", () => {
+  for (const { outcome } of outcomeFixtures.valid) {
+    assert.equal(validPageOutcome(outcome), true, JSON.stringify(outcome));
+  }
+  for (const outcome of outcomeFixtures.invalid) {
+    assert.equal(validPageOutcome(outcome), false, JSON.stringify(outcome));
+  }
+});
 
 function response(body, { status = 200, contentLength } = {}) {
   const chunks = Array.isArray(body) ? body : [encoder.encode(body)];
@@ -52,7 +101,9 @@ async function evaluate(options, overrides = {}) {
     clearTimeout,
     ...overrides,
   };
-  return vm.runInNewContext(`(${source})(${JSON.stringify(options)})`, context);
+  const outcome = await vm.runInNewContext(`(${source})(${JSON.stringify(options)})`, context);
+  assert.equal(validPageOutcome(jsonValue(outcome)), true, "page producer violated the shared outcome contract");
+  return outcome;
 }
 
 test("generated artifact is the callable expression Rust evaluates", async () => {

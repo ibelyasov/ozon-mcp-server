@@ -1,11 +1,20 @@
 mod browser;
+mod browser_error;
+mod executor;
+mod model;
 mod operations;
+mod ozon_pages;
+mod page_outcome;
+mod page_source;
 mod parse;
+mod response;
 mod search;
+mod widgets;
 
 use anyhow::Result;
-use browser::Browser;
-use operations::{DetailsArgs, ReviewsArgs, SearchArgs};
+use executor::RequestExecutor;
+use operations::{DetailsArgs, Operation, ReviewsArgs};
+use ozon_pages::OzonPages;
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -13,23 +22,13 @@ use rmcp::{
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
+use search::SearchArgs;
 use serde_json::Value;
-use std::{sync::Arc, time::Duration};
-use tokio::sync::{Mutex, Semaphore};
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct Ozon {
-    browser: Arc<Mutex<Browser>>,
-    slots: Arc<Semaphore>,
-    stop: CancellationToken,
-    tasks: TaskTracker,
-}
-
-enum Operation {
-    Search(SearchArgs),
-    Details(DetailsArgs),
-    Reviews(ReviewsArgs),
+    executor: Arc<RequestExecutor<OzonPages>>,
 }
 
 fn error(message: &str) -> CallToolResult {
@@ -47,73 +46,28 @@ impl Ozon {
         operation: Operation,
         request: RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Ok(slot) = self.slots.clone().try_acquire_owned() else {
-            return error("SERVER_BUSY: the request queue is full");
-        };
-        let cancel = self.stop.child_token();
-        // The SDK may drop a cancelled handler. Keep cleanup in a tracked task,
-        // and retain the browser mutex until the browser really has closed.
-        let _cancel_on_drop = cancel.clone().drop_guard();
-        let worker_cancel = cancel.clone();
-        let browser = self.browser.clone();
-        let work = self.tasks.spawn(async move {
-            let _slot = slot;
-            let mut browser = tokio::select! {
-                biased;
-                _ = worker_cancel.cancelled() => return Err(anyhow::anyhow!("Request cancelled")),
-                guard = browser.lock() => guard,
-            };
-            let result = match operation {
-                Operation::Search(args) => {
-                    operations::search(&mut browser, args, &worker_cancel).await
-                }
-                Operation::Details(args) => {
-                    operations::details(&mut browser, args, &worker_cancel).await
-                }
-                Operation::Reviews(args) => {
-                    operations::reviews(&mut browser, args, &worker_cancel).await
-                }
-            };
-            if result.is_err() || worker_cancel.is_cancelled() {
-                browser.shutdown().await?;
-            }
-            result
-        });
-        let result = tokio::select! {
-            biased;
-            _ = request.ct.cancelled() => { cancel.cancel(); return error("Request cancelled"); },
-            _ = self.stop.cancelled() => { cancel.cancel(); return error("Server shutting down"); },
-            _ = tokio::time::sleep(Duration::from_secs(55)) => { cancel.cancel(); return error("TOOL_TIMEOUT: tool exceeded 55 seconds including queue time"); },
-            result = work => result,
-        };
-        match result {
-            Ok(Ok(value)) => bounded_result(value),
-            Ok(Err(e)) => error(&e.to_string()),
-            Err(_) => error("Tool worker failed"),
+        match self.executor.run(operation, request.ct.clone()).await {
+            Ok(value) => match response::bounded_value(&value) {
+                Ok(value) => CallToolResult::structured(value),
+                Err(e) => error(&e.to_string()),
+            },
+            Err(e) => error(&e.to_string()),
         }
     }
 }
 
-fn bounded_result(value: Value) -> CallToolResult {
-    if value.to_string().encode_utf16().count() > 60000 {
-        error("RESULT_TOO_LARGE: response exceeds size limit")
-    } else {
-        CallToolResult::structured(value)
-    }
-}
-
-fn output_schema() -> Arc<serde_json::Map<String, Value>> {
+fn output_schema<T: schemars::JsonSchema>() -> Arc<serde_json::Map<String, Value>> {
     Arc::new(
-        serde_json::json!({"type":"object"})
+        schemars::schema_for!(T)
             .as_object()
-            .unwrap()
+            .expect("result schema is an object")
             .clone(),
     )
 }
 
 #[tool_router]
 impl Ozon {
-    #[tool(name = "ozon_search", output_schema = output_schema(), description = "Search Ozon products. Start with query, or follow a returned facet/sort searchUrl; continue with nextCursor alone (plus limit/includeFacets). limit 1-36, default 12, applies to one fetched page; follow nextCursor to see more. sort: popular, price, price_desc, rating, new, discount; priceMin/priceMax in RUB. sort/price overrides on searchUrl reset pagination. Available facets contain refinement links and selected values; missing or truncated facets are not an exhaustive catalog. rating is product rating, reviews is review count: compare both, treating null as unknown, not zero. popular is Ozon ordering, not a numeric popularity or sales measure. Check priceType/priceLabel, matchesPriceRange and deliveryLabel; native Ozon filters may return out-of-range displayed prices. Region is unverified. count is returned items, not total matches. For shortlisted products use ozon_product_details to verify characteristics, seller and payment prices, and ozon_product_reviews to read review text. Report search coverage and unknown fields; search results can change between calls.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
+    #[tool(name = "ozon_search", output_schema = output_schema::<model::SearchResponse>(), description = "Search Ozon products. Start with query, or follow a returned facet/sort searchUrl; continue with nextCursor alone (plus limit/includeFacets). limit 1-36, default 12, applies to one fetched page; follow nextCursor to see more. sort: popular, price, price_desc, rating, new, discount; priceMin/priceMax in RUB. sort/price overrides on searchUrl reset pagination. Available facets contain refinement links and selected values; missing or truncated facets are not an exhaustive catalog. rating is product rating, reviews is review count: compare both, treating null as unknown, not zero. popular is Ozon ordering, not a numeric popularity or sales measure. Check priceType/priceLabel, matchesPriceRange and deliveryLabel; native Ozon filters may return out-of-range displayed prices. Region is unverified. count is returned items, not total matches. For shortlisted products use ozon_product_details to verify characteristics, seller and payment prices, and ozon_product_reviews to read review text. Report search coverage and unknown fields; search results can change between calls.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
     async fn search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
@@ -121,7 +75,7 @@ impl Ozon {
     ) -> CallToolResult {
         self.run(Operation::Search(args), request).await
     }
-    #[tool(name = "ozon_product_details", output_schema = output_schema(), description = "Read an Ozon product by SKU, product URL or slug. Returns available price, seller, images, characteristics and description; warnings indicate missing data. Use on shortlisted search results to verify required characteristics, seller and price conditions before recommending a product.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
+    #[tool(name = "ozon_product_details", output_schema = output_schema::<model::ProductDetails>(), description = "Read an Ozon product by SKU, product URL or slug. Returns available price, seller, images, characteristics and description; warnings indicate missing data. Use on shortlisted search results to verify required characteristics, seller and price conditions before recommending a product.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
     async fn details(
         &self,
         Parameters(args): Parameters<DetailsArgs>,
@@ -129,7 +83,7 @@ impl Ozon {
     ) -> CallToolResult {
         self.run(Operation::Details(args), request).await
     }
-    #[tool(name = "ozon_product_reviews", output_schema = output_schema(), description = "Read available Ozon customer reviews by SKU, product URL or slug. Limit 1-30, default 10. Unknown purchase and photo indicators remain null.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
+    #[tool(name = "ozon_product_reviews", output_schema = output_schema::<model::ReviewPage>(), description = "Read available Ozon customer reviews by SKU, product URL or slug. Limit 1-30, default 10. Unknown purchase and photo indicators remain null.", annotations(read_only_hint = true, open_world_hint = true, idempotent_hint = true))]
     async fn reviews(
         &self,
         Parameters(args): Parameters<ReviewsArgs>,
@@ -155,10 +109,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let service = Ozon {
-        browser: Arc::new(Mutex::new(Browser::from_env().await?)),
-        slots: Arc::new(Semaphore::new(8)),
-        stop: CancellationToken::new(),
-        tasks: TaskTracker::new(),
+        executor: Arc::new(RequestExecutor::new(OzonPages::from_env().await?)),
     };
     let running = service.clone().serve(rmcp::transport::stdio()).await?;
     eprintln!(
@@ -170,10 +121,7 @@ async fn main() -> Result<()> {
         _ = running.waiting() => {},
         _ = shutdown_signal() => { transport_cancel.cancel(); },
     }
-    service.stop.cancel();
-    service.tasks.close();
-    service.tasks.wait().await;
-    service.browser.lock().await.shutdown().await?;
+    service.executor.shutdown().await?;
     Ok(())
 }
 
@@ -195,14 +143,12 @@ mod tests {
     use super::*;
     #[test]
     fn mcp_output_is_structured_and_never_truncated() {
-        let result = bounded_result(serde_json::json!({"price": 12.5}));
+        let value = response::bounded_value(&serde_json::json!({"price": 12.5})).unwrap();
+        let result = CallToolResult::structured(value);
         assert_eq!(
             result.structured_content,
             Some(serde_json::json!({"price": 12.5}))
         );
-        assert_eq!(
-            bounded_result(serde_json::json!({"text": "x".repeat(60001)})).is_error,
-            Some(true)
-        );
+        assert!(response::bounded_value(&serde_json::json!({"text": "x".repeat(60001)})).is_err());
     }
 }

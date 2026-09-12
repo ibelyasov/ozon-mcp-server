@@ -1,0 +1,18 @@
+{
+  "rating": 5.0,
+  "totalReviews": 1,
+  "count": 1,
+  "reviews": [
+    {
+      "author": "Ada",
+      "score": 5.0,
+      "comment": "Works",
+      "pros": null,
+      "cons": null,
+      "date": "2024-01-01",
+      "useful": 0,
+      "purchased": false,
+      "hasPhotos": false
+    }
+  ]
+}

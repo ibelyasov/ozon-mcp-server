@@ -1,3 +1,4 @@
+use crate::browser_error::BrowserError;
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use futures_util::SinkExt;
@@ -7,7 +8,7 @@ use std::{
     io::ErrorKind,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,25 +19,26 @@ use tokio_util::sync::CancellationToken;
 const DRIVER_VERSION: &str = "agent-browser 0.36.0";
 const MAX_CLI_BYTES: usize = 12 * 1024 * 1024;
 const MAX_PROFILE_SLOTS: usize = 1024;
-const HOME: &str = "https://www.ozon.ru/";
-
-pub struct Browser {
+pub struct BrowserSession {
     binary: PathBuf,
     profile: PathBuf,
     executable: Option<String>,
     headed: bool,
-    city: String,
     runtime: tempfile::TempDir,
     _profile_lock: File,
     user_agent: Option<String>,
-    cdp: Option<String>,
-    ready: bool,
-    started: bool,
-    poisoned: bool,
-    last_used: Instant,
+    state: SessionState,
 }
 
-impl Browser {
+#[derive(Debug)]
+enum SessionState {
+    Idle,
+    Acquiring,
+    Running { cdp: String },
+    Poisoned,
+}
+
+impl BrowserSession {
     pub async fn from_env() -> Result<Self> {
         let binary =
             std::env::var_os("OZON_AGENT_BROWSER_BIN").unwrap_or_else(|| "agent-browser".into());
@@ -68,16 +70,8 @@ impl Browser {
             executable: std::env::var("OZON_BROWSER_EXECUTABLE").ok(),
             headed: std::env::var("OZON_HEADLESS")
                 .is_ok_and(|v| v.trim().eq_ignore_ascii_case("false")),
-            city: std::env::var("OZON_CITY")
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
             user_agent: None,
-            cdp: None,
-            ready: false,
-            started: false,
-            poisoned: false,
-            last_used: Instant::now(),
+            state: SessionState::Idle,
         };
         let output = browser
             .command()
@@ -153,55 +147,77 @@ impl Browser {
         if script.is_some() {
             cmd.stdin(Stdio::piped());
         }
-        let mut child = cmd.spawn().context("Cannot start agent-browser command")?;
+        let mut child = cmd.spawn().map_err(|_| BrowserError::DriverFailure {
+            operation: "process startup",
+        })?;
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
         let mut stdin = child.stdin.take();
         let work = async {
             let write = async {
                 if let (Some(mut input), Some(text)) = (stdin.take(), script) {
-                    input.write_all(text.as_bytes()).await?;
-                    input.shutdown().await?;
+                    input.write_all(text.as_bytes()).await.map_err(|_| {
+                        BrowserError::DriverFailure {
+                            operation: "stdin write",
+                        }
+                    })?;
+                    input
+                        .shutdown()
+                        .await
+                        .map_err(|_| BrowserError::DriverFailure {
+                            operation: "stdin shutdown",
+                        })?;
                 }
-                Ok::<_, std::io::Error>(())
+                Ok::<_, anyhow::Error>(())
             };
             let read = async {
                 let mut bytes = Vec::new();
                 (&mut stdout)
                     .take((MAX_CLI_BYTES + 1) as u64)
                     .read_to_end(&mut bytes)
-                    .await?;
-                ensure!(
-                    bytes.len() <= MAX_CLI_BYTES,
-                    "agent-browser response exceeds size limit"
-                );
+                    .await
+                    .map_err(|_| BrowserError::DriverFailure {
+                        operation: "stdout read",
+                    })?;
+                if bytes.len() > MAX_CLI_BYTES {
+                    return Err(BrowserError::DriverFailure {
+                        operation: "response size check",
+                    }
+                    .into());
+                }
                 Ok::<_, anyhow::Error>(bytes)
             };
             let errors = async {
                 // Drain without retaining page data or unbounded diagnostics.
-                tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+                tokio::io::copy(&mut stderr, &mut tokio::io::sink())
+                    .await
+                    .map_err(|_| BrowserError::DriverFailure {
+                        operation: "stderr drain",
+                    })?;
                 Ok::<_, anyhow::Error>(())
             };
-            let ((), bytes, ()) = tokio::try_join!(
-                async { write.await.map_err(anyhow::Error::from) },
-                read,
-                errors
-            )?;
-            let status = child.wait().await?;
+            let ((), bytes, ()) = tokio::try_join!(write, read, errors)?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|_| BrowserError::DriverFailure {
+                    operation: "process wait",
+                })?;
             let value: Value =
-                serde_json::from_slice(&bytes).context("Invalid agent-browser JSON response")?;
+                serde_json::from_slice(&bytes).map_err(|_| BrowserError::InvalidBridgeResponse)?;
             // Never return arbitrary CLI stderr or a raw page response as an error.
-            ensure!(
-                status.success() && value["success"] == true,
-                "BROWSER_COMMAND_FAILED: agent-browser {} failed",
-                args[0]
-            );
+            if !status.success() || value["success"] != true {
+                return Err(BrowserError::CommandFailed {
+                    command: args[0].to_owned(),
+                }
+                .into());
+            }
             Ok(value["data"].clone())
         };
         let result = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(anyhow::anyhow!("Request cancelled")),
-            _ = tokio::time::sleep(deadline) => Err(anyhow::anyhow!("BROWSER_TIMEOUT: agent-browser command timed out")),
+            _ = cancel.cancelled() => Err(BrowserError::Cancelled.into()),
+            _ = tokio::time::sleep(deadline) => Err(BrowserError::CommandTimeout.into()),
             result = work => result,
         };
         if result.is_err() {
@@ -210,11 +226,11 @@ impl Browser {
         result
     }
 
-    async fn run(&self, args: &[&str], cancel: &CancellationToken) -> Result<Value> {
+    pub(crate) async fn run(&self, args: &[&str], cancel: &CancellationToken) -> Result<Value> {
         self.raw(args, None, cancel, Duration::from_secs(45)).await
     }
 
-    async fn evaluate(&self, script: &str, cancel: &CancellationToken) -> Result<Value> {
+    pub(crate) async fn evaluate(&self, script: &str, cancel: &CancellationToken) -> Result<Value> {
         Ok(self
             .raw(
                 &["eval", "--stdin"],
@@ -226,7 +242,7 @@ impl Browser {
             .clone())
     }
 
-    async fn remember_cdp(&mut self, cancel: &CancellationToken) -> Result<()> {
+    async fn read_cdp(&self, cancel: &CancellationToken) -> Result<String> {
         let data = self
             .raw(&["get", "cdp-url"], None, cancel, Duration::from_secs(5))
             .await?;
@@ -234,49 +250,82 @@ impl Browser {
             .as_str()
             .or_else(|| data["value"].as_str())
             .or_else(|| data["cdpUrl"].as_str())
-            .context("agent-browser did not return its CDP endpoint")?;
-        let url = url::Url::parse(endpoint)?;
-        ensure!(
-            url.scheme() == "ws"
-                && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
-                && url.path().starts_with("/devtools/browser/")
-                && url.username().is_empty()
-                && url.password().is_none(),
-            "Expected a local private browser CDP endpoint"
-        );
-        self.cdp = Some(endpoint.to_owned());
-        Ok(())
+            .ok_or(BrowserError::DriverFailure {
+                operation: "CDP endpoint discovery",
+            })?;
+        let url = url::Url::parse(endpoint).map_err(|_| BrowserError::DriverFailure {
+            operation: "CDP endpoint validation",
+        })?;
+        if url.scheme() != "ws"
+            || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            || !url.path().starts_with("/devtools/browser/")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(BrowserError::DriverFailure {
+                operation: "CDP endpoint validation",
+            }
+            .into());
+        }
+        Ok(endpoint.to_owned())
     }
 
     async fn launch(&mut self, cancel: &CancellationToken) -> Result<()> {
-        ensure!(!cancel.is_cancelled(), "Request cancelled");
-        self.started = true;
+        if cancel.is_cancelled() {
+            return Err(BrowserError::Cancelled.into());
+        }
+        if matches!(self.state, SessionState::Poisoned) {
+            return Err(BrowserError::SessionPoisoned.into());
+        }
+        self.state = SessionState::Acquiring;
         // Acquire the private browser handle before honoring cancellation. Killing
         // the CLI halfway through startup can orphan its detached daemon before
         // we know which CDP endpoint to close. The acquisition itself is bounded.
         let acquiring = CancellationToken::new();
-        self.raw(
-            &["open", "about:blank"],
-            None,
-            &acquiring,
-            Duration::from_secs(15),
-        )
-        .await?;
-        self.remember_cdp(&acquiring).await?;
-        ensure!(!cancel.is_cancelled(), "Request cancelled");
+        let acquisition = async {
+            self.raw(
+                &["open", "about:blank"],
+                None,
+                &acquiring,
+                Duration::from_secs(15),
+            )
+            .await?;
+            self.read_cdp(&acquiring).await
+        }
+        .await;
+        let cdp = match acquisition {
+            Ok(cdp) => cdp,
+            Err(error) => {
+                let closed = self
+                    .raw(
+                        &["close"],
+                        None,
+                        &CancellationToken::new(),
+                        Duration::from_secs(7),
+                    )
+                    .await
+                    .is_ok();
+                self.state = if closed {
+                    SessionState::Idle
+                } else {
+                    SessionState::Poisoned
+                };
+                return Err(error);
+            }
+        };
+        self.state = SessionState::Running { cdp };
+        if cancel.is_cancelled() {
+            return Err(BrowserError::Cancelled.into());
+        }
         Ok(())
     }
 
-    async fn ensure_ready(&mut self, cancel: &CancellationToken) -> Result<()> {
-        ensure!(
-            !self.poisoned,
-            "BROWSER_CLEANUP_FAILED: previous session could not be closed; restart after closing its browser"
-        );
-        if self.ready && self.last_used.elapsed() < Duration::from_secs(590) {
-            return Ok(());
+    pub(crate) async fn ensure_running(&mut self, cancel: &CancellationToken) -> Result<()> {
+        if matches!(self.state, SessionState::Poisoned) {
+            return Err(BrowserError::SessionPoisoned.into());
         }
-        if self.started {
-            self.shutdown().await?;
+        if matches!(self.state, SessionState::Running { .. }) {
+            return Ok(());
         }
         self.launch(cancel).await?;
         if !self.headed && self.user_agent.is_none() {
@@ -284,145 +333,26 @@ impl Browser {
             self.shutdown().await?;
             self.user_agent = Some(
                 ua.as_str()
-                    .context("Missing browser User-Agent")?
+                    .ok_or(BrowserError::DriverFailure {
+                        operation: "User-Agent discovery",
+                    })?
                     .replace("HeadlessChrome/", "Chrome/"),
             );
             self.launch(cancel).await?;
         }
-        self.run(&["set", "viewport", "1920", "1080"], cancel)
-            .await?;
-        self.run(&["open", HOME], cancel).await?;
-        self.run(&["wait", "12000"], cancel).await?;
-        if !self.city.is_empty() {
-            self.try_set_city(cancel).await?;
-        }
-        self.ready = true;
-        self.last_used = Instant::now();
         Ok(())
-    }
-
-    async fn try_set_city(&self, cancel: &CancellationToken) -> Result<()> {
-        let action = async {
-            self.run(&["find", "first", "[data-widget*=locationSelector i], [data-widget*=region i], button[aria-label*=ород]", "click"], cancel).await?;
-            self.run(
-                &[
-                    "find",
-                    "first",
-                    "[role=dialog] input[type=text], [role=dialog] input[placeholder*=ород i]",
-                    "fill",
-                    &self.city,
-                ],
-                cancel,
-            )
-            .await?;
-            self.run(&["wait", "1500"], cancel).await?;
-            self.run(
-                &[
-                    "find",
-                    "first",
-                    "[role=dialog] [role=option], [role=dialog] li, [role=dialog] [data-suggest]",
-                    "click",
-                ],
-                cancel,
-            )
-            .await?;
-            self.run(&["wait", "2500"], cancel).await?;
-            Ok::<_, anyhow::Error>(())
-        };
-        // Never return prices from an unconfirmed requested region after UI failure.
-        match tokio::time::timeout(Duration::from_secs(10), action).await {
-            Ok(Ok(())) => {
-                eprintln!("OZON_CITY selection completed; verify the saved region if prices matter")
-            }
-            _ if cancel.is_cancelled() => bail!("Request cancelled"),
-            _ => bail!(
-                "REGION_SELECTION_FAILED: set the region manually in the profile and unset OZON_CITY"
-            ),
-        }
-        Ok(())
-    }
-
-    pub async fn fetch_json(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
-        let result = self.fetch_once(path, cancel).await;
-        if result
-            .as_ref()
-            .is_err_and(|e| e.to_string().starts_with("BROWSER_COMMAND_FAILED:"))
-            && !cancel.is_cancelled()
-        {
-            // Read-only request: one fresh-session retry for driver failures only.
-            // HTTP errors and challenges are returned without a restart loop.
-            self.shutdown().await?;
-            return self.fetch_once(path, cancel).await;
-        }
-        result
-    }
-
-    async fn fetch_once(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
-        let target = url::Url::parse(HOME)?.join(path)?;
-        ensure!(
-            target.origin() == url::Url::parse(HOME)?.origin(),
-            "Invalid Ozon origin"
-        );
-        self.ensure_ready(cancel).await?;
-        let script = format!(
-            "({})({})",
-            include_str!("page.js"),
-            json!({"mode":"fetch", "path":path})
-        );
-        let response = self.evaluate(&script, cancel).await?;
-        self.last_used = Instant::now();
-        if let Some(page) = response.get("page") {
-            return Ok(page.clone());
-        }
-        if response["error"] == "RESPONSE_TOO_LARGE" {
-            bail!("RESPONSE_TOO_LARGE: Ozon response exceeds 4 MiB");
-        }
-        // A direct page can still work when the composer endpoint or warm-up is blocked.
-        let status = response["status"].as_u64();
-        if status.is_some_and(|s| !matches!(s, 403 | 307)) {
-            bail!("Ozon returned HTTP {}", status.unwrap());
-        }
-        self.run(&["open", target.as_str()], cancel).await?;
-        self.run(&["wait", "1500"], cancel).await?;
-        let navigation = self.evaluate("({url:location.href,status:performance.getEntriesByType('navigation')[0]?.responseStatus})", cancel).await?;
-        let status = navigation["status"]
-            .as_u64()
-            .context("Ozon navigation HTTP status is unavailable")?;
-        ensure!(
-            (200..400).contains(&status),
-            "Ozon page returned HTTP {status}"
-        );
-        ensure!(
-            is_requested_page(
-                target.as_str(),
-                navigation["url"].as_str().unwrap_or_default()
-            ),
-            "Ozon redirected to a different page; requested data is unavailable"
-        );
-        let script = format!(
-            "({})({})",
-            include_str!("page.js"),
-            json!({"mode":"widgets"})
-        );
-        let response = self.evaluate(&script, cancel).await?;
-        self.last_used = Instant::now();
-        if let Some(page) = response.get("page") {
-            return Ok(page.clone());
-        }
-        if response["error"] == "RESPONSE_TOO_LARGE" {
-            bail!("RESPONSE_TOO_LARGE: Ozon response exceeds 4 MiB");
-        }
-        bail!("CAPTCHA_OR_BLOCKED: Ozon did not provide public product data")
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
-        if !self.started {
-            return Ok(());
-        }
-        self.ready = false;
+        let cdp = match &self.state {
+            SessionState::Idle => return Ok(()),
+            SessionState::Running { cdp } => Some(cdp.clone()),
+            SessionState::Acquiring => None,
+            SessionState::Poisoned => return Err(BrowserError::SessionPoisoned.into()),
+        };
         // agent-browser serializes commands, so `close` alone cannot interrupt eval.
         // This single standard CDP command only closes the private browser captured above.
-        if let Some(endpoint) = self.cdp.take() {
+        if let Some(endpoint) = cdp {
             let _ = tokio::time::timeout(Duration::from_secs(3), async {
                 let (mut ws, _) = tokio_tungstenite::connect_async(endpoint).await?;
                 ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -441,11 +371,11 @@ impl Browser {
                 Duration::from_secs(7),
             )
             .await;
-        self.poisoned = result.is_err();
-        if self.poisoned {
-            bail!("BROWSER_CLEANUP_FAILED: could not confirm private browser shutdown");
+        if result.is_err() {
+            self.state = SessionState::Poisoned;
+            return Err(BrowserError::CleanupFailed.into());
         }
-        self.started = false;
+        self.state = SessionState::Idle;
         Ok(())
     }
 }
@@ -538,126 +468,74 @@ fn try_lock_profile(profile: &Path) -> std::io::Result<Option<File>> {
     }
 }
 
-fn is_requested_page(requested: &str, actual: &str) -> bool {
-    let (Ok(target), Ok(final_url)) = (url::Url::parse(requested), url::Url::parse(actual)) else {
-        return false;
-    };
-    if target.origin() != final_url.origin() {
-        return false;
-    }
-    if target.path() == "/search/" || target.path().starts_with("/category/") {
-        if has_duplicate_query_key(&target, "sorting")
-            || has_duplicate_query_key(&final_url, "sorting")
-        {
-            return false;
-        }
-        let predicted_category = target.path() == "/search/"
-            && final_url.path().starts_with("/category/")
-            && final_url
-                .query_pairs()
-                .any(|(key, value)| key == "category_was_predicted" && value == "true");
-        let allowed_path = if target.path() == "/search/" {
-            final_url.path() == "/search/" || predicted_category
-        } else {
-            target.path() == final_url.path()
-        };
-        let mut requested_query = semantic_query(&target);
-        let actual_query = semantic_query(&final_url);
-        if allowed_path && requested_query == actual_query {
-            return true;
-        }
-
-        // Ozon canonicalizes a single numeric brand facet into the final category
-        // path segment. Accept only that exact representation change.
-        let Some(brand) = single_numeric_brand(&requested_query) else {
-            return false;
-        };
-        let brand_pair = ("brand".to_owned(), brand.clone());
-        requested_query.remove(&brand_pair);
-        let category_path_matches = if target.path() == "/search/" {
-            predicted_category
-        } else {
-            target.path() == final_url.path()
-                || final_url
-                    .path()
-                    .trim_end_matches('/')
-                    .strip_suffix(&format!("-{brand}"))
-                    .and_then(|path| path.rsplit_once('/'))
-                    .is_some_and(|(parent, _)| parent == target.path().trim_end_matches('/'))
-        };
-        return category_path_matches
-            && category_path_has_brand(final_url.path(), &brand)
-            && requested_query == actual_query;
-    }
-    let re = regex::Regex::new(r"^/product/(?:[^/]*-)?([0-9]+)/(reviews/)?$").unwrap();
-    match (re.captures(target.path()), re.captures(final_url.path())) {
-        (Some(a), Some(b)) => {
-            a.get(1).map(|m| m.as_str()) == b.get(1).map(|m| m.as_str())
-                && a.get(2).map(|m| m.as_str()) == b.get(2).map(|m| m.as_str())
-        }
-        _ => target.path() == final_url.path(),
-    }
-}
-
-fn has_duplicate_query_key(url: &url::Url, expected: &str) -> bool {
-    url.query_pairs()
-        .filter(|(key, _)| key == expected)
-        .nth(1)
-        .is_some()
-}
-
-fn single_numeric_brand(
-    query: &std::collections::BTreeMap<(String, String), usize>,
-) -> Option<String> {
-    let mut brands = query.iter().filter(|((key, _), _)| key == "brand");
-    let ((_, brand), count) = brands.next()?;
-    (brands.next().is_none()
-        && *count == 1
-        && !brand.is_empty()
-        && brand.bytes().all(|byte| byte.is_ascii_digit()))
-    .then(|| brand.clone())
-}
-
-fn category_path_has_brand(path: &str, brand: &str) -> bool {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .is_some_and(|segment| {
-            segment == brand
-                || segment
-                    .strip_suffix(brand)
-                    .is_some_and(|prefix| prefix.ends_with('-'))
-        })
-}
-
-fn semantic_query(url: &url::Url) -> std::collections::BTreeMap<(String, String), usize> {
-    let mut pairs = std::collections::BTreeMap::new();
-    for (key, value) in url.query_pairs() {
-        if is_navigation_metadata(&key) {
-            continue;
-        }
-        if key == "sorting" && matches!(value.as_ref(), "score" | "popular") {
-            continue;
-        }
-        let value = value.into_owned();
-        *pairs.entry((key.into_owned(), value)).or_default() += 1;
-    }
-    pairs
-}
-
-fn is_navigation_metadata(key: &str) -> bool {
-    matches!(
-        key,
-        "__rr" | "category_was_predicted" | "deny_category_prediction" | "from_global" | "at"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    // Process creation can temporarily inherit flock descriptors on macOS.
+    // Serialize this fault-injection test with lease/release assertions only.
+    static PROFILE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn profile_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        PROFILE_TEST_LOCK.blocking_lock()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_failure_poisons_session_and_blocks_further_driver_work() {
+        let _guard = PROFILE_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let profile_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.join(".ozon-mcp.lock"))
+            .unwrap();
+        let runtime = tempfile::Builder::new()
+            .prefix("runtime-")
+            .tempdir_in(root.path())
+            .unwrap();
+        std::fs::write(runtime.path().join("config.json"), "{}").unwrap();
+        let mut session = BrowserSession {
+            binary: root.path().join("missing-agent-browser"),
+            profile,
+            executable: None,
+            headed: false,
+            runtime,
+            _profile_lock: profile_lock,
+            user_agent: Some("test".to_owned()),
+            state: SessionState::Acquiring,
+        };
+
+        let cleanup = session.shutdown().await.unwrap_err();
+        assert!(matches!(
+            cleanup.downcast_ref::<BrowserError>(),
+            Some(BrowserError::CleanupFailed)
+        ));
+        assert!(matches!(session.state, SessionState::Poisoned));
+
+        let ensure = session
+            .ensure_running(&CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            ensure.downcast_ref::<BrowserError>(),
+            Some(BrowserError::SessionPoisoned)
+        ));
+        let shutdown = session.shutdown().await.unwrap_err();
+        assert!(matches!(
+            shutdown.downcast_ref::<BrowserError>(),
+            Some(BrowserError::SessionPoisoned)
+        ));
+    }
 
     #[test]
     fn profile_leases_use_distinct_slots_and_reuse_released_slot() {
+        let _guard = profile_test_guard();
         let root = tempfile::tempdir().unwrap();
         let base = root.path().join("profile");
         let (base_profile, base_lock) = lease_profile(&base).unwrap();
@@ -698,6 +576,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn profile_lease_preserves_existing_base_permissions() {
+        let _guard = profile_test_guard();
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -714,6 +593,7 @@ mod tests {
 
     #[test]
     fn profile_lease_does_not_fallback_after_non_contention_error() {
+        let _guard = profile_test_guard();
         let root = tempfile::tempdir().unwrap();
         let base = root.path().join("profile");
         ensure_private_directory(&base).unwrap();
@@ -731,6 +611,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn profile_lease_rejects_symlinked_pool() {
+        let _guard = profile_test_guard();
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
@@ -749,180 +630,6 @@ mod tests {
         assert!(!outside.join(".ozon-mcp.lock").exists());
     }
 
-    #[test]
-    fn fallback_must_match_product_or_search() {
-        assert!(is_requested_page(
-            "https://www.ozon.ru/product/123/",
-            "https://www.ozon.ru/product/item-123/"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/product/123/reviews/",
-            "https://www.ozon.ru/product/123/"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse",
-            "https://www.ozon.ru/search/?text=phone"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/product/123/",
-            "https://evil.example/product/123/"
-        ));
-    }
-
-    #[test]
-    fn search_redirect_preserves_all_semantic_query_pairs() {
-        let requested = "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=2&search_page_state=abc";
-        assert!(is_requested_page(
-            requested,
-            "https://www.ozon.ru/search/?search_page_state=abc&page=2&delivery=tomorrow&brand=logitech&text=mouse"
-        ));
-        for actual in [
-            "https://www.ozon.ru/search/?text=mouse&delivery=tomorrow&page=2&search_page_state=abc",
-            "https://www.ozon.ru/search/?text=mouse&brand=other&delivery=tomorrow&page=2&search_page_state=abc",
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech&page=2&search_page_state=abc",
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=3&search_page_state=abc",
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=2&search_page_state=changed",
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech&delivery=tomorrow&page=2&search_page_state=abc&color=black",
-        ] {
-            assert!(!is_requested_page(requested, actual), "accepted {actual}");
-        }
-    }
-
-    #[test]
-    fn search_redirect_compares_duplicate_query_pairs_as_a_multiset() {
-        assert!(is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=a&brand=b",
-            "https://www.ozon.ru/search/?brand=b&text=mouse&brand=a"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=a&brand=b",
-            "https://www.ozon.ru/search/?text=mouse&brand=b&brand=b"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=a&brand=a",
-            "https://www.ozon.ru/search/?text=mouse&brand=a"
-        ));
-    }
-
-    #[test]
-    fn search_redirect_allows_only_known_navigation_metadata() {
-        assert!(is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
-            "https://www.ozon.ru/search/?brand=logitech&text=mouse&__rr=1&deny_category_prediction=true&from_global=true&at=analytics-token"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech&tracking_token=123"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech&utm_source=unknown"
-        ));
-    }
-
-    #[test]
-    fn search_redirect_normalizes_only_default_sort() {
-        assert!(is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&sorting=popular",
-            "https://www.ozon.ru/search/?text=mouse&sorting=score"
-        ));
-        assert!(is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse",
-            "https://www.ozon.ru/search/?text=mouse&sorting=score"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse",
-            "https://www.ozon.ru/search/?text=mouse&sorting=price"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&sorting=rating",
-            "https://www.ozon.ru/search/?text=mouse"
-        ));
-        for actual in [
-            "https://www.ozon.ru/search/?text=mouse&sorting=price&sorting=score",
-            "https://www.ozon.ru/search/?text=mouse&sorting=score&sorting=price",
-            "https://www.ozon.ru/search/?text=mouse&sorting=rating&sorting=popular",
-            "https://www.ozon.ru/search/?text=mouse&sorting=popular&sorting=rating",
-        ] {
-            assert!(!is_requested_page(
-                "https://www.ozon.ru/search/?text=mouse&sorting=price",
-                actual
-            ));
-        }
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&sorting=price&sorting=score",
-            "https://www.ozon.ru/search/?text=mouse&sorting=price"
-        ));
-    }
-
-    #[test]
-    fn search_prediction_requires_marker_and_matching_semantics() {
-        assert!(is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&text=mouse&category_was_predicted=true"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&text=mouse"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=logitech",
-            "https://www.ozon.ru/category/mice-15871/?brand=other&text=mouse&category_was_predicted=true"
-        ));
-        assert!(is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=26303256",
-            "https://www.ozon.ru/category/mice-15871/logitech-26303256/?text=mouse&category_was_predicted=true"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=26303256&brand=other",
-            "https://www.ozon.ru/category/mice-15871/logitech-26303256/?text=mouse&category_was_predicted=true"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/search/?text=mouse&brand=26303256",
-            "https://www.ozon.ru/category/mice-15871/other-42/?text=mouse&category_was_predicted=true"
-        ));
-    }
-
-    #[test]
-    fn category_redirect_requires_exact_path_and_semantics() {
-        assert!(is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
-            "https://www.ozon.ru/category/mice-15871/?page=2&brand=logitech&__rr=1"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
-            "https://www.ozon.ru/category/keyboards-15872/?brand=logitech&page=2"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=3"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=logitech&page=2",
-            "https://www.ozon.ru/search/?brand=logitech&page=2"
-        ));
-        assert!(is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=26303256&page=2",
-            "https://www.ozon.ru/category/mice-15871/logitech-26303256/?page=2"
-        ));
-        assert!(is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=26303256&sorting=score",
-            "https://www.ozon.ru/category/mice-15871/logitech-26303256/"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=26303256&sorting=price",
-            "https://www.ozon.ru/category/mice-15871/logitech-26303256/"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=26303256&sorting=rating",
-            "https://www.ozon.ru/category/mice-15871/logitech-26303256/"
-        ));
-        assert!(!is_requested_page(
-            "https://www.ozon.ru/category/mice-15871/?brand=26303256&page=2",
-            "https://www.ozon.ru/category/keyboards-15872/logitech-26303256/?page=2"
-        ));
-    }
-
     #[tokio::test]
     #[ignore = "requires pinned agent-browser, Chrome, and an explicit disposable OZON_USER_DATA_DIR"]
     async fn cancelled_evaluation_closes_private_browser_and_can_restart() {
@@ -930,7 +637,7 @@ mod tests {
             std::env::var_os("OZON_USER_DATA_DIR").is_some(),
             "Use a disposable test profile"
         );
-        let mut browser = Browser::from_env().await.unwrap();
+        let mut browser = BrowserSession::from_env().await.unwrap();
         let cancel = CancellationToken::new();
         browser.launch(&cancel).await.unwrap();
         let trigger = cancel.clone();
@@ -963,8 +670,8 @@ mod tests {
             std::env::var_os("OZON_USER_DATA_DIR").is_some(),
             "Use a disposable test profile"
         );
-        let mut first = Browser::from_env().await.unwrap();
-        let mut second = Browser::from_env().await.unwrap();
+        let mut first = BrowserSession::from_env().await.unwrap();
+        let mut second = BrowserSession::from_env().await.unwrap();
         let first_cancel = CancellationToken::new();
         let second_cancel = CancellationToken::new();
         let result = async {

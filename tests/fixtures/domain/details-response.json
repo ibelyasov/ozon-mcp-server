@@ -1,0 +1,16 @@
+{
+  "sku": "901",
+  "name": "Example",
+  "url": "https://www.ozon.ru/product/example-901/",
+  "price": 10.5,
+  "priceRegular": null,
+  "oldPrice": null,
+  "duty": null,
+  "available": false,
+  "rating": 4.5,
+  "reviews": 0,
+  "seller": null,
+  "images": [],
+  "characteristics": {},
+  "description": { "text": "Useful text", "images": ["/one.jpg"] }
+}
