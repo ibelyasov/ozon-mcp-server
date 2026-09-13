@@ -650,7 +650,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn two_frontends_use_one_private_listener() {
-        let root = tempfile::tempdir_in("/private/tmp").unwrap();
+        let root = tempfile::tempdir_in("/tmp").unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let config = Config::at(root.path().to_path_buf()).unwrap();
         let listener = UnixListener::bind(&config.socket).unwrap();

@@ -1213,7 +1213,7 @@ mod tests {
     ) -> (tempfile::TempDir, Service) {
         let temp = tempfile::Builder::new()
             .prefix("service-scripted-")
-            .tempdir_in(std::env::current_dir().unwrap().join(".work"))
+            .tempdir()
             .unwrap();
         std::fs::set_permissions(
             temp.path(),
@@ -1258,7 +1258,7 @@ mod tests {
     async fn journal_tools_work_without_starting_a_browser() {
         let temp = tempfile::Builder::new()
             .prefix("service-journal-")
-            .tempdir_in(std::env::current_dir().unwrap().join(".work"))
+            .tempdir()
             .unwrap();
         std::fs::set_permissions(
             temp.path(),
