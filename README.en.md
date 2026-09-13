@@ -1,102 +1,71 @@
-# Ozon MCP — product search, prices and reviews
+# Ozon MCP — thorough product research
 
 [Русский](README.md)
 
-A local, read-only [Model Context Protocol](https://modelcontextprotocol.io/) server that gives an AI assistant three tools for searching **Ozon.ru**, reading product details and reading reviews. Version 0.4.0 is written in Rust with `rmcp` and native `agent-browser` 0.36.0. The server and driver do not require Node.js.
+Ozon MCP is a local [Model Context Protocol](https://modelcontextprotocol.io/) server for researching products on Ozon.ru. Version 1.0.0 is written in Rust with `rmcp` 3.2 and native `agent-browser` 0.36.0. It does not modify carts, orders, accounts, or regions.
 
-The browser runs without a window by default. A local profile keeps cookies and the selected region between runs; the server cannot place orders or modify a cart, and it needs neither an Ozon Seller API key nor a paid scraping service.
+Status: **development**. The live source implements variants, review photos, and city observation from an exact first-cell field; verification returned Moscow. A public probe found no safe link for other seller offers, so offers remain `unsupported`. Full readiness still requires the remaining live gates and target MCP client acceptance.
 
-> **Current 0.4.0 status (September 5, 2026):** the release Rust build passed a live headless run on macOS. MCP started with all three tools: search returned two products in 19.82 seconds; details returned a price of 6,859 RUB and a 4.9 rating for SKU `947750106` in 3.86 seconds; reviews returned two entries out of 2,618 in 1.90 seconds. A subsequent description check confirmed two images without separate description text. The full stdio session exited successfully in 25.78 seconds. Earlier HTTP 403 responses and a transient driver error remain historical limitations: this successful run does not guarantee future Ozon availability.
+## Tools
 
-## Capabilities
+- `ozon_get_context` observes the shared context, region, and capabilities;
+- `ozon_search` searches and refines results;
+- `ozon_get_products` reads product cards in batches;
+- `ozon_get_reviews` reads reviews and observed aggregates;
+- `ozon_get_images` returns validated images through stored references;
+- `ozon_list_research` and `ozon_get_research` read the local journal;
+- `ozon_append_research_note` appends an idempotent agent note.
 
-- `ozon_search` searches by query, price and sort, returning available Ozon facets and a continuation cursor. Up to 36 products per call include ratings, review counts, price conditions and available delivery labels.
-- `ozon_product_details` reads available prices, seller, rating, images, specifications and description by URL, SKU or slug.
-- `ozon_product_reviews` reads up to 30 available reviews.
+An Ozon Card price remains a separate observed payment condition and is never replaced with a regular price. Unknown and incomplete data is returned as `unknown`, `partial`, or a typed error. References and cursors are bound to one `researchId` and `contextId`; navigation cursors expire after 30 minutes.
 
-Follow returned facet `searchUrl` links to refine a search and `nextCursor` to continue it. Available filters depend on the category and Ozon response; incomplete coverage and unknown conditions remain explicit. Use details and reviews to verify shortlisted products. See [search parameters and limitations](docs/behavior.md#search-refinement-and-continuation).
+An observed city cannot guarantee that two accounts in the same city are distinguishable; such an account switch may remain invisible to the server. Local product-section continuations read a bounded cached snapshot with its original timestamp.
 
-Each successful call returns the same valid JSON as MCP `structuredContent` and text content. Unknown values remain `null`, and missing expected widgets produce warnings. Prices and availability depend on region, session and payment conditions.
+Marketplace calls only read Ozon, but persist local events and evidence. Journal retention is 30 days with a 512 MiB cap and at least ten minutes of idle protection for leased research. Notes are local writes: reusing an `operationId` with identical content returns the prior result; changed content returns `CONFLICT`.
 
-## Install 0.4.0
+## Install and run
 
-You need Rust 1.88+ and **exactly** `agent-browser` 0.36.0. The server rejects any other driver version at startup.
+You need Rust 1.95 and **exactly** `agent-browser` 0.36.0.
 
 ```sh
 git clone https://github.com/ibelyasov/ozon-mcp-server.git
 cd ozon-mcp-server
 cargo build --release --locked
-```
-
-Install the native `agent-browser` 0.36.0 binary from its [official release page](https://github.com/vercel-labs/agent-browser/releases/tag/v0.36.0), or build it with Cargo:
-
-```sh
 cargo install agent-browser --version 0.36.0 --locked
-```
-
-Then install agent-browser's managed Chrome separately:
-
-```sh
 agent-browser install
 ```
 
-To use an existing full Chrome installation instead, set `OZON_BROWSER_EXECUTABLE` to its existing executable.
-
-## Configure an MCP client
-
-Use the absolute path to the built stdio server. An absolute path to the pinned driver is recommended, especially when the MCP client starts with a restricted `PATH`.
+The normal process is a stdio frontend. Multiple frontends share a private local broker, one persistent browser profile, and one observed context.
 
 ```json
-{
-  "mcpServers": {
-    "ozon": {
-      "command": "/absolute/path/ozon-mcp-server/target/release/ozon-mcp-server",
-      "env": {
-        "OZON_AGENT_BROWSER_BIN": "/absolute/path/to/agent-browser",
-        "OZON_HEADLESS": "true"
-      }
-    }
-  }
-}
+{"mcpServers":{"ozon":{"command":"/absolute/path/ozon-mcp-server/target/release/ozon-mcp-server","env":{"OZON_AGENT_BROWSER_BIN":"/absolute/path/to/agent-browser","OZON_HEADLESS":"true","OZON_DATA_DIR":"/absolute/private/path/ozon-mcp"}}}}
 ```
 
-The default primary profile is `~/.ozon-mcp-rust-profile`. The server first tries to lease the configured `OZON_USER_DATA_DIR`; if another process already owns it, the server selects the first free persistent slot at `base/.ozon-mcp-profiles/1`, `2`, and so on (up to 1,024 fallback slots). Each process holds its profile's exclusive lock until exit and never deletes an active lock. Freed slots are reused.
+`OZON_DATA_DIR` contains private IPC and journal state and must be owned by the current user with mode `0700`. `OZON_USER_DATA_DIR` selects the single persistent profile. `OZON_BROKER_SOCKET` may override the socket within the data directory. The Unix socket path must fit within 103 bytes. macOS and Linux are supported; Windows is not.
 
-Cookies, sign-in and region are independent in every slot: a fresh slot does not copy authentication from the primary profile. Reconnecting Codex does not guarantee the same slot. Restart or reconnect the MCP after changing its configuration.
+Set `OZON_HEADLESS=false` before broker startup for manual account/region setup; the window opens after an MCP context call. Changing a frontend environment does not reconfigure an existing broker. Stop that broker gracefully (Ctrl+C for foreground `--broker`, or SIGTERM), or allow its ten-minute inactivity shutdown, before switching mode. There is no automatic sign-in, region change, or fallback profile. Keep the profile and data directory outside the repository.
 
-### Visible manual session
+## Agent research workflow
 
-For manual sign-in or reliable region selection, set a dedicated `OZON_USER_DATA_DIR` together with `OZON_HEADLESS=false`, reconnect the MCP, and call a tool. Do not run concurrent processes against that dedicated base. Check the account and region in the opened window, then stop the MCP and restore `OZON_HEADLESS=true` while keeping the same profile. Visible mode is never enabled automatically.
+The agent records mandatory and preferred requirements and a budget, tries different queries, categories, and observed refinements, then examines finalists, reviews, and photos until further passes stop improving the choice. Before concluding, it refreshes price and delivery, recommends one primary option and at most two alternatives, and explains rejected competitors, coverage, and uncertainty. A dynamic catalog cannot be claimed as exhaustively searched.
 
-`OZON_CITY` attempts to select a city through Ozon's interface. If it cannot apply the requested city, the request fails with `REGION_SELECTION_FAILED`; the server does not present the saved profile region as the requested one. Even successful selector actions do not prove which region Ozon saved, so manual verification in the persistent profile remains the reliable option.
-
-Keep profiles outside the repository because they may contain account sessions.
+See [docs/behavior.md](docs/behavior.md) for details and [contracts/](contracts/README.md) for machine-readable contracts.
 
 ## Development
 
-Edit the browser script in `rust/page.ts`; TypeScript 7.0.2 compiles it into the tracked `rust/page.js`. Rust embeds the generated JavaScript, so Cargo builds and server execution do not require Node.js. Do not edit `page.js` by hand.
-
-To change the script, use Node.js 22+ with npm:
-
 ```sh
-npm ci
-npm run build:page
-npm run check:page
-npm test
+cargo +1.95.0 fmt --all -- --check
+cargo +1.95.0 test --locked
+cargo +1.95.0 clippy --locked --all-targets -- -D warnings
+npm ci && npm run check:page && npm test
+UV_CACHE_DIR=/tmp/ozon-contracts-uv uv run --offline --no-project --with 'jsonschema[format]==4.25.1' python scripts/validate-contracts.py
 ```
 
-`check:page` checks types and verifies that `page.js` matches its source. Commit both files together; CI repeats this check and the browser script's offline tests.
+`rust/page.ts` compiles to tracked `rust/page.js`; commit both together. Offline checks do not prove live Ozon availability.
 
-```sh
-cargo fmt --all -- --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-```
+## Authors and license
 
-CI also runs Rust tests on the minimum supported version 1.88.0, and formatting, tests and Clippy on 1.95.0. See the [module architecture and request execution rules](docs/behavior.md#internal-architecture).
+This project is based on [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server) and the original [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server). Git history and attribution are preserved. The source projects declare MIT metadata. This is an unofficial project and is not affiliated with Ozon.
 
-After the search upgrade, all 29 ordinary Rust tests and 10 browser-script tests passed, covering parsing, facets, continuation, URL boundaries and public metadata extraction. A separate ignored-by-default real-Chromium test cancels endless JavaScript, closes the private browser and successfully restarts it; it passed in 8.00 seconds. Neither test path depends on Ozon or establishes marketplace availability. See [configuration and behavior](docs/behavior.md) for the opt-in command, isolation and resource limits.
+Image DNS compatibility and `OZON_IMAGE_DOH_FALLBACK=auto|off` are documented in [server behavior](docs/behavior.md#image-dns-compatibility).
 
-## Credits and license
-
-Based on [Pir0manT/ozon-mcp-server](https://github.com/Pir0manT/ozon-mcp-server) and the original [eduard256/ozon-mcp-server](https://github.com/eduard256/ozon-mcp-server). Git history and author attribution are retained. MIT is declared in the upstream project metadata. This project is unofficial and is not affiliated with Ozon.
+The optimized local build passed 30 MCP calls across six search categories, product/review image transport, simultaneous clients, and broker crash recovery. See [validation and remaining limits](docs/behavior.md#validation-on-2026-09-13).

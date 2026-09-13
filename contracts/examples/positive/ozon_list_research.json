@@ -1,0 +1,10 @@
+{
+  "inputSchema": "schemas/ozon_list_research.input.schema.json", "outputSchema": "schemas/ozon_list_research.output.schema.json",
+  "input": {"query": "наушники", "limit": 10},
+  "output": {
+    "schemaVersion": "1", "researchId": null,
+    "data": {"researches": [{"researchId": "research-01", "title": "Беспроводные наушники", "createdAt": "2026-09-13T09:01:00Z", "updatedAt": "2026-09-13T09:04:00Z", "contextId": "ctx-01"}], "nextCursor": null},
+    "context": {"contextId": "ctx-current", "regionLabel": "Москва", "regionVerification": "verified", "accountState": "anonymous", "accessState": "available"}, "observedAt": "2026-09-13T10:00:00Z",
+    "evidence": [], "warnings": [{"code": "HISTORICAL_CONTEXT", "message": "Listed research may belong to a different captured context.", "evidenceRefs": []}]
+  }
+}

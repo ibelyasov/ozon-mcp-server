@@ -10,7 +10,4 @@ pub trait PageSource: Send {
         path: &str,
         cancel: &CancellationToken,
     ) -> impl Future<Output = Result<Value>> + Send;
-
-    /// Confirm cleanup before allowing another request to use this source.
-    fn shutdown(&mut self) -> impl Future<Output = Result<()>> + Send;
 }

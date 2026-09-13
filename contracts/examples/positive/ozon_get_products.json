@@ -1,0 +1,22 @@
+{
+  "inputSchema": "schemas/ozon_get_products.input.schema.json",
+  "outputSchema": "schemas/ozon_get_products.output.schema.json",
+  "input": {"products": [{"productRef": "product-123"}], "researchId": "research-01", "include": ["characteristics", "offers", "images"]},
+  "output": {
+    "schemaVersion": "1", "researchId": "research-01",
+    "data": {"results": [{
+      "status": "ok", "requested": {"productRef": "product-123"},
+      "product": {
+        "productRef": "product-123", "sku": "123", "title": "Наушники", "url": "https://www.ozon.ru/product/123/", "availability": "unknown", "prices": [{"amountMinor": 62700, "currency": "RUB", "type": "unknown", "condition": null, "evidenceRefs": ["ev-product"]}], "seller": null, "rating": null, "reviewCount": null,
+        "characteristics": {"status": "partial", "items": [{"name": "Цвет", "value": "черный", "evidenceRefs": ["ev-product"]}], "truncated": true, "nextCursor": "cursor-char-2", "hasNext": true},
+        "offers": {"status": "unsupported", "items": [], "truncated": false, "nextCursor": null, "hasNext": null},
+        "images": {"status": "available", "items": [{"imageRef": "image-123-1", "altText": null, "evidenceRefs": ["ev-product"]}], "truncated": false, "nextCursor": null, "hasNext": false},
+        "fieldEvidence": [{"fieldPath": "/title", "evidenceRefs": ["ev-product"]}], "evidenceRefs": ["ev-product"]
+      }
+    }]},
+    "context": {"contextId": "ctx-01", "regionLabel": null, "regionVerification": "unverified", "accountState": "unknown", "accessState": "available"},
+    "observedAt": "2026-09-13T09:02:00Z",
+    "evidence": [{"evidenceRef": "ev-product", "sourceKind": "ozon_page", "sourceUrl": "https://www.ozon.ru/product/123/", "observedAt": "2026-09-13T09:02:00Z", "contextId": "ctx-01", "sku": "123", "fieldPaths": ["/title", "/characteristics", "/images"]}],
+    "warnings": [{"code": "UNSUPPORTED_CAPABILITY", "message": "Offer enumeration is not available.", "evidenceRefs": ["ev-product"]}]
+  }
+}

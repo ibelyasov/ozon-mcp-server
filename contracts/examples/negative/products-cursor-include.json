@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_get_products.input.schema.json","instance":{"products":[{"cursor":"section-cursor"},{"sku":"123"}],"include":["offers"]},"expectedInvalidAt":"schema"}

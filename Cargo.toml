@@ -1,9 +1,9 @@
 [package]
 name = "ozon-mcp-server"
-version = "0.4.0"
+version = "1.0.0"
 edition = "2024"
-rust-version = "1.88"
-description = "Local read-only Ozon MCP server using agent-browser"
+rust-version = "1.95"
+description = "Local Ozon research MCP with one shared browser context and a durable evidence journal"
 license = "MIT"
 
 [[bin]]
@@ -12,7 +12,15 @@ path = "rust/main.rs"
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+base64 = "0.23"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+jsonschema = { version = "0.52", default-features = false }
+libc = "0.2"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
 percent-encoding = "2"
@@ -22,7 +30,7 @@ schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "io-std", "net", "fs", "sync", "signal", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.28"
 url = "2"

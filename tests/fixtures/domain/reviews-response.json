@@ -4,6 +4,7 @@
   "count": 1,
   "reviews": [
     {
+      "reviewId": null,
       "author": "Ada",
       "score": 5.0,
       "comment": "Works",
@@ -11,8 +12,14 @@
       "cons": null,
       "date": "2024-01-01",
       "useful": 0,
-      "purchased": false,
-      "hasPhotos": false
+      "purchased": null,
+      "hasPhotos": false,
+      "variantLabel": null,
+      "photos": []
     }
-  ]
+  ],
+  "nextPath": null,
+  "hasNext": null,
+  "refinements": [],
+  "aggregationScope": "unknown"
 }

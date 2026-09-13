@@ -1,0 +1,4 @@
+{
+  "schema": "schemas/tool_failure.schema.json",
+  "instance": {"schemaVersion": "1", "researchId": "research-01", "error": {"code": "SOURCE_BLOCKED", "message": "Ozon returned a challenge page.", "retryable": true, "safeToRetry": true, "retryAfterSeconds": 30, "recovery": "retry_later"}}
+}

@@ -2,6 +2,7 @@
 type JsonRecord = Record<string, unknown>;
 type PageOptions =
   | { mode: "widgets" }
+  | { mode: "context" }
   | { mode: "fetch"; path: string };
 type PageError =
   | "CAPTCHA_OR_BLOCKED"
@@ -19,6 +20,13 @@ interface FilteredPage {
     link: Array<{ href: string }>;
   };
   layoutTrackingInfo?: { sku: unknown };
+  contextObservation?: {
+    regionLabel: string | null;
+    regionVerified: boolean;
+    accountState: "authenticated" | "anonymous" | "unknown";
+    accessState: "available" | "unknown";
+    signature: string | null;
+  };
 }
 
 type PageResult =
@@ -37,12 +45,12 @@ const publicWidgetNames = new Set([
   "webProductHeading",
   "webPrice",
   "webGallery",
-  "webListReviews",
 ]);
 const searchWidgetNames = new Set([
   "filtersDesktop", "searchResultsSort", "searchResultsFiltersActive",
   "infiniteVirtualPaginator", "categoryBrandList",
 ]);
+const sourceWidgetNames = new Set(["webAspects", "webListReviews"]);
 const filterTypes = new Set([
   "categoryFilter", "boolFilter", "checkboxesFilter", "rangeFilter",
   "multipleRangesFilter", "colorFilter",
@@ -151,6 +159,87 @@ function projectSearchWidget(name: string, raw: unknown): JsonRecord | undefined
     case "categoryBrandList":
       if (!Array.isArray(value.brands)) return undefined;
       return { brands: records(value.brands).map((v) => linkedItem(v, ["text"])) };
+    case "webAspects":
+      if (!Array.isArray(value.aspects)) return undefined;
+      return { aspects: records(value.aspects).map((aspect) => {
+        const item = scalars(aspect, ["aspectKey", "aspectName", "type"]);
+        if (Array.isArray(aspect.descriptionRs)) {
+          item.descriptionRs = records(aspect.descriptionRs)
+            .map((description) => scalars(description, ["content", "type"]));
+        }
+        if (Array.isArray(aspect.variants)) {
+          item.variants = records(aspect.variants).map((variant) => {
+            const projected = scalars(variant, ["availability", "link", "price", "sku"]);
+            if (isRecord(variant.data)) {
+              projected.data = scalars(variant.data,
+                ["title", "text", "name", "value", "isSelected", "selected"]);
+            }
+            return projected;
+          });
+        }
+        return item;
+      }) };
+    case "webListReviews": {
+      if (!Array.isArray(value.reviews) && !Array.isArray(value.items)) return undefined;
+      const rawReviews = records(Array.isArray(value.reviews) ? value.reviews : value.items);
+      const result = scalars(value,
+        ["itemId", "requestedPath", "fullRequestUrl", "productScore", "pageType"]);
+      if (isRecord(value.paging)) {
+        const paging = scalars(value.paging,
+          ["page", "perPage", "total", "commonTotal", "nextButton", "prevButton"]);
+        if (Array.isArray(value.paging.links)) {
+          paging.links = records(value.paging.links)
+            .map((link) => scalars(link, ["text", "urlParams"]));
+        }
+        result.paging = paging;
+      }
+      if (isRecord(value.filters)) {
+        result.filters = scalars(value.filters, ["withMedia", "withPhotos"]);
+      }
+      if (Array.isArray(value.sortings)) {
+        result.sortings = records(value.sortings)
+          .map((sorting) => scalars(sorting, ["active", "name", "value"]));
+      }
+      result.reviews = rawReviews.map((review) => {
+        const item = scalars(review, ["uuid", "itemId", "publishedAt", "createdAt",
+          "isItemPurchased", "showVariantImage", "isAnonymous"]);
+        if (isRecord(review.author)) {
+          item.author = scalars(review.author, ["firstName", "lastName", "fio"]);
+        }
+        if (isRecord(review.content)) {
+          const content = scalars(review.content,
+            ["score", "comment", "positive", "negative"]);
+          if (Array.isArray(review.content.photos)) {
+            content.photos = review.content.photos.map((photo) => isRecord(photo)
+              ? scalars(photo, ["src", "url", "link", "image", "previewUrl", "originalUrl"])
+              : typeof photo === "string" ? photo : {}).filter((photo) =>
+                typeof photo === "string" || Object.keys(photo).length > 0);
+          }
+          item.content = content;
+        }
+        if (isRecord(review.usefulness)) {
+          item.usefulness = scalars(review.usefulness, ["useful", "unuseful"]);
+        }
+        if (isRecord(review.status)) item.status = scalars(review.status, ["id", "name"]);
+        return item;
+      });
+      if (isRecord(value.products)) {
+        result.productsCount = Object.keys(value.products)
+          .filter((sku) => /^[0-9]+$/.test(sku)).length;
+        const itemIds = new Set(rawReviews.map((review) => String(review.itemId ?? "")));
+        result.products = Object.fromEntries(Object.entries(value.products).flatMap(([sku, product]) => {
+          if (!/^[0-9]+$/.test(sku) || !isRecord(product) ||
+              (!itemIds.has(sku) && !itemIds.has(String(product.itemId ?? "")))) return [];
+          const projected = scalars(product, ["itemId", "name", "uri"]);
+          if (Array.isArray(product.variants)) {
+            projected.variants = records(product.variants)
+              .map((variant) => scalars(variant, ["name", "value"]));
+          }
+          return [[sku, projected]];
+        }));
+      }
+      return result;
+    }
     default: return undefined;
   }
 }
@@ -168,6 +257,7 @@ function widgetName(key: string): string {
 function parseOptions(value: unknown): PageOptions | null {
   if (!isRecord(value)) return null;
   if (value.mode === "widgets") return { mode: "widgets" };
+  if (value.mode === "context") return { mode: "context" };
   if (value.mode === "fetch" && typeof value.path === "string") {
     return { mode: "fetch", path: value.path };
   }
@@ -182,7 +272,7 @@ function filterPage(page: unknown): PageResult {
     for (const [key, value] of Object.entries(page.widgetStates)) {
       const name = widgetName(key);
       if (publicWidgetNames.has(name)) widgetStates[key] = value;
-      else if (searchWidgetNames.has(name)) {
+      else if (searchWidgetNames.has(name) || sourceWidgetNames.has(name)) {
         const projected = projectSearchWidget(name, value);
         if (projected !== undefined) widgetStates[key] = projected;
       }
@@ -229,6 +319,71 @@ async function ozonPage(rawOptions: unknown): Promise<PageResult> {
   const options = parseOptions(rawOptions);
   if (options === null) return { error: "INVALID_OPTIONS" };
 
+  if (options.mode === "context") {
+    // Keep this read-only and narrow. A location control may contain a street
+    // address, so its text is never exported until a city-only signal is proven.
+    const visible = (element: Element | null): boolean => {
+      if (!(element instanceof HTMLElement)) return false;
+      const style = getComputedStyle(element);
+      return style.display !== "none" && style.visibility !== "hidden";
+    };
+    const state = (name: string): JsonRecord | null => {
+      const raw = document.querySelector(`[id^="state-${name}-"][data-state]`)
+        ?.getAttribute("data-state");
+      if (raw === undefined || raw === null) return null;
+      try {
+        const value: unknown = JSON.parse(raw);
+        return isRecord(value) && !Array.isArray(value) ? value : null;
+      } catch { return null; }
+    };
+    const address = state("addressBookBarWeb");
+    const cityValue = address?.customCell;
+    const city = isRecord(cityValue) && Array.isArray(cityValue.cells) &&
+      isRecord(cityValue.cells[0]) && isRecord(cityValue.cells[0].button) &&
+      typeof cityValue.cells[0].button.text === "string"
+      ? cityValue.cells[0].button.text.split(/\s+/u).filter(Boolean).join(" ") : "";
+    // This exact first-cell field was observed as the city on home, product and
+    // review pages. Reject address-like or structurally ambiguous text.
+    const regionLabel = city.length <= 100 && /^[\p{L} -]+$/u.test(city) &&
+      !/(?:адрес|улиц|дом|квартир|подъезд|этаж|достав|укажите)/iu.test(city)
+      ? city : null;
+    const anonymous = document.querySelector('[id^="state-profileMenuAnonymous-"][data-state]') !== null ||
+      visible(document.querySelector('a[href^="/login"], button[aria-label="Войти"]'));
+    // Presence distinguishes the signed-in header without reading profile
+    // state, which may contain identity data.
+    const authenticated = !anonymous &&
+      document.querySelector('[id^="state-profileMenu-"][data-state]') !== null;
+    const publicState = Array.from(document.querySelectorAll<HTMLElement>('[id^="state-"][data-state]'))
+      .some((element) => {
+        const name = widgetName(element.id.slice(6));
+        return publicWidgetNames.has(name) || searchWidgetNames.has(name) ||
+          sourceWidgetNames.has(name);
+      });
+    const accountState = anonymous ? "anonymous" : authenticated ? "authenticated" : "unknown";
+    const indicatorText = regionLabel !== null || accountState !== "unknown"
+      ? `${accountState}\n${regionLabel ?? ""}` : "";
+    let signature: string | null = null;
+    if (indicatorText.length > 0) {
+      try {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(indicatorText));
+        signature = Array.from(new Uint8Array(digest),
+          (byte) => byte.toString(16).padStart(2, "0")).join("");
+      } catch {
+        // Context stays observable but unbound if hashing is unavailable.
+      }
+    }
+    return { page: {
+      widgetStates: {},
+      contextObservation: {
+        regionLabel,
+        regionVerified: regionLabel !== null,
+        accountState,
+        accessState: anonymous || authenticated || publicState ? "available" : "unknown",
+        signature,
+      },
+    } };
+  }
+
   if (options.mode === "widgets") {
     const widgetStates: JsonRecord = Object.create(null) as JsonRecord;
     let bytes = 0;
@@ -236,7 +391,8 @@ async function ozonPage(rawOptions: unknown): Promise<PageResult> {
       '[id^="state-"][data-state]',
     )) {
       const key = element.id.slice(6);
-      if (!publicWidgetNames.has(widgetName(key)) && !searchWidgetNames.has(widgetName(key))) continue;
+      if (!publicWidgetNames.has(widgetName(key)) && !searchWidgetNames.has(widgetName(key)) &&
+          !sourceWidgetNames.has(widgetName(key))) continue;
       const value = element.getAttribute("data-state");
       if (value === null) continue;
       bytes += new TextEncoder().encode(value).length;

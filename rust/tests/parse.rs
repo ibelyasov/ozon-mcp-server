@@ -102,6 +102,13 @@ fn details_preserves_false_zero_and_null_fields() {
             "webProductHeading-0": { "title": " Example product " },
             "webPrice-0": { "cardPrice": "10,50 ₽", "isAvailable": false },
             "webSingleProductScore-0": { "reviewsCount": "0" },
+            "webAspects-0": {"aspects": [{
+                "aspectName": "Цвет",
+                "variants": [
+                    {"sku": "902", "link": "/product/blue-902/", "data": {"value": "Синий"}},
+                    {"sku": "903", "link": "https://example.test/product/903/", "data": {"value": "Красный"}}
+                ]
+            }]},
             "webCurrentSeller-0": {
                 "rating": { "title": { "text": "0" }},
                 "sellerCell": { "centerBlock": { "title": { "text": "Seller" }}}
@@ -112,9 +119,14 @@ fn details_preserves_false_zero_and_null_fields() {
     let details = parse_details(&page, None);
     assert_eq!(details["sku"], "901");
     assert_eq!(details["price"], 10.5);
+    assert_eq!(details["cardPrice"], 10.5);
     assert_eq!(details["available"], false);
     assert_eq!(details["rating"], json!(null));
     assert_eq!(details["reviews"], 0);
+    assert_eq!(details["variants"]["status"], "available");
+    assert_eq!(details["variants"]["items"][0]["sku"], "902");
+    assert_eq!(details["variants"]["items"][0]["title"], "Цвет: Синий");
+    assert_eq!(details["variants"]["items"][1]["url"], json!(null));
     assert_eq!(details["seller"]["rating"].as_f64(), Some(0.0));
     assert_eq!(details["description"], json!({ "text": "", "images": [] }));
 }
@@ -137,10 +149,54 @@ fn reviews_preserves_variant_specific_unknowns() {
     assert_eq!(parsed["rating"], json!(null));
     assert_eq!(parsed["reviews"][0]["pros"], "");
     assert_eq!(parsed["reviews"][0]["useful"], 0);
-    assert_eq!(parsed["reviews"][0]["purchased"], false);
+    assert_eq!(parsed["reviews"][0]["purchased"], json!(null));
     assert_eq!(parsed["reviews"][1]["author"], "Аноним");
     assert_eq!(parsed["reviews"][1]["purchased"], json!(null));
     assert_eq!(parsed["reviews"][1]["hasPhotos"], json!(null));
+}
+
+#[test]
+fn reviews_exposes_only_safe_observed_identity_photos_and_continuation() {
+    let page = json!({"widgetStates": {"webListReviews-a": {
+        "requestedPath": "/product/example-901/reviews/",
+        "fullRequestUrl": "/product/example-901/reviews/?reviewsVariantMode=2&sort=usefulness_desc",
+        "productsCount": 2,
+        "paging": {"page": 1, "total": 3,
+          "nextButton": "?page=2&page_key=TOKEN_1&sort=usefulness_desc", "links": [
+            {"text": "1", "urlParams": "page=1"},
+            {"text": "2", "urlParams": "page=2"}
+        ]},
+        "sortings": [{"active": true, "name": "Сначала полезные", "value": "usefulness_desc"}],
+        "products": {"901": {"itemId": "901", "variants": [{"name": "Цвет", "value": "Blue"}]}},
+        "reviews": [{
+            "reviewId": "review_1",
+            "itemId": "901",
+            "isItemPurchased": true,
+            "content": {"photos": [
+                {"url": "https://ir.ozone.ru/picture.jpg?tracking=discard#fragment"},
+                "http://127.0.0.1/private.jpg"
+            ]}
+        }]
+    }}});
+    let parsed = parse_reviews(&page, 10);
+    assert_eq!(
+        parsed["nextPath"],
+        "/product/example-901/reviews/?page=2&page_key=TOKEN_1&reviewsVariantMode=2&sort=usefulness_desc"
+    );
+    assert_eq!(parsed["hasNext"], true);
+    assert_eq!(parsed["aggregationScope"], "multiple_variants");
+    assert_eq!(parsed["refinements"][0]["kind"], "sort");
+    assert_eq!(
+        parsed["refinements"][0]["url"],
+        "/product/example-901/reviews/?reviewsVariantMode=2&sort=usefulness_desc"
+    );
+    assert_eq!(parsed["reviews"][0]["reviewId"], "review_1");
+    assert_eq!(parsed["reviews"][0]["variantLabel"], "Цвет: Blue");
+    assert_eq!(parsed["reviews"][0]["purchased"], true);
+    assert_eq!(
+        parsed["reviews"][0]["photos"],
+        json!(["https://ir.ozone.ru/picture.jpg"])
+    );
 }
 
 #[test]
@@ -169,7 +225,7 @@ fn description_falls_back_from_malformed_json_and_deduplicates_images() {
     assert_eq!(
         parse_description(&page),
         json!({
-            "text": "Fresh & clean", "images": ["/same.jpg"]
+            "text": "Fresh & clean", "images": ["https://www.ozon.ru/same.jpg"]
         })
     );
 }

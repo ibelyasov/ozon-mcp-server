@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_get_images.input.schema.json","instance":{"imageRefs":["https://example.com/image.jpg"],"url":"https://example.com/image.jpg"},"expectedInvalidAt":"schema"}

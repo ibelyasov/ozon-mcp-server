@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_get_research input",
+  "type": "object",
+  "oneOf": [
+    {"$ref": "#/$defs/defaultSummary"},
+    {"$ref": "#/$defs/pagedSection"},
+    {"$ref": "#/$defs/pagedEvidence"},
+    {"$ref": "#/$defs/selectedEvidence"}
+  ],
+  "$defs": {
+    "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "defaultSummary": {
+      "type": "object",
+      "required": ["researchId"],
+      "properties": {"researchId": {"$ref": "#/$defs/opaque"}},
+      "additionalProperties": false
+    },
+    "pagedSection": {
+      "type": "object",
+      "required": ["researchId", "section"],
+      "properties": {
+        "researchId": {"$ref": "#/$defs/opaque"},
+        "section": {"enum": ["summary", "events", "notes"]},
+        "cursor": {"$ref": "#/$defs/opaque"}
+      },
+      "additionalProperties": false
+    },
+    "pagedEvidence": {
+      "type": "object",
+      "required": ["researchId", "section"],
+      "properties": {
+        "researchId": {"$ref": "#/$defs/opaque"},
+        "section": {"const": "evidence"},
+        "cursor": {"$ref": "#/$defs/opaque"}
+      },
+      "additionalProperties": false
+    },
+    "selectedEvidence": {
+      "type": "object",
+      "required": ["researchId", "section", "evidenceRefs"],
+      "properties": {
+        "researchId": {"$ref": "#/$defs/opaque"},
+        "section": {"const": "evidence"},
+        "evidenceRefs": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}
+      },
+      "additionalProperties": false
+    }
+  }
+}

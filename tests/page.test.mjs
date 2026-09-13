@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
+import { webcrypto } from "node:crypto";
 
 const source = readFileSync(new URL("../rust/page.js", import.meta.url), "utf8");
 const outcomeFixtures = JSON.parse(
@@ -35,7 +36,7 @@ function validPageOutcome(value) {
   }
   if (!exactKeys(value, ["page"]) || value.page === null ||
       typeof value.page !== "object" || Array.isArray(value.page)) return false;
-  const allowed = new Set(["widgetStates", "seo", "layoutTrackingInfo"]);
+  const allowed = new Set(["widgetStates", "seo", "layoutTrackingInfo", "contextObservation"]);
   if (Object.keys(value.page).some((key) => !allowed.has(key)) ||
       value.page.widgetStates === null ||
       typeof value.page.widgetStates !== "object" ||
@@ -46,6 +47,16 @@ function validPageOutcome(value) {
        !Array.isArray(value.page.seo.link) ||
        !value.page.seo.link.every((link) =>
          exactKeys(link, ["href"]) && typeof link.href === "string"))) return false;
+  if ("contextObservation" in value.page &&
+      (!exactKeys(value.page.contextObservation,
+        ["regionLabel", "regionVerified", "accountState", "accessState", "signature"]) ||
+       !(value.page.contextObservation.regionLabel === null ||
+         typeof value.page.contextObservation.regionLabel === "string") ||
+       typeof value.page.contextObservation.regionVerified !== "boolean" ||
+       !["authenticated", "anonymous", "unknown"].includes(value.page.contextObservation.accountState) ||
+       !["available", "unknown"].includes(value.page.contextObservation.accessState) ||
+       !(value.page.contextObservation.signature === null ||
+         /^[a-f0-9]{64}$/.test(value.page.contextObservation.signature)))) return false;
   return !("layoutTrackingInfo" in value.page) ||
     exactKeys(value.page.layoutTrackingInfo, ["sku"]);
 }
@@ -57,6 +68,89 @@ test("shared page outcomes accept all variants and reject malformed unknowns", (
   for (const outcome of outcomeFixtures.invalid) {
     assert.equal(validPageOutcome(outcome), false, JSON.stringify(outcome));
   }
+});
+
+test("context exposes the observed city and never the address prompt", async () => {
+  class MockElement {}
+  const auth = new MockElement();
+  const address = {
+    getAttribute: () => JSON.stringify({ customCell: { cells: [
+      { button: { text: "Москва" } },
+      { button: { text: "Укажите адрес" } },
+    ] } }),
+  };
+  const value = await evaluate(
+    { mode: "context" },
+    {
+      HTMLElement: MockElement,
+      Element: MockElement,
+      getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+      crypto: webcrypto,
+      document: {
+        querySelector(selector) {
+          if (selector.startsWith('[id^="state-addressBookBarWeb-"')) return address;
+          return selector.startsWith('a[href^="/login"]') ? auth : null;
+        },
+        querySelectorAll: () => [],
+      },
+    },
+  );
+  assert.match(value.page.contextObservation.signature, /^[a-f0-9]{64}$/);
+  assert.deepEqual(jsonValue(value), { page: {
+    widgetStates: {},
+    contextObservation: {
+      regionLabel: "Москва",
+      regionVerified: true,
+      accountState: "anonymous",
+      accessState: "available",
+      signature: value.page.contextObservation.signature,
+    },
+  } });
+  assert.equal(JSON.stringify(value).includes("address"), false);
+  assert.equal(JSON.stringify(value).includes("Укажите адрес"), false);
+  const unknown = await evaluate(
+    { mode: "context" },
+    {
+      HTMLElement: MockElement,
+      Element: MockElement,
+      getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+      crypto: webcrypto,
+      document: { querySelector: () => null, querySelectorAll: () => [] },
+    },
+  );
+  assert.deepEqual(jsonValue(unknown.page.contextObservation), {
+    regionLabel: null,
+    regionVerified: false,
+    accountState: "unknown",
+    accessState: "unknown",
+    signature: null,
+  });
+});
+
+test("context observes the signed-in header without reading profile state", async () => {
+  class MockElement {}
+  const profile = new MockElement();
+  profile.id = "state-profileMenu-1";
+  profile.getAttribute = () => JSON.stringify({ accountId: "PRIVATE" });
+  const value = await evaluate(
+    { mode: "context" },
+    {
+      HTMLElement: MockElement,
+      Element: MockElement,
+      getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+      crypto: webcrypto,
+      document: {
+        querySelector(selector) {
+          return selector.startsWith('[id^="state-profileMenu-"') ? profile : null;
+        },
+        querySelectorAll: () => [profile],
+      },
+    },
+  );
+  assert.equal(value.page.contextObservation.accountState, "authenticated");
+  assert.equal(value.page.contextObservation.accessState, "available");
+  assert.match(value.page.contextObservation.signature, /^[a-f0-9]{64}$/);
+  assert.doesNotMatch(JSON.stringify(value), /PRIVATE|accountId/);
 });
 
 function response(body, { status = 200, contentLength } = {}) {
@@ -158,6 +252,42 @@ test("fetch retains only public widgets and safe metadata", async () => {
       layoutTrackingInfo: { sku: "12345" },
     },
   });
+});
+
+test("source widgets project variants and reviews without account or tracking data", async () => {
+  const body = JSON.stringify({ widgetStates: {
+    "webAspects-1": { aspects: [{ aspectKey: "color", aspectName: "Цвет", type: "COLOR",
+      variants: [{ sku: "902", availability: "AVAILABLE", link: "/product/blue-902/",
+        price: 100, data: { value: "Blue", accountId: "PRIVATE" }, trackingInfo: { key: "PRIVATE" } }]
+    }], cellTrackingInfo: { secret: "PRIVATE" } },
+    "webListReviews-1": {
+      itemId: "901", requestedPath: "/product/901/reviews/", productsCount: 999,
+      paging: { page: 1, total: 2, links: [{ text: "2", urlParams: "page=2", secret: "PRIVATE" }] },
+      sortings: [{ active: true, name: "Useful", value: "usefulness_desc", action: "PRIVATE" }],
+      user: { guid: "PRIVATE" }, actions: { vote: "PRIVATE" },
+      products: { "901": { itemId: "901", name: "Mouse", uri: "/product/901/",
+        variants: [{ name: "Color", value: "Blue", tracking: "PRIVATE" }], trackingInfo: "PRIVATE" },
+        "999": { itemId: "999", name: "Unreturned review product" } },
+      reviews: [{ uuid: "review-1", itemId: "901", publishedAt: 1, isItemPurchased: true,
+        author: { firstName: "Ada", guid: "PRIVATE" },
+        content: { score: 5, comment: "Good", photos: [{ url: "https://ir.ozone.ru/a.jpg", token: "PRIVATE" }] },
+        editUrl: "PRIVATE", sharing: { url: "PRIVATE" } }]
+    }
+  } });
+  const value = jsonValue(await evaluate(
+    { mode: "fetch", path: "/product/901/" },
+    { fetch: async () => response(body) },
+  ));
+  assert.equal(JSON.stringify(value).includes("PRIVATE"), false);
+  assert.deepEqual(value.page.widgetStates["webAspects-1"].aspects[0].variants[0], {
+    availability: "AVAILABLE", link: "/product/blue-902/", price: 100, sku: "902",
+    data: { value: "Blue" },
+  });
+  const reviews = value.page.widgetStates["webListReviews-1"];
+  assert.equal(reviews.productsCount, 2);
+  assert.deepEqual(Object.keys(reviews.products), ["901"]);
+  assert.deepEqual(reviews.reviews[0].author, { firstName: "Ada" });
+  assert.deepEqual(reviews.reviews[0].content.photos, [{ url: "https://ir.ozone.ru/a.jpg" }]);
 });
 
 test("DOM fallback filters private widgets", async () => {

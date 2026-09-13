@@ -218,6 +218,8 @@ pub struct ProductDetails {
     pub name: Option<String>,
     pub url: Option<String>,
     pub price: Option<f64>,
+    /// Explicitly observed `cardPrice`. This never falls back to the regular price.
+    pub card_price: Option<f64>,
     pub price_regular: Option<f64>,
     pub old_price: Option<f64>,
     pub duty: Option<Duty>,
@@ -225,16 +227,66 @@ pub struct ProductDetails {
     pub rating: Option<f64>,
     pub reviews: Option<u64>,
     pub seller: Option<Seller>,
+    pub delivery_label: Option<String>,
     pub images: Vec<String>,
     pub characteristics: BTreeMap<String, String>,
     pub description: Description,
+    pub variants: ProductVariants,
+    pub offers: ProductOffers,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSectionStatus {
+    Available,
+    Partial,
+    Unknown,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductVariant {
+    pub sku: String,
+    pub title: Option<String>,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductVariants {
+    pub status: SourceSectionStatus,
+    pub items: Vec<ProductVariant>,
+    pub has_next: Option<bool>,
+    pub next_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductOffer {
+    pub seller: Option<Seller>,
+    pub prices: Vec<f64>,
+    pub delivery_label: Option<String>,
+    pub url: Option<String>,
+    pub sku: Option<String>,
+    pub available: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductOffers {
+    pub status: SourceSectionStatus,
+    pub items: Vec<ProductOffer>,
+    pub has_next: Option<bool>,
+    pub next_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Review {
+    pub review_id: Option<String>,
     pub author: Option<String>,
     pub score: Option<f64>,
     pub comment: Option<String>,
@@ -244,6 +296,25 @@ pub struct Review {
     pub useful: Option<u64>,
     pub purchased: Option<bool>,
     pub has_photos: Option<bool>,
+    pub variant_label: Option<String>,
+    pub photos: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAggregationScope {
+    SpecificSku,
+    MultipleVariants,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRefinement {
+    pub label: String,
+    pub url: String,
+    pub selected: Option<bool>,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -253,6 +324,10 @@ pub struct ReviewPage {
     pub total_reviews: Option<u64>,
     pub count: usize,
     pub reviews: Vec<Review>,
+    pub next_path: Option<String>,
+    pub has_next: Option<bool>,
+    pub refinements: Vec<ReviewRefinement>,
+    pub aggregation_scope: ReviewAggregationScope,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<Warning>,
 }

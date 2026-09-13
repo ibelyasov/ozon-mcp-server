@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ToolFailure",
+  "type": "object",
+  "required": ["schemaVersion", "researchId", "error"],
+  "properties": {
+    "schemaVersion": {"const": "1"},
+    "researchId": {"oneOf": [{"$ref": "#/$defs/opaque"}, {"type": "null"}]},
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "retryable", "safeToRetry", "retryAfterSeconds", "recovery"],
+      "properties": {
+        "code": {"enum": ["INVALID_ARGUMENT", "INVALID_REFERENCE", "CONTEXT_CHANGED", "CONTEXT_UNVERIFIED", "RESEARCH_EXPIRED", "UNSUPPORTED_CAPABILITY", "SOURCE_BLOCKED", "SOURCE_CHANGED", "UPSTREAM_TIMEOUT", "SERVER_BUSY", "RESULT_TOO_LARGE", "PARTIAL_RESULT", "NOT_FOUND", "CONFLICT", "STORAGE_FULL", "CANCELLED"]},
+        "message": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "retryable": {"type": "boolean"},
+        "safeToRetry": {"type": "boolean"},
+        "retryAfterSeconds": {"type": ["integer", "null"], "minimum": 0},
+        "recovery": {"enum": ["retry_later", "refine_query", "refresh_context", "restart_search", "manual_browser_check", "reduce_batch", "none"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {"opaque": {"type": "string", "minLength": 1, "maxLength": 2048}}
+}

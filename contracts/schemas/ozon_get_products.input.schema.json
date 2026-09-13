@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_get_products input",
+  "type": "object",
+  "required": ["products"],
+  "properties": {
+    "products": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/productRefSelector"},
+          {"$ref": "#/$defs/skuSelector"},
+          {"$ref": "#/$defs/urlSelector"},
+          {"$ref": "#/$defs/cursorSelector"}
+        ]
+      }
+    },
+    "researchId": {"$ref": "#/$defs/opaque"},
+    "include": {
+      "type": "array",
+      "uniqueItems": true,
+      "default": ["characteristics", "offers"],
+      "items": {"enum": ["characteristics", "description", "variants", "offers", "images"]}
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"properties": {"products": {"contains": {"type": "object", "required": ["cursor"]}}}},
+      "then": {"not": {"required": ["include"]}}
+    }
+  ],
+  "$defs": {
+    "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "productRefSelector": {
+      "type": "object",
+      "required": ["productRef"],
+      "properties": {"productRef": {"$ref": "#/$defs/opaque"}},
+      "additionalProperties": false
+    },
+    "skuSelector": {
+      "type": "object",
+      "required": ["sku"],
+      "properties": {"sku": {"type": "string", "pattern": "^[0-9]+$", "maxLength": 64}},
+      "additionalProperties": false
+    },
+    "urlSelector": {
+      "type": "object",
+      "required": ["url"],
+      "properties": {"url": {"type": "string", "format": "uri", "pattern": "^https://(?:www\\.)?ozon\\.ru(?:/|$)", "maxLength": 2048}},
+      "additionalProperties": false
+    },
+    "cursorSelector": {
+      "type": "object",
+      "required": ["cursor"],
+      "properties": {"cursor": {"$ref": "#/$defs/opaque"}},
+      "additionalProperties": false
+    }
+  }
+}

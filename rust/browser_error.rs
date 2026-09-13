@@ -11,7 +11,6 @@ pub enum BrowserError {
     InvalidBridgeResponse,
     ResponseTooLarge,
     CaptchaOrBlocked,
-    RegionSelectionFailed,
     InvalidOrigin,
     HttpStatus(u64),
     NavigationStatusUnavailable,
@@ -62,10 +61,6 @@ impl fmt::Display for BrowserError {
                 formatter,
                 "CAPTCHA_OR_BLOCKED: Ozon did not provide public product data"
             ),
-            Self::RegionSelectionFailed => write!(
-                formatter,
-                "REGION_SELECTION_FAILED: set the region manually in the profile and unset OZON_CITY"
-            ),
             Self::InvalidOrigin => write!(formatter, "Invalid Ozon origin"),
             Self::HttpStatus(status) => write!(formatter, "Ozon returned HTTP {status}"),
             Self::NavigationStatusUnavailable => {
@@ -91,7 +86,7 @@ pub fn requires_reset(error: &anyhow::Error) -> bool {
                 | BrowserError::CleanupFailed
                 | BrowserError::SessionPoisoned
                 | BrowserError::InvalidBridgeResponse
-                | BrowserError::RegionSelectionFailed
+                | BrowserError::Cancelled
         )
     })
 }
@@ -112,9 +107,9 @@ mod tests {
         assert!(!timeout.should_retry());
         assert!(requires_reset(&anyhow::Error::new(timeout)));
 
-        let region = BrowserError::RegionSelectionFailed;
-        assert!(!region.should_retry());
-        assert!(requires_reset(&anyhow::Error::new(region)));
+        let cancelled = BrowserError::Cancelled;
+        assert!(!cancelled.should_retry());
+        assert!(requires_reset(&anyhow::Error::new(cancelled)));
 
         assert!(!requires_reset(&anyhow::anyhow!("ordinary parse error")));
     }

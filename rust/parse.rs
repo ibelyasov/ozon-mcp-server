@@ -6,8 +6,9 @@ use url::Url;
 
 use crate::{
     model::{
-        Description, Discount, Duty, NumericValue, PriceType, ProductDetails, Review, ReviewPage,
-        SearchItem, Seller,
+        Description, Discount, Duty, NumericValue, PriceType, ProductDetails, ProductOffers,
+        ProductVariant, ProductVariants, Review, ReviewAggregationScope, ReviewPage,
+        ReviewRefinement, SearchItem, Seller, SourceSectionStatus,
     },
     widgets::WidgetSet,
 };
@@ -255,7 +256,23 @@ fn image_url(value: Option<&Value>) -> Option<String> {
     let value = value?;
     if let Some(source) = value.as_str() {
         let source = source.trim();
-        return (!source.is_empty()).then(|| source.to_owned());
+        if source.is_empty() || source.len() > 4096 || source.chars().any(char::is_control) {
+            return None;
+        }
+        let base = Url::parse(OZON_ORIGIN).ok()?;
+        let mut url = base.join(source).ok()?;
+        let host = url.host_str()?.to_ascii_lowercase();
+        let allowed = url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && (host == "ozon.ru" || host == "www.ozon.ru" || host.ends_with(".ozone.ru"));
+        if !allowed {
+            return None;
+        }
+        url.set_query(None);
+        url.set_fragment(None);
+        return Some(url.into());
     }
     let record = value.as_object()?;
     image_url(record.get("src"))
@@ -558,6 +575,64 @@ fn parse_seller(page: &Value) -> Option<Seller> {
     Some(Seller { name, rating, url })
 }
 
+fn parse_variants(page: &Value) -> ProductVariants {
+    let state = widget_matching(page, "webAspects", |value| {
+        value.get("aspects").is_some_and(Value::is_array)
+    });
+    let mut items = Vec::new();
+    if let Some(aspects) = state
+        .as_ref()
+        .and_then(|value| value.get("aspects"))
+        .and_then(Value::as_array)
+    {
+        for aspect in aspects {
+            let aspect_name = aspect.get("aspectName").and_then(text);
+            for variant in aspect
+                .get("variants")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(sku) = normalize_sku(variant.get("sku")) else {
+                    continue;
+                };
+                let url = clean_url(variant.get("link")).filter(|url| {
+                    sku_from_url(Some(&Value::String(url.clone()))).as_deref() == Some(&sku)
+                });
+                let data = variant.get("data").and_then(Value::as_object);
+                let value = ["title", "text", "name", "value"]
+                    .into_iter()
+                    .find_map(|key| {
+                        data.and_then(|data| data.get(key))
+                            .and_then(|value| text_from(Some(value)))
+                    });
+                let title = match (aspect_name.as_ref(), value) {
+                    (Some(name), Some(value)) => Some(format!("{name}: {value}")),
+                    (_, Some(value)) => Some(value),
+                    _ => None,
+                };
+                items.push(ProductVariant { sku, title, url });
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    items.retain(|item| seen.insert(item.sku.clone()));
+    let truncated = items.len() > 20;
+    items.truncate(20);
+    ProductVariants {
+        status: if state.is_none() {
+            SourceSectionStatus::Unknown
+        } else if truncated {
+            SourceSectionStatus::Partial
+        } else {
+            SourceSectionStatus::Available
+        },
+        items,
+        has_next: None,
+        next_path: None,
+    }
+}
+
 fn decode_html_entities(value: &str) -> String {
     let re = Regex::new(r"(?iu)&(#x[0-9a-f]+|#\d+|nbsp|amp|lt|gt|quot|apos);").unwrap();
     re.replace_all(value, |caps: &regex::Captures<'_>| {
@@ -667,6 +742,7 @@ pub fn parse_description(page: &Value) -> Description {
     }
     let mut seen = HashSet::new();
     images.retain(|image| seen.insert(image.clone()));
+    images.truncate(12);
     Description {
         text: texts.join(" ").trim().to_owned(),
         images,
@@ -757,8 +833,9 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails
     }
     let mut seen = HashSet::new();
     images.retain(|image| seen.insert(image.clone()));
-    images.truncate(10);
-    let card_price = price_to_number(price.as_ref().and_then(|v| v.get("cardPrice")))
+    images.truncate(12);
+    let explicit_card_price = price_to_number(price.as_ref().and_then(|v| v.get("cardPrice")));
+    let card_price = explicit_card_price
         .or_else(|| price_to_number(price.as_ref().and_then(|v| v.get("price"))));
     let duty = parse_duty(base_page).map(|(amount, note)| Duty {
         amount,
@@ -788,6 +865,7 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails
         name,
         url: final_url,
         price: card_price,
+        card_price: explicit_card_price,
         price_regular: price_to_number(price.as_ref().and_then(|v| v.get("price"))),
         old_price: price_to_number(price.as_ref().and_then(|v| v.get("originalPrice"))),
         duty,
@@ -798,9 +876,20 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails
         rating,
         reviews,
         seller: parse_seller(base_page),
+        delivery_label: price
+            .as_ref()
+            .and_then(|value| value.get("deliveryLabel"))
+            .and_then(text),
         images,
         characteristics: parse_short_characteristics(base_page),
         description,
+        variants: parse_variants(base_page),
+        offers: ProductOffers {
+            status: SourceSectionStatus::Unsupported,
+            items: Vec::new(),
+            has_next: None,
+            next_path: None,
+        },
         warnings: Vec::new(),
     }
 }
@@ -863,7 +952,66 @@ pub fn parse_reviews(page: &Value, limit: usize) -> ReviewPage {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             };
+            let photos: Vec<String> = content
+                .and_then(|c| c.get("photos"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|photo| image_url(Some(photo)))
+                .take(12)
+                .collect();
+            let review_id = review
+                .get("reviewId")
+                .or_else(|| review.get("id"))
+                .or_else(|| review.get("uuid"))
+                .and_then(|value| match value {
+                    Value::String(value) => Some(value.trim().to_owned()),
+                    Value::Number(value) if value.is_u64() => Some(value.to_string()),
+                    _ => None,
+                })
+                .filter(|value| {
+                    !value.is_empty()
+                        && value.len() <= 128
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                });
+            let item_id = normalize_sku(review.get("itemId"));
+            let variant_label = item_id.as_ref().and_then(|item_id| {
+                state
+                    .as_ref()
+                    .and_then(|value| value.get("products"))
+                    .and_then(Value::as_object)
+                    .and_then(|products| {
+                        products.get(item_id).or_else(|| {
+                            products.values().find(|product| {
+                                normalize_sku(product.get("itemId")).as_ref() == Some(item_id)
+                            })
+                        })
+                    })
+                    .and_then(|product| product.get("variants"))
+                    .and_then(Value::as_array)
+                    .map(|variants| {
+                        variants
+                            .iter()
+                            .filter_map(|variant| {
+                                let name =
+                                    variant.get("name").and_then(|value| text_from(Some(value)));
+                                let value = variant
+                                    .get("value")
+                                    .and_then(|value| text_from(Some(value)));
+                                match (name, value) {
+                                    (Some(name), Some(value)) => Some(format!("{name}: {value}")),
+                                    (_, value) => value,
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|label| !label.is_empty())
+            });
             Review {
+                review_id,
                 author,
                 score: rating_from_value(content.and_then(|c| c.get("score"))),
                 comment: optional_string("comment"),
@@ -875,20 +1023,173 @@ pub fn parse_reviews(page: &Value, limit: usize) -> ReviewPage {
                         .or_else(|| review.get("createdAt")),
                 ),
                 useful: count_from_value(review.pointer("/usefulness/useful")),
-                purchased: review.get("isItemPurchased").and_then(Value::as_bool),
+                // Captured runtime evidence showed false on purchased reviews;
+                // only an affirmative upstream value is treated as evidence.
+                purchased: (review.get("isItemPurchased").and_then(Value::as_bool) == Some(true))
+                    .then_some(true),
                 has_photos: content
                     .and_then(|c| c.get("photos"))
                     .and_then(Value::as_array)
                     .map(|photos| !photos.is_empty()),
+                variant_label: variant_label.or_else(|| {
+                    review
+                        .pointer("/productVariant/title")
+                        .or_else(|| review.pointer("/variant/title"))
+                        .or_else(|| review.get("variantLabel"))
+                        .and_then(|value| text_from(Some(value)))
+                }),
+                photos,
             }
         })
         .collect();
+    let requested_path = state
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("fullRequestUrl")
+                .or_else(|| value.get("requestedPath"))
+        })
+        .and_then(Value::as_str)
+        .and_then(safe_review_path);
+    let next_button = state
+        .as_ref()
+        .and_then(|value| value.pointer("/paging/nextButton"))
+        .and_then(Value::as_str);
+    let next_path = next_button
+        .filter(|value| !value.is_empty())
+        .and_then(|params| review_path_with_params(requested_path.as_deref()?, params));
+    let has_next = if next_path.is_some() {
+        Some(true)
+    } else {
+        (next_button == Some("")).then_some(false)
+    };
+    let refinements = parse_review_refinements(state.as_ref(), requested_path.as_deref());
+    let aggregation_scope = match state
+        .as_ref()
+        .and_then(|value| value.get("productsCount"))
+        .and_then(Value::as_u64)
+    {
+        Some(count) if count > 1 => ReviewAggregationScope::MultipleVariants,
+        Some(1) => ReviewAggregationScope::SpecificSku,
+        _ => ReviewAggregationScope::Unknown,
+    };
     ReviewPage {
         rating,
         total_reviews: total,
         count: reviews.len(),
         reviews,
+        next_path,
+        has_next,
+        refinements,
+        aggregation_scope,
         warnings: Vec::new(),
+    }
+}
+
+fn review_path_with_params(base: &str, params: &str) -> Option<String> {
+    let origin = Url::parse(OZON_ORIGIN).ok()?;
+    let mut target = origin.join(base).ok()?;
+    let additions = origin
+        .join(&format!("/?{}", params.trim_start_matches('?')))
+        .ok()?;
+    let mut pairs: BTreeMap<String, String> = target
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    for (key, value) in additions.query_pairs() {
+        pairs.insert(key.into_owned(), value.into_owned());
+    }
+    target.set_query(None);
+    for (key, value) in pairs {
+        target.query_pairs_mut().append_pair(&key, &value);
+    }
+    let path = target.as_str().strip_prefix(OZON_ORIGIN)?.to_owned();
+    safe_review_path(&path)
+}
+
+fn parse_review_refinements(
+    state: Option<&Value>,
+    requested_path: Option<&str>,
+) -> Vec<ReviewRefinement> {
+    let Some(base) = requested_path else {
+        return Vec::new();
+    };
+    state
+        .and_then(|value| value.get("sortings"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|sorting| {
+            let label = sorting
+                .get("name")
+                .and_then(text)?
+                .chars()
+                .take(500)
+                .collect();
+            let value = sorting.get("value").and_then(Value::as_str)?;
+            let url = review_path_with_params(base, &format!("sort={value}"))?;
+            Some(ReviewRefinement {
+                label,
+                url,
+                selected: sorting.get("active").and_then(Value::as_bool),
+                kind: Some("sort".to_owned()),
+            })
+        })
+        .take(100)
+        .collect()
+}
+
+pub(crate) fn safe_review_path(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+        return None;
+    }
+    let base = Url::parse(OZON_ORIGIN).ok()?;
+    let url = base.join(value).ok()?;
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("ozon.ru" | "www.ozon.ru"))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.fragment().is_some()
+        || !Regex::new(r"^/product/(?:[^/]*-)?[0-9]+/reviews/$")
+            .ok()?
+            .is_match(url.path())
+    {
+        return None;
+    }
+    let mut result = url.path().to_owned();
+    let mut seen = HashSet::new();
+    let pairs: Vec<_> = url.query_pairs().collect();
+    for (key, value) in &pairs {
+        if !seen.insert(key.to_string()) || !safe_review_parameter(key, value) {
+            return None;
+        }
+    }
+    if !pairs.is_empty() {
+        result.push('?');
+        result.push_str(url.query()?);
+    }
+    Some(result)
+}
+
+fn safe_review_parameter(key: &str, value: &str) -> bool {
+    match key {
+        "page" => value
+            .parse::<u64>()
+            .is_ok_and(|page| (1..=10_000).contains(&page)),
+        "page_key" => {
+            !value.is_empty()
+                && value.len() <= 512
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }
+        "sort" => matches!(value, "usefulness_desc" | "score_desc" | "score_asc"),
+        "reviewsVariantMode" => value.parse::<u8>().is_ok_and(|mode| mode <= 10),
+        "rating" => value
+            .parse::<u8>()
+            .is_ok_and(|rating| (1..=5).contains(&rating)),
+        _ => false,
     }
 }
 

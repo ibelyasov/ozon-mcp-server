@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_get_context.input.schema.json","instance":{"region":"Москва"},"expectedInvalidAt":"schema"}

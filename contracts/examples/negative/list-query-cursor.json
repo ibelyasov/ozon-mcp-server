@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_list_research.input.schema.json","instance":{"query":"phones","cursor":"cursor-2"},"expectedInvalidAt":"schema"}

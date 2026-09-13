@@ -305,11 +305,17 @@ fn prepare_request(args: &SearchArgs) -> Result<PreparedSearchRequest> {
     }
     if args.price_min.is_some() || args.price_max.is_some() {
         let min = args.price_min.unwrap_or(0);
-        let max = args.price_max.unwrap_or(min.max(99_999_999));
+        let max = args.price_max.unwrap_or(min.max(9_999_999_900));
         current = refine(
             &current,
             "currency_price",
-            Some(&format!("{min}.000;{max}.000")),
+            Some(&format!(
+                "{}.{:02}0;{}.{:02}0",
+                min / 100,
+                min % 100,
+                max / 100,
+                max % 100
+            )),
         )
         .ok_or_else(|| anyhow::anyhow!("Invalid price URL"))?;
     }
@@ -857,10 +863,6 @@ mod tests {
         async fn fetch_json(&mut self, _: &str, _: &CancellationToken) -> Result<Value> {
             Ok(self.0.clone())
         }
-
-        async fn shutdown(&mut self) -> Result<()> {
-            Ok(())
-        }
     }
 
     fn finish(page: &Value, args: &SearchArgs, request: PreparedSearchRequest) -> Result<Value> {
@@ -985,6 +987,21 @@ mod tests {
             )
             .unwrap(),
             "https://www.ozon.ru/category/mice-123/brand-2/?search_page_state=abc&page=2"
+        );
+    }
+    #[test]
+    fn price_bounds_preserve_kopecks() {
+        let prepared = prepare(&args(
+            json!({"query":"x","priceMin":19999,"priceMax":20501}),
+        ))
+        .unwrap();
+        let url = url::Url::parse(&prepared.url).unwrap();
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "currency_price")
+                .unwrap()
+                .1,
+            "199.990;205.010"
         );
     }
     #[test]

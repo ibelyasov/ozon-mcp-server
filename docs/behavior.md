@@ -1,150 +1,74 @@
 # Configuration and behavior
 
-[Обзор на русском](../README.md) · [English overview](../README.en.md)
+[Русский обзор](../README.md) · [English overview](../README.en.md) · [Contracts](../contracts/README.md)
 
-This page describes the Rust 0.4.0 server built with `rmcp` and `agent-browser` 0.36.0.
+This describes development version 1.0.0, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
 
-## Runtime configuration
+## Process and configuration
 
-| Variable | Default | Behavior |
+Each MCP client starts a stdio frontend. Frontends connect through private local IPC to one broker, which owns one persistent browser profile and one observed account/region context. Another frontend never creates a fallback profile.
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `OZON_AGENT_BROWSER_BIN` | `agent-browser` from `PATH` | Optional absolute path to the pinned native driver. The executable must report exactly `agent-browser 0.36.0`; another version stops server startup. |
-| `OZON_BROWSER_EXECUTABLE` | Unset | Optional path to an existing full Chrome executable. If unset, agent-browser uses the Chrome installed by `agent-browser install`. |
-| `OZON_HEADLESS` | `true` | Only the case-insensitive value `false` enables a visible browser. There is no automatic visible fallback. |
-| `OZON_USER_DATA_DIR` | `~/.ozon-mcp-rust-profile` | Preferred persistent profile for cookies, storage and region. If occupied, the process leases the first free persistent fallback slot under `base/.ozon-mcp-profiles/`. |
-| `OZON_CITY` | Unset | Selects a city through current Ozon UI selectors. Failure returns `REGION_SELECTION_FAILED`; successful selector actions still require manual verification of the saved region. |
-| `OZON_HIDE_WINDOW` | Ignored | Deprecated. Use `OZON_HEADLESS`; the server only emits a diagnostic when this variable is present. |
+| `OZON_DATA_DIR` | Platform user-data location | Private socket, journal, and state. It must belong to the current OS user, must not be a symlink, and has mode `0700`. |
+| `OZON_USER_DATA_DIR` | Under `OZON_DATA_DIR` | The one persistent browser profile. |
+| `OZON_BROKER_SOCKET` | Under `OZON_DATA_DIR` | Optional Unix socket override, directly inside the data directory. Its encoded path is at most 103 bytes. |
+| `OZON_AGENT_BROWSER_BIN` | `agent-browser` from `PATH` | Driver executable, exactly version 0.36.0. |
+| `OZON_BROWSER_EXECUTABLE` | Unset | Optional existing Chrome executable. |
+| `OZON_HEADLESS` | `true` | Only `false` requests a visible browser. |
 
-The browser starts on the first tool call. Agent-browser receives a ten-minute idle timeout, and the server replaces a session before reuse after roughly that interval. `OZON_HEADLESS=false` is an explicit manual session; errors never open a window automatically.
+The broker and IPC support macOS and Linux. Windows is unsupported. The server never automatically signs in or changes region. To configure either, set `OZON_HEADLESS=false` before broker startup and request context from an MCP client, then make the change manually in the visible window. A running broker retains its launch configuration; stop it gracefully before changing mode.
 
-### Persistent profile leasing
+The profile can contain cookies. The journal excludes credentials, cookies, account identifiers, full addresses, raw DOM/widgets, and unrestricted stderr. Keep both directories outside the repository.
 
-Each server process first attempts to exclusively lock the configured `OZON_USER_DATA_DIR`. If another process owns it, the server tries `base/.ozon-mcp-profiles/1`, `2`, and so on, selecting the first free slot among at most 1,024 fallbacks. It owns that exclusive profile lock for its lifetime and does not delete active locks; slots become available for reuse after their owner exits.
+## Context, observations, and references
 
-Every slot is an independent persistent browser profile. Cookies, sign-in and region are not copied into a fresh slot. A Codex session is not guaranteed to receive the same slot after a reconnect. For reliable manual sign-in or region selection, configure a dedicated `OZON_USER_DATA_DIR` and avoid concurrent processes using that dedicated base.
+`ozon_get_context` reports observed access, account, region, and capability state. `contextId` identifies the broker generation shared by agents. The live source reads the city only from the exact first cell observed on supported Ozon pages; a probe verified the label `Москва`. This establishes that observed city signal, not arbitrary region correctness. Switching between accounts in the same city may be unobservable, so `contextId` does not guarantee account identity.
 
-The driver runs from a private temporary directory with an empty private config, an empty plugin list, WebMCP disabled and a cleared environment containing only a small system allowlist. Ambient agent-browser plugins, providers and user configuration are not loaded. Neither the Rust server nor the native driver needs a Node.js runtime.
+Opaque `researchId`, `productRef`, `imageRef`, and `evidenceRef` values are authority only within private IPC. References bind to their research and context. Navigation and section cursors also bind filters and projection and expire after 30 minutes. Context changes invalidate navigation rather than mixing observations.
 
-## Data path and results
+Search, product, review, and image calls only read Ozon and write bounded local journal records. Results preserve observation time, context, source association, and evidence paths. Unknown fields stay unknown; a missing or malformed source section is not a confirmed empty list.
 
-The server first fetches Ozon's internal `composer-api` inside the Ozon tab. When that request returns HTTP 403 or 307, it may navigate to the exact requested Ozon page and extract an allowlist of public product and search widgets. Search metadata is projected to explicit display, filter and navigation fields; tracking and unrelated nested data are excluded. A different origin, product, review page or search is rejected. Profile, address and order widgets are excluded from returned data.
+Prices use integer minor units. `ozon_card` is a distinct observed payment condition and is never replaced with `regular`. A visible price does not prove account eligibility. Delivery labels remain as displayed and are not guarantees; an unknown delivery fee is not zero.
 
-For `BROWSER_COMMAND_FAILED` only, a read-only request gets one retry in a confirmed fresh browser session, still inside the 55-second tool deadline. HTTP errors and challenges are returned directly; there is no HTTP retry loop.
+Search refinements represent complete observed states. Agents follow returned references instead of constructing category-specific URLs. Pagination is bounded and dynamic. `hasNext: false` requires a confirmed end; local limits produce partial or unknown coverage.
 
-Successful tools return the same JSON object as MCP `structuredContent` and text content. The server never truncates JSON: oversized results fail explicitly. It can only return fields present in the received page; unknown values remain `null` where defined.
+Product batches preserve selector order and per-item errors. Characteristics retain source labels and values. Variants are implemented from observed SKU mappings. A public live probe found no safe other-offers link, so seller offers remain explicitly `unsupported`. Product-section continuations use a bounded cached snapshot and preserve its original observation timestamp. Reviews preserve aggregation scope; review photos are implemented through research-bound image refs without inventing purchase filters.
 
-Tool output schemas are derived from the same Rust types that serialize the results. Optional warnings on product details and reviews remain absent when there is nothing to report; unknown data fields remain `null`. Optional search metadata and the final MCP response use the same serialized UTF-16 size measurement. The separate driver and page byte limits protect their own transport resources.
+Images accept only stored refs associated with the same research. Fetches enforce HTTPS, allowed origin, redirect and destination checks, raster MIME and decode, one MiB per image, four MiB per call, and a 20-megapixel decoded-source limit. Each returned image has a content index and hash; one failure does not hide successful siblings.
 
-Widget readers skip malformed instances and continue to later usable instances of the same widget. Readers of paginators, filters, sort options, grids and review lists also check the required field or container shape, so a wrong-shape object cannot hide a later usable instance. Explicit empty containers retain their meaning; a missing or malformed container is not evidence of an empty result.
+## Journal and errors
 
-Search items include `rating` (product rating) and `reviews` (review count). The search tool description tells assistants to consider both together when comparing products, and to treat `null` as unknown rather than zero. The `popular` sort uses Ozon's ordering; it does not expose a numeric popularity score or sales count. Assistants can use `ozon_product_reviews` to read available review text when useful for the comparison.
+Research events, evidence, product references, and notes survive broker restart. Summaries include at most 100 product refs; every candidate remains enumerable through events. Page caps are 25 events, 20 evidence entries, and 10 notes.
 
-### Search refinement and continuation
+Retention is 30 days with a 512 MiB logical database plus WAL budget. A request lease protects active research for at least ten idle minutes; no research is permanently active. Maintenance removes oldest idle research as a whole. If protected records prevent recovery, writes fail with `STORAGE_FULL`. A marketplace result cannot succeed if its journal write fails.
 
-`ozon_search` accepts exactly one starting mode: `query`, a returned `searchUrl`, or a returned `nextCursor`. Existing query, sort, price and limit calls remain supported. Unknown argument names are rejected. `sort` and `priceMin`/`priceMax` may override a `searchUrl` and reset pagination; they cannot accompany `nextCursor`.
+`ozon_append_research_note` atomically validates refs against the same research. `(researchId, operationId)` is idempotent for canonical identical JSON; changed reuse returns `CONFLICT`. Source text and notes are untrusted data, never instructions.
 
-Each call fetches one Ozon page and returns at most `limit` items (1–36, default 12). `nextCursor` first continues any unreturned items on that page, then follows the observed Ozon next-page link. It removes fragment-only transport parameters so a browser fallback can load a complete page. A cursor suppresses repeated SKUs across its chain, is bounded to 500 unique SKUs and 100 calls, and is not a snapshot: changing Ozon ordering can still affect coverage between calls. Do not edit cursor contents. `CONTINUATION_LIMIT_REACHED` means the bounded chain stopped, not that Ozon has no more matches. `CONTINUATION_STALLED` means Ozon returned a link back to the same page.
+Whole-tool failures use a stable typed code and omit success `structuredContent`. Batch tools may preserve successful items beside typed item failures. Structured JSON is bounded to 60,000 UTF-16 units and the complete envelope to eight MiB. Arrays shorten only at whole-item boundaries with explicit continuation or partial status.
 
-`count` is the number of returned items. `coverage` describes the current page, parsed item offsets, returned items and unique SKUs seen in this cursor chain; it is not a marketplace-wide count. `total` stays `null` without a verified source. `hasNext: null` means the response does not establish whether another page exists. A missing search widget remains a warning, not proof of zero matches.
+At most eight whole calls are admitted. Each call receives 44 seconds for browser/image work, reserving 11 seconds for cleanup and result assembly inside a 55-second watchdog. An outer safety fallback can wait five more seconds while retaining admission ownership. Admission remains owned until execution and bounded cleanup finish.
 
-Initial searches include available `facets`, `sortOptions` and `activeFilters`. Follow their `searchUrl` links to apply or remove a selection. Facets cover observed categories, booleans, checkbox/radio values, ranges and colors, including brand, delivery and category-specific characteristics when Ozon supplies them. Range metadata includes the current selection when available; custom price bounds use `priceMin`/`priceMax`. Available values can be collapsed by Ozon or capped in the response: inspect `hasMoreValues`, `optionsTruncated` and `facets.truncated` instead of assuming completeness. Cursor calls omit these optional blocks by default; set `includeFacets: true` to request them. `SEARCH_METADATA_TRUNCATED` indicates optional metadata was dropped to bound the response.
+## Verification boundary
 
-Search products include nullable `price`, `priceLabel`, `deliveryLabel` and `seller`, with `currency: "RUB"` and `priceType`. An observed `CARD_PRICE` style is labelled `ozon_card`; other price conditions remain `unknown`. The price-filter description can explicitly say that it filters prices with an Ozon Card. A missing price no longer discards an otherwise identifiable product. `matchesPriceRange` compares the displayed price with the requested `currency_price` bounds: it is `true`/`false` when both are known and `null` otherwise. `PRICE_OUTSIDE_REQUESTED_RANGE` warns that Ozon returned a displayed price outside its active native filter; products are not silently discarded or reordered. A delivery label is Ozon's displayed text, not a guaranteed arrival date. The server does not infer a seller from an ambiguous badge: use product details for available seller and alternative payment prices. Search context reports `region: null` and `regionVerified: false` because neither the saved profile nor successful city selector actions establish the actual region.
-
-For comparisons, start with search, refine using returned facets, continue only as far as needed, then read details for shortlisted products to check required characteristics, seller and price conditions. Read review text when useful, considering `rating` together with `reviews`. Report unknown requirements and the actual search coverage.
-
-Product details request the secondary description page whenever the base page has no nonempty text, including when the base contains description images only. The merged result prefers nonempty base text, otherwise uses secondary text, and returns the deduplicated union of images from both pages.
-
-| Warning/error | Meaning |
-|---|---|
-| `DESCRIPTION_FETCH_FAILED` | The secondary description request failed; available base fields remain, together with `DESCRIPTION_TEXT_EMPTY` or `DESCRIPTION_EMPTY` when applicable. |
-| `DESCRIPTION_TEXT_EMPTY` | Description images are available after merging, but description text is absent. |
-| `DESCRIPTION_EMPTY` | Both description text and images are absent after merging. |
-| `SEARCH_WIDGET_MISSING` | The expected search block is absent; an empty result is not proof of no matching products. |
-| `PRODUCT_WIDGETS_MISSING` | Expected product heading or price blocks are absent. |
-| `REVIEWS_WIDGET_MISSING` | The expected reviews block is absent. |
-| `REGION_SELECTION_FAILED` | `OZON_CITY` was set but could not be applied through Ozon's current interface. |
-| `CAPTCHA_OR_BLOCKED` | Ozon supplied neither an accepted response nor allowed public widgets. |
-| `RESPONSE_TOO_LARGE` / `RESULT_TOO_LARGE` | The page response or final tool result exceeded its limit; partial JSON is not returned. |
-| `SERVER_BUSY` | Eight requests are already admitted, including the active request. |
-| `TOOL_TIMEOUT` | The 55-second whole-tool deadline, including queue time, expired. |
-| `BROWSER_CLEANUP_FAILED` | The server could not confirm that its private browser closed and refuses further browser work. |
-
-Unrecovered HTTP errors and browser command failures are tool errors. Raw page responses and unrestricted driver stderr are not returned to the MCP client.
-
-## Concurrency, timeouts and cancellation
-
-- Up to eight calls are admitted per server process, including the active call; a single browser mutex permits one actual browser operation at a time.
-- Arguments are validated before admission or browser access. Invalid requests do not close a healthy browser. Cancelling a queued request does not interrupt the active request.
-- The whole tool deadline is 55 seconds including queue time.
-- Normal agent-browser commands have a 45-second deadline; page evaluation commands have 40 seconds.
-- The in-page Ozon fetch aborts after 35 seconds.
-- An accepted Ozon page response is limited to 4 MiB. Driver JSON is separately bounded, and the final result is limited to 60,000 UTF-16 code units.
-- Agent-browser receives a ten-minute idle timeout.
-
-When cancellation, a timeout or uncertain browser state requires cleanup, the server closes only the private browser whose local CDP endpoint it captured and validated. It sends the standard CDP `Browser.close` command to that loopback endpoint, then asks agent-browser to close the session. This narrow interrupt path is not a general CDP implementation or a second browser driver. If shutdown cannot be confirmed, the session is poisoned and subsequent work fails closed instead of sharing an uncertain browser.
-
-Reset decisions use typed browser failures rather than error-message text. Browser failures that leave session state uncertain require cleanup; ordinary validation and marketplace responses do not by themselves invalidate a healthy session. The one fresh-session retry remains restricted to `BROWSER_COMMAND_FAILED`.
-
-Browser startup is cancellation-shielded only while the server acquires ownership: opening the private browser is bounded to 15 seconds and capturing its validated local CDP endpoint to another 5 seconds. Client cancellation is reported immediately, while the admitted queue slot and browser lock remain owned until this bounded acquisition and cleanup finish. This prevents a detached browser from being orphaned before the server knows which endpoint it may close.
-
-## Compatibility and verification
-
-### Internal architecture
-
-The server remains one Rust binary. Its modules hide different kinds of knowledge:
-
-- `main` adapts typed requests/results and schemas to MCP.
-- `executor` owns admission, deadlines, cancellation, tracked work and cleanup ordering. A dropped MCP handler cancels the work without releasing ownership before cleanup finishes.
-- `operations` and `search` validate and execute marketplace scenarios through the internal `PageSource` interface. Production uses Ozon pages; offline scenario tests use scripted pages.
-- `model` defines public result types; `parse` converts external widget data and owns product-description merging; `widgets` applies one decoding and instance-selection policy.
-- `ozon_pages` owns Ozon preparation, region selection, composer requests, accepted fallback pages and retry policy.
-- `browser` owns the pinned driver, persistent profile lease, session state, private endpoint and shutdown.
-- `page_outcome` validates the TypeScript/Rust bridge, while `browser_error` classifies browser failures. Shared synthetic fixtures exercise accepted and rejected bridge outcomes in both languages.
-- `response` measures serialized public results and enforces the final response budget.
-
-External Ozon data remains dynamic inside extraction and parsing. Cross-module product/search/review results are typed; public JSON is produced at the MCP edge. The generated `page.js` stays checked in so Cargo builds and the installed server do not require Node.js.
-
-CI checks generated JavaScript freshness and browser-script tests, plus Rust formatting, tests and Clippy. Browser lifecycle tests remain opt-in and use disposable profiles; ordinary tests do not contact Ozon.
-
-On September 12, 2026, local architecture-refactor checks passed on Rust 1.95.0: 52 ordinary Rust tests, 11 browser-script tests, generated JavaScript freshness, formatting, Clippy with warnings denied, and a debug build. A stdio check verified all three tools' typed output schemas and rejected invalid requests without launching Chrome. Both opt-in Chromium lifecycle tests passed with disposable profiles (11.42 seconds total). These checks did not contact Ozon. The new Rust 1.88 CI job has not been run locally.
-
-On September 6, 2026, acceptance for concurrent profile leasing passed:
-
-- All 32 ordinary Rust tests passed.
-- Eight simultaneous stdio clients each completed `initialize` and `tools/list` in 0.412 seconds overall.
-- The ignored real-Chromium test started two local headless browsers with isolated profiles and verified their independent shutdown in 2.17 seconds. It made no Ozon requests.
-
-As of September 5, 2026:
-
-- Rust 0.4.0 server startup and MCP tool listing passed.
-- All 29 ordinary Rust offline tests and 10 browser-script tests passed after the search upgrade. They cover parsers, search continuation and refinement, URL/redirect boundaries and public metadata projection without contacting Ozon.
-- The ignored-by-default real-Chromium test `cancelled_evaluation_closes_private_browser_and_can_restart` passed in 8.00 seconds. It cancelled endless JavaScript, closed the captured private browser and successfully launched and used a replacement, without contacting Ozon.
-- The release 0.4.0 stdio server completed a successful live headless run on macOS with all three advertised tools and exit code 0 in 25.78 seconds. Search returned two items in 19.82 seconds, including Logitech MX Master 3S SKU `947750106` at 6,859 RUB. Details for that SKU returned rating 4.9 but no description text in 3.86 seconds. A later description check confirmed two images and no text, with `DESCRIPTION_TEXT_EMPTY`, in 3.88 seconds. Reviews returned two entries out of 2,618 in 1.90 seconds; their aggregate rating was unavailable (`null`).
-- Search-upgrade live acceptance verified local page overflow plus pages 2 and 3, yielding 24 distinct SKUs. A subsequent 38.47-second headless MCP run passed brand application/removal, delivery, price/sort, verified-brand and Bluetooth facets, then product details and reviews, exiting with code 0. One displayed price fell below the active native minimum; the server correctly reported `matchesPriceRange: false` and `PRICE_OUTSIDE_REQUESTED_RANGE`. These probes cover the tested mouse category and profile, not every category or region. The final output-only `score` to `popular` alias was checked offline after this live run.
-- Earlier runs received HTTP 403 responses and one transient `BROWSER_COMMAND_FAILED`. Those results remain historical evidence that Ozon access can change; the successful run does not guarantee future availability.
-- Windows and Linux compatibility for this fork remains unverified.
-
-Ozon may change response formats and anti-bot checks at any time. These checks do not establish uninterrupted access, completeness across product categories, or acceptance of a signed-in profile in headless mode. Verify the region and product page before relying on prices or availability.
-
-Run the real-browser cancellation test only with a disposable profile and explicit pinned executables:
+Schema, Rust, browser-script, and client tests establish different properties. They do not prove live catalog access, account identity, seller-offer coverage, or recommendation quality. A disposable real-Chrome lifecycle run recorded seven passing tests in 8.45 seconds: cancellation followed by restart, strict profile contention, persistent poison state after cleanup failure, confirmed-close recovery, and private profile paths without fallback. It was compiled before the final source/tools changes and did not test abnormal broker termination. Version 1.0.0 remains in development until the remaining live broker, catalog, target-client, reconnect, and agent-task gates have recorded evidence.
 
 ```sh
-OZON_USER_DATA_DIR=/absolute/path/to/disposable-test-profile \
-OZON_AGENT_BROWSER_BIN=/absolute/path/to/agent-browser \
-OZON_BROWSER_EXECUTABLE=/absolute/path/to/full-chrome \
-cargo test --locked cancelled_evaluation_closes_private_browser_and_can_restart -- --ignored
+UV_CACHE_DIR=/tmp/ozon-contracts-uv uv run --offline --no-project --with 'jsonschema[format]==4.25.1' python scripts/validate-contracts.py
 ```
 
-To run the concurrent browser-isolation check, keep the same disposable profile and pinned executable variables and replace the test filter with `concurrent_profiles_keep_browsers_independent`.
+`rust/page.ts` generates tracked `rust/page.js`; keep them together. Ordinary checks do not contact Ozon.
 
-## Troubleshooting
+## Image DNS compatibility
 
-- **Driver version error:** install exactly agent-browser 0.36.0 or point `OZON_AGENT_BROWSER_BIN` at that binary.
-- **Chrome missing:** run `agent-browser install`, or set `OZON_BROWSER_EXECUTABLE` to an existing full Chrome executable.
-- **Browser unexpectedly opens:** remove `OZON_HEADLESS=false` and restart old MCP processes. No error path enables visible mode.
-- **Unexpected account or region:** a concurrent process may have caused this server to lease a different persistent slot. Slots do not copy cookies or login state. For reliable manual setup, use a dedicated `OZON_USER_DATA_DIR` without concurrent users; never delete an active lock.
-- **Region selection fails:** start an explicit visible session, select the region manually, then reuse that profile in headless mode.
-- **HTTP 403 or blocked page:** the server reports the failure. A visible login may help but is not a guaranteed workaround.
+Image downloads accept only HTTPS `ir.ozone.ru` and pin validated public destination addresses. If every system DNS answer belongs to the synthetic `198.18.0.0/15` VPN range, a bounded fallback queries only this constant CDN hostname through [Google Public DNS over HTTPS](https://developers.google.com/speed/public-dns/docs/doh/json). The resolver TLS hostname is pinned to a public bootstrap address; product URLs, queries, account data and cookies are never sent to it, and EDNS client subnet is disabled. DNS questions, CNAME chains and final public addresses are validated before the original CDN TLS connection. Other private or mixed answers remain rejected. Set `OZON_IMAGE_DOH_FALLBACK=off` to disable the fallback; the default is `auto`. No operating-system DNS or VPN settings are changed.
 
-Do not include cookies, account profiles or raw account responses in bug reports. Use synthetic examples or remove personal and session data before sharing a reproducer.
+The broker owns idle cleanup. The driver's independent idle timer is disabled so it cannot terminate Chromium behind the broker while local journal calls keep the broker active. An abnormal broker exit leaves a private captured-CDP marker; the next owner must recover that exact browser or fail closed.
+
+## Validation on 2026-09-13
+
+The optimized local binary completed 30 schema-validated MCP calls across six search categories with two simultaneous clients. Product and review images were returned as MCP image content, hash-checked, decoded, saved, and visually inspected. Search continuation and cached review continuation worked. Killing the explicitly owned test broker and reconnecting the same clients recovered the captured browser, preserved research evidence, and retained exactly one idempotent note event. The retained local report is `artifacts/vnext/live-e/report.md`; the test is reproducible with `scripts/live-smoke.py --crash-restart`. This is a bounded integration run, not a measurement of catalog recall or best-product recommendation quality.
+
+The quota controls retained live SQLite pages (512 MiB). WAL, checkpoint, and compaction bookkeeping may require additional transient filesystem space; a strict instantaneous database-plus-WAL filesystem cap is not promised. Admission, retention, leases, and caller changes are checked transactionally, so a failed quota admission rolls them back together.
+
+Remaining readiness limits: seller-offer listing is unsupported in the observed public source; changing between authenticated accounts in the same city may be unobservable; manually switching two real regions and the planned judged agent-evaluation pool have not been accepted. Existing Codex/Hermes client installations were not replaced by this repository implementation.

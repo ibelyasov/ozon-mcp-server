@@ -1,0 +1,1534 @@
+use crate::config::Config;
+use crate::contracts;
+use crate::evidence::{
+    self, MAX_IMAGE_WIRE_BYTES, MAX_JSON_UTF16, envelope, error_code, safe_message,
+};
+use crate::gateway::Gateway;
+use crate::images;
+use crate::marketplace::item_error;
+use crate::marketplace::{self, Normalized, ReviewRequest};
+use crate::search::SearchArgs;
+use crate::store::{Store, StoredRef};
+use crate::wire::{ImagePayload, ToolReply};
+use anyhow::{Context, Result, anyhow};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use url::Url;
+use uuid::Uuid;
+
+const DEADLINE: Duration = Duration::from_secs(55);
+
+#[derive(Clone)]
+pub struct Service {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    store: StdMutex<Store>,
+    gateway: Mutex<Option<GatewayBackend>>,
+    admission: Arc<Semaphore>,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    shutdown: CancellationToken,
+}
+
+#[cfg(test)]
+enum FakeAction {
+    Value(Value),
+    WaitForCancellation { cleanup: Duration },
+}
+
+#[cfg(test)]
+struct FakeGateway {
+    contexts: std::collections::VecDeque<Value>,
+    searches: std::collections::VecDeque<FakeAction>,
+    products: std::collections::VecDeque<FakeAction>,
+    reviews: std::collections::VecDeque<FakeAction>,
+}
+
+#[cfg(test)]
+impl FakeGateway {
+    async fn context(&mut self, _cancel: &CancellationToken) -> Result<Value> {
+        self.contexts
+            .pop_front()
+            .ok_or_else(|| anyhow!("SOURCE_CHANGED: fake context script exhausted"))
+    }
+
+    async fn search(&mut self, _args: SearchArgs, cancel: &CancellationToken) -> Result<Value> {
+        run_fake_action(self.searches.pop_front(), cancel, "search").await
+    }
+
+    async fn product(&mut self, _product: &str, cancel: &CancellationToken) -> Result<Value> {
+        run_fake_action(self.products.pop_front(), cancel, "product").await
+    }
+
+    async fn reviews(
+        &mut self,
+        _path: &str,
+        _limit: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        run_fake_action(self.reviews.pop_front(), cancel, "reviews").await
+    }
+}
+
+#[cfg(test)]
+async fn run_fake_action(
+    action: Option<FakeAction>,
+    cancel: &CancellationToken,
+    operation: &str,
+) -> Result<Value> {
+    match action {
+        Some(FakeAction::Value(value)) => Ok(value),
+        Some(FakeAction::WaitForCancellation { cleanup }) => {
+            cancel.cancelled().await;
+            tokio::time::sleep(cleanup).await;
+            Err(anyhow!("CANCELLED: fake {operation} cancelled"))
+        }
+        None => Err(anyhow!("SOURCE_CHANGED: fake {operation} script exhausted")),
+    }
+}
+
+enum GatewayBackend {
+    Real(Gateway),
+    #[cfg(test)]
+    Fake(FakeGateway),
+}
+
+impl GatewayBackend {
+    async fn context(&mut self, cancel: &CancellationToken) -> Result<Value> {
+        match self {
+            Self::Real(gateway) => gateway.context(cancel).await,
+            #[cfg(test)]
+            Self::Fake(gateway) => gateway.context(cancel).await,
+        }
+    }
+
+    async fn search(&mut self, args: SearchArgs, cancel: &CancellationToken) -> Result<Value> {
+        match self {
+            Self::Real(gateway) => gateway.search(args, cancel).await,
+            #[cfg(test)]
+            Self::Fake(gateway) => gateway.search(args, cancel).await,
+        }
+    }
+
+    async fn product(&mut self, product: &str, cancel: &CancellationToken) -> Result<Value> {
+        match self {
+            Self::Real(gateway) => gateway.product(product, cancel).await,
+            #[cfg(test)]
+            Self::Fake(gateway) => gateway.product(product, cancel).await,
+        }
+    }
+
+    async fn reviews(
+        &mut self,
+        path: &str,
+        limit: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        match self {
+            Self::Real(gateway) => gateway.reviews(path, limit, cancel).await,
+            #[cfg(test)]
+            Self::Fake(gateway) => gateway.reviews(path, limit, cancel).await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Real(gateway) => gateway.shutdown().await,
+            #[cfg(test)]
+            Self::Fake(_) => Ok(()),
+        }
+    }
+}
+
+impl Service {
+    pub async fn new(config: &Config) -> Result<Self> {
+        let mut store = Store::open(&config.root).context("open research store")?;
+        store.maintain().context("maintain research store")?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                store: StdMutex::new(store),
+                gateway: Mutex::new(None),
+                admission: Arc::new(Semaphore::new(8)),
+                tasks: Mutex::new(vec![]),
+                shutdown: CancellationToken::new(),
+            }),
+        })
+    }
+
+    pub async fn call(&self, name: &str, args: Value, cancel: CancellationToken) -> ToolReply {
+        if !contracts::tool_names().contains(&name) {
+            return contracts::failure("INVALID_ARGUMENT", "Unknown tool.", research_arg(&args));
+        }
+        if let Err(error) = contracts::validate_input(name, &args) {
+            return contracts::failure(
+                "INVALID_ARGUMENT",
+                &safe_message(&error),
+                research_arg(&args),
+            );
+        }
+        if price_range_inverted(&args) {
+            return contracts::failure(
+                "INVALID_ARGUMENT",
+                "priceRange.minMinor must not exceed maxMinor.",
+                research_arg(&args),
+            );
+        }
+        let call_permit = match self.inner.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return contracts::failure(
+                    "SERVER_BUSY",
+                    "Eight requests are already active or waiting.",
+                    research_arg(&args),
+                );
+            }
+        };
+        let (tx, rx) = oneshot::channel();
+        let inner = self.inner.clone();
+        let tool = name.to_owned();
+        let research = research_arg(&args).map(str::to_owned);
+        let request_cancel = cancel.child_token();
+        let deadline = Instant::now() + DEADLINE;
+        let operation_deadline = deadline - Duration::from_secs(11);
+        let mut tasks = self.inner.tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        let handle = tokio::spawn(async move {
+            let _call_permit = call_permit;
+            let work_inner = inner.clone();
+            let work_cancel = request_cancel.child_token();
+            let work_cancel_for_task = work_cancel.clone();
+            let mut work = tokio::spawn(async move {
+                execute(
+                    work_inner,
+                    &tool,
+                    args,
+                    work_cancel_for_task,
+                    operation_deadline,
+                )
+                .await
+            });
+            let reply = tokio::select! {
+                result = &mut work => result.unwrap_or_else(|_| contracts::failure("SOURCE_CHANGED", "The server task failed.", research.as_deref())),
+                _ = request_cancel.cancelled() => {
+                    work_cancel.cancel();
+                    let reply = contracts::failure("CANCELLED", "The request was cancelled.", research.as_deref());
+                    let _ = tx.send(reply);
+                    let _ = work.await;
+                    return;
+                }
+                _ = inner.shutdown.cancelled() => {
+                    work_cancel.cancel();
+                    let reply = contracts::failure("CANCELLED", "The server is shutting down.", research.as_deref());
+                    let _ = tx.send(reply);
+                    let _ = work.await;
+                    return;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    match tokio::time::timeout(Duration::from_secs(5), &mut work).await {
+                        Ok(result) => result.unwrap_or_else(|_| contracts::failure("SOURCE_CHANGED", "The server task failed.", research.as_deref())),
+                        Err(_) => {
+                            work_cancel.cancel();
+                            let reply = contracts::failure("UPSTREAM_TIMEOUT", "The request deadline expired and cleanup is still completing.", research.as_deref());
+                            let _ = tx.send(reply);
+                            let _ = work.await;
+                            return;
+                        }
+                    }
+                }
+            };
+            let _ = tx.send(reply);
+        });
+        tasks.push(handle);
+        drop(tasks);
+        rx.await.unwrap_or_else(|_| {
+            contracts::failure(
+                "CANCELLED",
+                "The request ended before a result was available.",
+                research_arg_fallback(name),
+            )
+        })
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.inner.shutdown.cancel();
+        let gateway_result = {
+            let mut guard = self.inner.gateway.lock().await;
+            match guard.as_mut() {
+                Some(gateway) => gateway.shutdown().await,
+                None => Ok(()),
+            }
+        };
+        let mut tasks = self.inner.tasks.lock().await;
+        for handle in tasks.drain(..) {
+            let _ = handle.await;
+        }
+        gateway_result
+    }
+}
+
+async fn execute(
+    inner: Arc<Inner>,
+    name: &str,
+    args: Value,
+    cancel: CancellationToken,
+    deadline: Instant,
+) -> ToolReply {
+    let result = match name {
+        "ozon_get_context" => get_context(&inner, &cancel, deadline).await,
+        "ozon_search" => search(&inner, &args, &cancel, deadline).await,
+        "ozon_get_products" => products(&inner, &args, &cancel, deadline).await,
+        "ozon_get_reviews" => reviews(&inner, &args, &cancel, deadline).await,
+        "ozon_get_images" => get_images(&inner, &args, &cancel, deadline).await,
+        "ozon_list_research" => journal(&inner, name, &args),
+        "ozon_get_research" => journal(&inner, name, &args),
+        "ozon_append_research_note" => journal(&inner, name, &args),
+        _ => Err(anyhow!("INVALID_ARGUMENT: unknown tool")),
+    };
+    match result {
+        Ok((value, images)) => success(name, value, images, research_arg(&args)),
+        Err(error) => contracts::failure(
+            error_code(&error),
+            &safe_message(&error),
+            research_arg(&args),
+        ),
+    }
+}
+
+async fn get_context(
+    inner: &Inner,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Value, Vec<ImagePayload>)> {
+    let raw = gateway_call(inner, cancel, deadline, |gateway, token| {
+        Box::pin(gateway.context(token))
+    })
+    .await?;
+    let context = bind_context(inner, &raw)?;
+    let n = marketplace::normalize_context(&with_context_id(raw, &context));
+    let observed = n.data["observedAt"].as_str().unwrap_or("").to_owned();
+    Ok((
+        envelope(
+            None,
+            n.data.clone(),
+            &context,
+            n.evidence,
+            n.warnings,
+            &observed,
+        ),
+        vec![],
+    ))
+}
+
+async fn search(
+    inner: &Inner,
+    args: &Value,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Value, Vec<ImagePayload>)> {
+    let context = observe_context(inner, cancel, deadline).await?;
+    let context_id = required_text(&context, "contextId")?;
+    let start = &args["start"];
+    let (research_id, search_args, summary) =
+        if let Some(query) = start.get("query").and_then(Value::as_str) {
+            let rid = match research_arg(args) {
+                Some(id) => {
+                    locked_store(inner)?.ensure_research(id, context_id)?;
+                    id.to_owned()
+                }
+                None => locked_store(inner)?.create_research(query, &context)?,
+            };
+            (
+                rid,
+                make_search_args(start, args, Some(query), None, None),
+                format!("Search: {query}"),
+            )
+        } else if let Some(reference) = start.get("searchRef").and_then(Value::as_str) {
+            let stored = locked_store(inner)?.get_ref(reference, "search_ref")?;
+            verify_bound(&stored, args, context_id)?;
+            (
+                stored.research_id.clone(),
+                make_search_args(
+                    start,
+                    args,
+                    None,
+                    stored.value.get("searchUrl").and_then(Value::as_str),
+                    None,
+                ),
+                "Applied observed search refinement".into(),
+            )
+        } else {
+            let stored =
+                locked_store(inner)?.get_ref(required_text(start, "cursor")?, "search_cursor")?;
+            verify_bound(&stored, args, context_id)?;
+            (
+                stored.research_id.clone(),
+                make_search_args(
+                    start,
+                    args,
+                    None,
+                    None,
+                    stored.value.get("cursor").and_then(Value::as_str),
+                ),
+                "Continued search".into(),
+            )
+        };
+    let raw = match gateway_call(inner, cancel, deadline, move |gateway, token| {
+        Box::pin(gateway.search(search_args, token))
+    })
+    .await
+    {
+        Ok(raw) => raw,
+        Err(error) => {
+            if error_code(&error) == "CANCELLED" {
+                record_cancelled(inner, &research_id)?;
+            }
+            return Err(error);
+        }
+    };
+    if let Err(error) = confirm_context(inner, cancel, deadline, context_id).await {
+        if error_code(&error) == "CANCELLED" {
+            record_cancelled(inner, &research_id)?;
+        }
+        return Err(error);
+    }
+    let include = args
+        .get("includeFacets")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let n = {
+        let mut store = locked_store(inner)?;
+        marketplace::normalize_search(&raw, &mut store, &research_id, context_id, include)?
+    };
+    record(inner, &research_id, "search", &summary, &n)?;
+    if cancel.is_cancelled() {
+        record_cancelled(inner, &research_id)?;
+        return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    let observed = oldest_observation(&n.evidence);
+    let value = envelope(
+        Some(&research_id),
+        n.data,
+        &context,
+        n.evidence,
+        n.warnings,
+        &observed,
+    );
+    Ok((value, vec![]))
+}
+
+async fn products(
+    inner: &Inner,
+    args: &Value,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Value, Vec<ImagePayload>)> {
+    let context = observe_context(inner, cancel, deadline).await?;
+    let context_id = required_text(&context, "contextId")?.to_owned();
+    let selectors = args["products"]
+        .as_array()
+        .ok_or_else(|| anyhow!("INVALID_ARGUMENT: products is required"))?;
+    let mut resolved = Vec::with_capacity(selectors.len());
+    let mut inferred: Option<String> = research_arg(args).map(str::to_owned);
+    for selector in selectors {
+        let resolved_product = resolve_product(inner, selector)?;
+        if resolved_product
+            .context_id
+            .as_ref()
+            .is_some_and(|bound| bound != &context_id)
+        {
+            return Err(anyhow!(
+                "CONTEXT_CHANGED: product reference belongs to another context"
+            ));
+        }
+        if let Some(rid) = &resolved_product.research_id {
+            if inferred.as_ref().is_some_and(|v| v != rid) {
+                return Err(anyhow!("INVALID_REFERENCE: mixed-research product batch"));
+            }
+            inferred = Some(rid.clone());
+        }
+        resolved.push(resolved_product);
+    }
+    let research_id = match inferred {
+        Some(rid) => {
+            locked_store(inner)?.ensure_research(&rid, &context_id)?;
+            rid
+        }
+        None => locked_store(inner)?.create_research("Direct product lookup", &context)?,
+    };
+    let includes = args
+        .get("include")
+        .and_then(Value::as_array)
+        .map(|v| {
+            v.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["characteristics".into(), "offers".into()]);
+    let mut results = vec![];
+    let mut all_evidence = vec![];
+    let mut product_refs = vec![];
+    let mut warnings = vec![];
+    for (selector, resolved) in selectors.iter().zip(resolved) {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let target = resolved.target;
+        let item_include = resolved.include.unwrap_or_else(|| includes.clone());
+        let cached = resolved.cached_raw;
+        let fetched_live = cached.is_none();
+        let raw_result = match cached {
+            Some(raw) => Ok(raw),
+            None => {
+                gateway_call(inner, cancel, deadline, move |gateway, token| {
+                    Box::pin(async move { gateway.product(&target, token).await })
+                })
+                .await
+            }
+        };
+        match raw_result {
+            Ok(raw) => match if fetched_live {
+                confirm_context(inner, cancel, deadline, &context_id).await
+            } else {
+                Ok(())
+            } {
+                Ok(()) => {
+                    let normalization = {
+                        let mut store = locked_store(inner)?;
+                        marketplace::normalize_product(
+                            &raw,
+                            selector,
+                            &mut store,
+                            &research_id,
+                            &context_id,
+                            &item_include,
+                        )
+                    };
+                    match normalization {
+                        Ok(normalized) => {
+                            results.push(normalized.result);
+                            all_evidence.extend(normalized.evidence);
+                            product_refs.extend(normalized.product_refs);
+                            warnings.extend(normalized.warnings)
+                        }
+                        Err(e) => {
+                            results.push(item_error(selector, error_code(&e), &safe_message(&e)))
+                        }
+                    }
+                }
+                Err(e) => results.push(item_error(selector, error_code(&e), &safe_message(&e))),
+            },
+            Err(e) => results.push(item_error(selector, error_code(&e), &safe_message(&e))),
+        }
+        tokio::task::yield_now().await;
+    }
+    let n = Normalized {
+        data: json!({"results":results}),
+        evidence: all_evidence,
+        warnings: dedup_warnings(warnings),
+        product_refs,
+    };
+    record(
+        inner,
+        &research_id,
+        "products",
+        "Fetched product details",
+        &n,
+    )?;
+    if cancel.is_cancelled() {
+        record_cancelled(inner, &research_id)?;
+        return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    let observed = oldest_observation(&n.evidence);
+    Ok((
+        envelope(
+            Some(&research_id),
+            n.data,
+            &context,
+            n.evidence,
+            n.warnings,
+            &observed,
+        ),
+        vec![],
+    ))
+}
+
+async fn reviews(
+    inner: &Inner,
+    args: &Value,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Value, Vec<ImagePayload>)> {
+    let context = observe_context(inner, cancel, deadline).await?;
+    let cid = required_text(&context, "contextId")?;
+    let start = &args["start"];
+    let (rid, pref, sku, path, source, cached_raw) =
+        if let Some(pref) = start.get("productRef").and_then(Value::as_str) {
+            let r = locked_store(inner)?.get_ref(pref, "product")?;
+            verify_bound(&r, args, cid)?;
+            (
+                r.research_id,
+                pref.to_owned(),
+                required_text(&r.value, "sku")?.to_owned(),
+                r.value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                r.value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                None,
+            )
+        } else {
+            let (key, kind) = if start.get("reviewSearchRef").is_some() {
+                ("reviewSearchRef", "review_search")
+            } else {
+                ("cursor", "review_cursor")
+            };
+            let r = locked_store(inner)?.get_ref(required_text(start, key)?, kind)?;
+            verify_bound(&r, args, cid)?;
+            let cached_raw = r.value.get("cachedRaw").cloned();
+            (
+                r.research_id,
+                required_text(&r.value, "productRef")?.to_owned(),
+                required_text(&r.value, "sku")?.to_owned(),
+                r.value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                required_text(&r.value, "sourceUrl")?.to_owned(),
+                cached_raw,
+            )
+        };
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let fetched_live = cached_raw.is_none();
+    let raw_result = match cached_raw {
+        Some(raw) => Ok(raw),
+        None => {
+            let call_path = path.clone();
+            gateway_call(inner, cancel, deadline, move |gateway, token| {
+                Box::pin(async move { gateway.reviews(&call_path, limit, token).await })
+            })
+            .await
+        }
+    };
+    let raw = match raw_result {
+        Ok(raw) => raw,
+        Err(error) => {
+            if error_code(&error) == "CANCELLED" {
+                record_cancelled(inner, &rid)?;
+            }
+            return Err(error);
+        }
+    };
+    if fetched_live && let Err(error) = confirm_context(inner, cancel, deadline, cid).await {
+        if error_code(&error) == "CANCELLED" {
+            record_cancelled(inner, &rid)?;
+        }
+        return Err(error);
+    }
+    let n = {
+        let mut store = locked_store(inner)?;
+        marketplace::normalize_reviews(
+            &raw,
+            &mut store,
+            ReviewRequest {
+                research_id: &rid,
+                context_id: cid,
+                product_ref: &pref,
+                sku: &sku,
+                source_url: &source,
+                limit,
+            },
+        )?
+    };
+    record(inner, &rid, "reviews", "Fetched product reviews", &n)?;
+    if cancel.is_cancelled() {
+        record_cancelled(inner, &rid)?;
+        return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    let observed = oldest_observation(&n.evidence);
+    Ok((
+        envelope(
+            Some(&rid),
+            n.data,
+            &context,
+            n.evidence,
+            n.warnings,
+            &observed,
+        ),
+        vec![],
+    ))
+}
+
+async fn get_images(
+    inner: &Inner,
+    args: &Value,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<(Value, Vec<ImagePayload>)> {
+    let context = observe_context(inner, cancel, deadline).await?;
+    let cid = required_text(&context, "contextId")?;
+    let refs = args["imageRefs"]
+        .as_array()
+        .ok_or_else(|| anyhow!("INVALID_ARGUMENT: imageRefs is required"))?;
+    let mut bindings = vec![];
+    let mut rid = research_arg(args).map(str::to_owned);
+    for image_ref in refs.iter().filter_map(Value::as_str) {
+        match locked_store(inner)?.get_ref(image_ref, "image") {
+            Ok(r) => {
+                if rid.as_ref().is_some_and(|id| id != &r.research_id) {
+                    return Err(anyhow!("INVALID_REFERENCE: mixed-research image batch"));
+                }
+                rid = Some(r.research_id.clone());
+                bindings.push((image_ref.to_owned(), r))
+            }
+            Err(e) => bindings.push((
+                image_ref.to_owned(),
+                StoredRef {
+                    research_id: rid.clone().unwrap_or_default(),
+                    context_id: String::new(),
+                    value: json!({"bindingError":safe_message(&e),"bindingCode":error_code(&e)}),
+                },
+            )),
+        }
+    }
+    let rid = rid.ok_or_else(|| anyhow!("INVALID_REFERENCE: image references are unavailable"))?;
+    locked_store(inner)?.ensure_research(&rid, cid)?;
+    let mut results = vec![];
+    let mut blocks = vec![];
+    let mut evidence_values = vec![];
+    let mut wire_bytes = 0usize;
+    for (image_ref, binding) in bindings {
+        if binding.value.get("bindingError").is_some() {
+            results.push(image_error(
+                &image_ref,
+                binding.value["bindingCode"]
+                    .as_str()
+                    .unwrap_or("INVALID_REFERENCE"),
+                binding.value["bindingError"]
+                    .as_str()
+                    .unwrap_or("Reference unavailable."),
+            ));
+            continue;
+        }
+        if binding.context_id != cid {
+            results.push(image_error(
+                &image_ref,
+                "CONTEXT_CHANGED",
+                "The image belongs to another context.",
+            ));
+            continue;
+        }
+        let url = required_text(&binding.value, "url")?.to_owned();
+        let token = cancel.child_token();
+        let fetch_token = token.clone();
+        let fetch = images::fetch_image(&url, &fetch_token);
+        tokio::pin!(fetch);
+        let fetched = tokio::select! {
+            result = &mut fetch => Ok(result),
+            _ = tokio::time::sleep_until(deadline) => {
+                token.cancel();
+                let _ = fetch.await;
+                Err(())
+            }
+        };
+        match fetched {
+            Ok(Ok(image)) => {
+                let approx = image.data.len();
+                if wire_bytes + approx > MAX_IMAGE_WIRE_BYTES {
+                    results.push(image_error(
+                        &image_ref,
+                        "RESULT_TOO_LARGE",
+                        "The image batch exceeds the 8 MiB wire limit.",
+                    ));
+                    continue;
+                }
+                wire_bytes += approx;
+                let ev_id = format!("evidence_{}", Uuid::new_v4());
+                let observed = &image.retrieved_at;
+                let mut ev = evidence::observed_evidence(
+                    binding.value.get("sourceUrl").and_then(Value::as_str),
+                    cid,
+                    binding.value.get("sku").and_then(Value::as_str),
+                    &[binding
+                        .value
+                        .get("fieldPath")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")],
+                    json!([
+                        {"fieldPath":"/sha256","value":image.sha256},
+                        {"fieldPath":"/mimeType","value":image.mime_type},
+                        {"fieldPath":"/width","value":image.width},
+                        {"fieldPath":"/height","value":image.height},
+                        {"fieldPath":"/retrievedAt","value":image.retrieved_at},
+                        {"fieldPath":"/sourceKind","value":binding.value["sourceKind"]},
+                        {"fieldPath":"/sourceRef","value":binding.value["sourceRef"]}
+                    ]),
+                    observed,
+                );
+                ev["evidenceRef"] = json!(ev_id);
+                evidence_values.push(ev);
+                blocks.push(ImagePayload {
+                    data: image.data,
+                    mime_type: image.mime_type.clone(),
+                });
+                results.push(json!({"imageRef":image_ref,"status":"ok","sourceKind":binding.value["sourceKind"],"sourceRef":binding.value["sourceRef"],"evidenceRefs":[ev_id],"mimeType":image.mime_type,"width":image.width,"height":image.height,"sha256":image.sha256,"retrievedAt":image.retrieved_at,"contentIndex":blocks.len()}))
+            }
+            Ok(Err(e)) => results.push(image_error(&image_ref, error_code(&e), &safe_message(&e))),
+            Err(()) => results.push(image_error(
+                &image_ref,
+                "UPSTREAM_TIMEOUT",
+                "Image retrieval exceeded the request deadline.",
+            )),
+        }
+        tokio::task::yield_now().await;
+    }
+    if let Err(error) = confirm_context(inner, cancel, deadline, cid).await {
+        if error_code(&error) == "CANCELLED" {
+            record_cancelled(inner, &rid)?;
+        }
+        return Err(error);
+    }
+    let n = Normalized {
+        data: json!({"results":results}),
+        evidence: evidence_values,
+        warnings: vec![],
+        product_refs: vec![],
+    };
+    record(inner, &rid, "images", "Fetched referenced images", &n)?;
+    if cancel.is_cancelled() {
+        record_cancelled(inner, &rid)?;
+        return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    let observed = evidence::now();
+    Ok((
+        envelope(
+            Some(&rid),
+            n.data,
+            &context,
+            n.evidence,
+            n.warnings,
+            &observed,
+        ),
+        blocks,
+    ))
+}
+
+fn journal(inner: &Inner, name: &str, args: &Value) -> Result<(Value, Vec<ImagePayload>)> {
+    let mut store = locked_store(inner)?;
+    let (rid, data, context, warnings) = match name {
+        "ozon_list_research" => (
+            None,
+            store.list(args)?,
+            cached_context(&store)?,
+            vec![marketplace::warning(
+                "HISTORICAL_CONTEXT",
+                "Listed research may belong to a different captured context.",
+                &[],
+            )],
+        ),
+        "ozon_get_research" => {
+            let rid = required_text(args, "researchId")?;
+            store.lease(rid)?;
+            (
+                Some(rid.to_owned()),
+                store.read(args)?,
+                cached_context(&store)?,
+                vec![marketplace::warning(
+                    "HISTORICAL_CONTEXT",
+                    "Journal data retains its original captured context.",
+                    &[],
+                )],
+            )
+        }
+        "ozon_append_research_note" => {
+            let rid = required_text(args, "researchId")?;
+            let context = store.research_context(rid)?;
+            let data = store.append_note(args)?;
+            (Some(rid.to_owned()), data, context, vec![])
+        }
+        _ => return Err(anyhow!("INVALID_ARGUMENT: unknown journal method")),
+    };
+    let observed = evidence::now();
+    Ok((
+        envelope(rid.as_deref(), data, &context, vec![], warnings, &observed),
+        vec![],
+    ))
+}
+
+async fn observe_context(
+    inner: &Inner,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<Value> {
+    let raw = gateway_call(inner, cancel, deadline, |gateway, token| {
+        Box::pin(gateway.context(token))
+    })
+    .await?;
+    bind_context(inner, &raw)
+}
+async fn confirm_context(
+    inner: &Inner,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    expected: &str,
+) -> Result<()> {
+    let current = observe_context(inner, cancel, deadline).await?;
+    if required_text(&current, "contextId")? != expected {
+        return Err(anyhow!(
+            "CONTEXT_CHANGED: marketplace context changed during the operation"
+        ));
+    }
+    Ok(())
+}
+fn bind_context(inner: &Inner, raw: &Value) -> Result<Value> {
+    let signature = raw
+        .get("signature")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "regionLabel": raw.get("regionLabel").cloned().unwrap_or(Value::Null),
+                "regionVerification": raw.get("regionVerification").cloned().unwrap_or(Value::Null),
+                "accountState": raw.get("accountState").cloned().unwrap_or(Value::Null)
+            })
+        });
+    let mut store = locked_store(inner)?;
+    let previous = store.meta("current_context")?;
+    let id = previous
+        .as_ref()
+        .filter(|v| v.get("signature") == Some(&signature))
+        .and_then(|v| v.get("contextId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("context_{}", Uuid::new_v4()));
+    let mut context =
+        evidence::public_context(&with_context_id(raw.clone(), &json!({"contextId":id})));
+    context["contextId"] = json!(id);
+    store.set_meta(
+        "current_context",
+        &json!({"signature":signature,"contextId":context["contextId"],"context":context}),
+    )?;
+    Ok(context)
+}
+fn cached_context(store: &Store) -> Result<Value> {
+    Ok(store.meta("current_context")?.and_then(|v|v.get("context").cloned()).unwrap_or_else(||json!({"contextId":"context_unobserved","regionLabel":null,"regionVerification":"unverified","accountState":"unknown","accessState":"unknown"})))
+}
+fn with_context_id(mut raw: Value, context: &Value) -> Value {
+    raw["contextId"] = context
+        .get("contextId")
+        .cloned()
+        .unwrap_or_else(|| json!("context-unknown"));
+    raw
+}
+
+type GatewayFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>;
+async fn gateway_call<F>(
+    inner: &Inner,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    f: F,
+) -> Result<Value>
+where
+    F: for<'a> FnOnce(&'a mut GatewayBackend, &'a CancellationToken) -> GatewayFuture<'a>,
+{
+    let mut gateway_guard = tokio::select! {
+        guard = inner.gateway.lock() => guard,
+        _ = cancel.cancelled() => return Err(anyhow!("CANCELLED: request cancelled")),
+        _ = tokio::time::sleep_until(deadline) => return Err(anyhow!("UPSTREAM_TIMEOUT: browser queue deadline expired")),
+    };
+    if cancel.is_cancelled() {
+        return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    if gateway_guard.is_none() {
+        *gateway_guard = Some(GatewayBackend::Real(Gateway::from_env().await?));
+    }
+    let gateway = gateway_guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("SOURCE_CHANGED: gateway initialization failed"))?;
+    let operation_cancel = cancel.child_token();
+    let operation_token = operation_cancel.clone();
+    let result = {
+        let operation = f(gateway, &operation_token);
+        tokio::pin!(operation);
+        tokio::select! {
+            result = &mut operation => result,
+            _ = cancel.cancelled() => {
+                operation_cancel.cancel();
+                let _ = operation.await;
+                Err(anyhow!("CANCELLED: request cancelled"))
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                operation_cancel.cancel();
+                let _ = operation.await;
+                Err(anyhow!("UPSTREAM_TIMEOUT: operation deadline expired"))
+            }
+        }
+    };
+    drop(gateway_guard);
+    result
+}
+
+fn record(inner: &Inner, rid: &str, kind: &str, summary: &str, n: &Normalized) -> Result<()> {
+    locked_store(inner)?.record(rid, kind, summary, &n.product_refs, &n.evidence)
+}
+fn oldest_observation(evidence_values: &[Value]) -> String {
+    evidence_values
+        .iter()
+        .filter_map(|value| value.get("observedAt").and_then(Value::as_str))
+        .min()
+        .map(str::to_owned)
+        .unwrap_or_else(evidence::now)
+}
+fn record_cancelled(inner: &Inner, rid: &str) -> Result<()> {
+    locked_store(inner)?.record(rid, "cancelled", "Request cancelled", &[], &[])
+}
+fn locked_store(inner: &Inner) -> Result<std::sync::MutexGuard<'_, Store>> {
+    inner
+        .store
+        .lock()
+        .map_err(|_| anyhow!("SOURCE_CHANGED: store lock poisoned"))
+}
+fn success(
+    name: &str,
+    value: Value,
+    images: Vec<ImagePayload>,
+    research: Option<&str>,
+) -> ToolReply {
+    if evidence::utf16_len(&value).map_or(true, |n| n > MAX_JSON_UTF16) {
+        return contracts::failure(
+            "RESULT_TOO_LARGE",
+            "The structured result exceeds 60000 UTF-16 units.",
+            research,
+        );
+    }
+    if let Err(e) = contracts::validate_output(name, &value) {
+        return contracts::failure(
+            "SOURCE_CHANGED",
+            &format!("Generated result failed its contract: {}", safe_message(&e)),
+            research,
+        );
+    }
+    ToolReply {
+        structured: Some(value),
+        error: false,
+        text: None,
+        images,
+    }
+}
+fn make_search_args(
+    start: &Value,
+    args: &Value,
+    query: Option<&str>,
+    url: Option<&str>,
+    cursor: Option<&str>,
+) -> SearchArgs {
+    let price = start.get("priceRange");
+    SearchArgs {
+        query: query.map(str::to_owned),
+        search_url: url.map(str::to_owned),
+        next_cursor: cursor.map(str::to_owned),
+        include_facets: Some(
+            args.get("includeFacets")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        ),
+        sort: None,
+        price_min: price
+            .and_then(|p| p.get("minMinor"))
+            .and_then(Value::as_u64),
+        price_max: price
+            .and_then(|p| p.get("maxMinor"))
+            .and_then(Value::as_u64),
+        limit: args.get("limit").and_then(Value::as_u64).unwrap_or(12) as usize,
+    }
+}
+struct ResolvedProduct {
+    target: String,
+    research_id: Option<String>,
+    include: Option<Vec<String>>,
+    cached_raw: Option<Value>,
+    context_id: Option<String>,
+}
+fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
+    if let Some(reference) = selector.get("productRef").and_then(Value::as_str) {
+        let r = locked_store(inner)?.get_ref(reference, "product")?;
+        return Ok(ResolvedProduct {
+            target: r
+                .value
+                .get("url")
+                .or_else(|| r.value.get("sku"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("INVALID_REFERENCE: malformed product reference"))?
+                .into(),
+            research_id: Some(r.research_id),
+            include: None,
+            cached_raw: None,
+            context_id: Some(r.context_id),
+        });
+    }
+    if let Some(cursor) = selector.get("cursor").and_then(Value::as_str) {
+        let r = locked_store(inner)?.get_ref(cursor, "product_cursor")?;
+        return Ok(ResolvedProduct {
+            target: r
+                .value
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .into(),
+            research_id: Some(r.research_id),
+            include: r.value.get("include").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            }),
+            cached_raw: r.value.get("cachedRaw").cloned(),
+            context_id: Some(r.context_id),
+        });
+    }
+    if let Some(sku) = selector.get("sku").and_then(Value::as_str) {
+        return Ok(ResolvedProduct {
+            target: sku.into(),
+            research_id: None,
+            include: None,
+            cached_raw: None,
+            context_id: None,
+        });
+    }
+    let url = required_text(selector, "url")?;
+    validate_product_url(url)?;
+    Ok(ResolvedProduct {
+        target: url.into(),
+        research_id: None,
+        include: None,
+        cached_raw: None,
+        context_id: None,
+    })
+}
+fn verify_bound(stored: &StoredRef, args: &Value, context_id: &str) -> Result<()> {
+    if stored.context_id != context_id {
+        return Err(anyhow!(
+            "CONTEXT_CHANGED: reference belongs to another context"
+        ));
+    }
+    if let Some(rid) = research_arg(args)
+        && rid != stored.research_id
+    {
+        return Err(anyhow!(
+            "INVALID_REFERENCE: reference belongs to another research"
+        ));
+    }
+    Ok(())
+}
+fn validate_product_url(input: &str) -> Result<()> {
+    let url = Url::parse(input).map_err(|_| anyhow!("INVALID_ARGUMENT: invalid product URL"))?;
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("ozon.ru" | "www.ozon.ru"))
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !url.path().starts_with("/product/")
+    {
+        return Err(anyhow!("INVALID_ARGUMENT: expected an Ozon product URL"));
+    }
+    Ok(())
+}
+fn image_error(reference: &str, code: &str, message: &str) -> Value {
+    let allowed = match code {
+        "INVALID_REFERENCE" | "CONTEXT_CHANGED" | "RESEARCH_EXPIRED" | "SOURCE_BLOCKED"
+        | "SOURCE_CHANGED" | "UPSTREAM_TIMEOUT" | "SERVER_BUSY" | "NOT_FOUND"
+        | "RESULT_TOO_LARGE" => code,
+        _ => "SOURCE_CHANGED",
+    };
+    json!({"imageRef":reference,"status":"error","error":{"code":allowed,"message":message,"retryable":matches!(allowed,"SOURCE_BLOCKED"|"UPSTREAM_TIMEOUT"|"SERVER_BUSY")}})
+}
+fn dedup_warnings(values: Vec<Value>) -> Vec<Value> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter(|v| {
+            seen.insert(
+                v.get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        })
+        .take(30)
+        .collect()
+}
+fn price_range_inverted(args: &Value) -> bool {
+    args.pointer("/start/priceRange").is_some_and(|p| {
+        match (
+            p.get("minMinor").and_then(Value::as_u64),
+            p.get("maxMinor").and_then(Value::as_u64),
+        ) {
+            (Some(a), Some(b)) => a > b,
+            _ => false,
+        }
+    })
+}
+fn required_text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("SOURCE_CHANGED: missing {key}"))
+}
+fn research_arg(args: &Value) -> Option<&str> {
+    args.get("researchId").and_then(Value::as_str)
+}
+fn research_arg_fallback(_name: &str) -> Option<&str> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_context(signature: &str) -> Value {
+        json!({
+            "sourceUrl":"https://www.ozon.ru/", "regionLabel":"Москва",
+            "regionVerification":"verified", "accountState":"anonymous",
+            "accessState":"available", "signature":signature, "capabilities":{}
+        })
+    }
+
+    async fn scripted_service(
+        contexts: Vec<Value>,
+        searches: Vec<FakeAction>,
+        products: Vec<FakeAction>,
+    ) -> (tempfile::TempDir, Service) {
+        let temp = tempfile::Builder::new()
+            .prefix("service-scripted-")
+            .tempdir_in(std::env::current_dir().unwrap().join(".work"))
+            .unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let service = Service::new(&Config::at(temp.path().to_path_buf()).unwrap())
+            .await
+            .unwrap();
+        *service.inner.gateway.lock().await = Some(GatewayBackend::Fake(FakeGateway {
+            contexts: contexts.into(),
+            searches: searches.into(),
+            products: products.into(),
+            reviews: std::collections::VecDeque::new(),
+        }));
+        (temp, service)
+    }
+
+    fn product_fixture(sku: &str) -> Value {
+        json!({"sku":sku,"name":format!("Product {sku}"),"url":format!("https://www.ozon.ru/product/item-{sku}/"),"cardPrice":null,"priceRegular":100.0,"available":true,"rating":null,"reviews":null,"seller":null,"images":[],"characteristics":{},"description":{"text":"","images":[]},"variants":{"status":"available","items":[],"hasNext":false,"nextPath":null},"offers":{"status":"unsupported","items":[],"hasNext":null,"nextPath":null},"warnings":[]})
+    }
+
+    fn failure_code(reply: &ToolReply) -> String {
+        serde_json::from_str::<Value>(reply.text.as_deref().unwrap()).unwrap()["error"]["code"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+    #[test]
+    fn rejects_non_product_routes() {
+        assert!(validate_product_url("https://www.ozon.ru/search/?text=x").is_err());
+        assert!(validate_product_url("https://www.ozon.ru/product/name-123/").is_ok());
+    }
+    #[test]
+    fn range_order_is_semantic() {
+        assert!(price_range_inverted(
+            &json!({"start":{"query":"x","priceRange":{"minMinor":2,"maxMinor":1}}})
+        ));
+    }
+
+    #[tokio::test]
+    async fn journal_tools_work_without_starting_a_browser() {
+        let temp = tempfile::Builder::new()
+            .prefix("service-journal-")
+            .tempdir_in(std::env::current_dir().unwrap().join(".work"))
+            .unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let config = Config::at(temp.path().to_path_buf()).unwrap();
+        let context = json!({"contextId":"ctx","regionLabel":null,"regionVerification":"unverified","accountState":"unknown","accessState":"unknown"});
+        let research_id = {
+            let mut store = Store::open(&config.root).unwrap();
+            store.create_research("Offline research", &context).unwrap()
+        };
+        let service = Service::new(&config).await.unwrap();
+        let token = CancellationToken::new();
+        let held = service
+            .inner
+            .admission
+            .clone()
+            .acquire_many_owned(8)
+            .await
+            .unwrap();
+        let busy = service
+            .call("ozon_list_research", json!({}), token.clone())
+            .await;
+        assert!(busy.error);
+        assert_eq!(
+            serde_json::from_str::<Value>(busy.text.as_deref().unwrap()).unwrap()["error"]["code"],
+            "SERVER_BUSY"
+        );
+        drop(held);
+        let list = service
+            .call("ozon_list_research", json!({}), token.clone())
+            .await;
+        assert!(!list.error);
+        contracts::validate_output("ozon_list_research", list.structured.as_ref().unwrap())
+            .unwrap();
+        let note = service
+            .call(
+                "ozon_append_research_note",
+                json!({"researchId":research_id,"operationId":"offline-op","kind":"requirements","text":"No browser is required."}),
+                token.clone(),
+            )
+            .await;
+        assert!(!note.error);
+        let read = service
+            .call(
+                "ozon_get_research",
+                json!({"researchId":research_id,"section":"notes"}),
+                token,
+            )
+            .await;
+        assert_eq!(
+            read.structured.as_ref().unwrap()["data"]["payload"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scripted_search_persists_recoverable_evidence_through_service() {
+        let context = fake_context("same");
+        let raw = json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"x","price":1.5,"priceType":"unknown","currency":"RUB","url":"https://www.ozon.ru/product/item-1/"}],"hasNext":false});
+        let (_temp, service) = scripted_service(
+            vec![context.clone(), context],
+            vec![FakeAction::Value(raw)],
+            vec![],
+        )
+        .await;
+        let reply = service
+            .call(
+                "ozon_search",
+                json!({"start":{"query":"x"},"includeFacets":false}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+        let value = reply.structured.unwrap();
+        contracts::validate_output("ozon_search", &value).unwrap();
+        let rid = value["researchId"].as_str().unwrap();
+        let stored = locked_store(&service.inner)
+            .unwrap()
+            .read(&json!({"researchId":rid,"section":"evidence"}))
+            .unwrap();
+        assert!(!stored["payload"][0]["facts"].as_array().unwrap().is_empty());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn scripted_context_change_rejects_search_before_recording_success() {
+        let raw =
+            json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[],"hasNext":false});
+        let (_temp, service) = scripted_service(
+            vec![fake_context("before"), fake_context("after")],
+            vec![FakeAction::Value(raw)],
+            vec![],
+        )
+        .await;
+        let reply = service
+            .call(
+                "ozon_search",
+                json!({"start":{"query":"x"}}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(reply.error);
+        assert_eq!(failure_code(&reply), "CONTEXT_CHANGED");
+        let list = locked_store(&service.inner)
+            .unwrap()
+            .list(&json!({}))
+            .unwrap();
+        let rid = list["researches"][0]["researchId"].as_str().unwrap();
+        let events = locked_store(&service.inner)
+            .unwrap()
+            .read(&json!({"researchId":rid,"section":"events"}))
+            .unwrap();
+        assert!(events["payload"].as_array().unwrap().is_empty());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_records_terminal_event_after_gateway_cleanup() {
+        let (_temp, service) = scripted_service(
+            vec![fake_context("same")],
+            vec![FakeAction::WaitForCancellation {
+                cleanup: Duration::from_millis(5),
+            }],
+            vec![],
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn({
+            let service = service.clone();
+            let cancel = cancel.clone();
+            async move {
+                service
+                    .call("ozon_search", json!({"start":{"query":"x"}}), cancel)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+        let reply = task.await.unwrap();
+        assert_eq!(failure_code(&reply), "CANCELLED");
+        service.shutdown().await.unwrap();
+        let list = locked_store(&service.inner)
+            .unwrap()
+            .list(&json!({}))
+            .unwrap();
+        let rid = list["researches"][0]["researchId"].as_str().unwrap();
+        let events = locked_store(&service.inner)
+            .unwrap()
+            .read(&json!({"researchId":rid,"section":"events"}))
+            .unwrap();
+        assert_eq!(events["payload"][0]["kind"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn batch_preserves_completed_item_when_later_cleanup_crosses_deadline() {
+        let context = fake_context("same");
+        let (_temp, service) = scripted_service(
+            vec![context.clone(), context],
+            vec![],
+            vec![
+                FakeAction::Value(product_fixture("1")),
+                FakeAction::WaitForCancellation {
+                    cleanup: Duration::from_millis(20),
+                },
+            ],
+        )
+        .await;
+        let reply = execute(
+            service.inner.clone(),
+            "ozon_get_products",
+            json!({"products":[{"sku":"1"},{"sku":"2"}]}),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_millis(10),
+        )
+        .await;
+        assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+        let value = reply.structured.unwrap();
+        assert_eq!(value["data"]["results"][0]["status"], "ok");
+        assert_eq!(
+            value["data"]["results"][1]["error"]["code"],
+            "UPSTREAM_TIMEOUT"
+        );
+        contracts::validate_output("ozon_get_products", &value).unwrap();
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_handler_drains_cached_source_page_before_upstream_continuation() {
+        let source_context = fake_context("same");
+        let (_temp, service) = scripted_service(
+            vec![
+                source_context.clone(),
+                source_context.clone(),
+                source_context.clone(),
+                source_context.clone(),
+            ],
+            vec![],
+            vec![],
+        )
+        .await;
+        let bound_context = bind_context(&service.inner, &source_context).unwrap();
+        let (rid, product_ref) = {
+            let mut store = locked_store(&service.inner).unwrap();
+            let rid = store.create_research("reviews", &bound_context).unwrap();
+            let product_ref = store
+                .put_ref(
+                    &rid,
+                    "product",
+                    &json!({"sku":"123","url":"https://www.ozon.ru/product/item-123/"}),
+                    None,
+                )
+                .unwrap();
+            (rid, product_ref)
+        };
+        let source_reviews = (0..30)
+            .map(|index| {
+                json!({"reviewId":format!("r{index}"),"score":5.0,"comment":format!("review-{index}"),"pros":null,"cons":null,"date":null,"purchased":null,"variantLabel":null,"photos":[]})
+            })
+            .collect::<Vec<_>>();
+        let raw = json!({"rating":5.0,"totalReviews":30,"reviews":source_reviews,"nextPath":null,"hasNext":false,"refinements":[],"aggregationScope":"specific_sku","warnings":[]});
+        {
+            let mut gateway = service.inner.gateway.lock().await;
+            let Some(GatewayBackend::Fake(gateway)) = gateway.as_mut() else {
+                panic!("scripted gateway missing")
+            };
+            gateway.reviews.push_back(FakeAction::Value(raw));
+        }
+
+        let mut start = json!({"productRef":product_ref});
+        let mut emitted = vec![];
+        let mut observed_at = None;
+        for limit in [3, 5, 30] {
+            let reply = service
+                .call(
+                    "ozon_get_reviews",
+                    json!({"start":start,"researchId":rid,"limit":limit}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+            let value = reply.structured.unwrap();
+            contracts::validate_output("ozon_get_reviews", &value).unwrap();
+            assert_eq!(
+                observed_at.get_or_insert(value["observedAt"].clone()),
+                &value["observedAt"]
+            );
+            emitted.extend(
+                value["data"]["reviews"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|review| review["text"].as_str().unwrap().to_owned()),
+            );
+            match value["data"]["nextCursor"].as_str() {
+                Some(cursor) => start = json!({"cursor":cursor}),
+                None => break,
+            }
+        }
+        assert_eq!(
+            emitted,
+            (0..30)
+                .map(|index| format!("review-{index}"))
+                .collect::<Vec<_>>()
+        );
+        service.shutdown().await.unwrap();
+    }
+}

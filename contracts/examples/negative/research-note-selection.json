@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_get_research.input.schema.json","instance":{"researchId":"research-01","section":"notes","evidenceRefs":["ev-1"]},"expectedInvalidAt":"schema"}

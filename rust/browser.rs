@@ -2,10 +2,12 @@ use crate::browser_error::BrowserError;
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use futures_util::SinkExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::File,
     io::ErrorKind,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -18,13 +20,20 @@ use tokio_util::sync::CancellationToken;
 
 const DRIVER_VERSION: &str = "agent-browser 0.36.0";
 const MAX_CLI_BYTES: usize = 12 * 1024 * 1024;
-const MAX_PROFILE_SLOTS: usize = 1024;
+const OWNERSHIP_MARKER: &str = "browser-owned";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OwnershipMarker {
+    version: u32,
+    pid: u32,
+    cdp: Option<String>,
+}
 pub struct BrowserSession {
     binary: PathBuf,
     profile: PathBuf,
     executable: Option<String>,
     headed: bool,
-    runtime: tempfile::TempDir,
+    runtime: PathBuf,
     _profile_lock: File,
     user_agent: Option<String>,
     state: SessionState,
@@ -50,19 +59,24 @@ impl BrowserSession {
                 .find(|p| p.is_file())
                 .context("agent-browser is missing; install 0.36.0 or set OZON_AGENT_BROWSER_BIN")?
         };
-        let base_profile = std::env::var_os("OZON_USER_DATA_DIR")
+        let profile = std::env::var_os("OZON_USER_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                    .join(".ozon-mcp-rust-profile")
+                    .join(".local/share/ozon-mcp-server/browser-profile")
             });
-        let (profile, lock) = lease_profile(&base_profile)?;
-        // A short private path is necessary for macOS Unix socket length limits.
-        let runtime = tempfile::Builder::new()
-            .prefix("ozon-")
-            .tempdir_in(std::env::temp_dir())?;
-        std::fs::write(runtime.path().join("config.json"), "{}")?;
-        let browser = Self {
+        let (profile, lock) = lease_profile(&profile)?;
+        // Keep the daemon rendezvous stable across broker crashes. A restarted
+        // broker reconnects to the surviving session instead of launching a
+        // second Chromium against the same profile. The one-letter directory
+        // also leaves room for agent-browser's socket on macOS.
+        let runtime = std::env::var_os("OZON_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| profile.parent().unwrap_or(&profile).to_path_buf())
+            .join("r");
+        ensure_private_directory(&runtime).context("Cannot create browser runtime directory")?;
+        write_runtime_config(&runtime)?;
+        let mut browser = Self {
             binary,
             profile,
             runtime,
@@ -74,8 +88,7 @@ impl BrowserSession {
             state: SessionState::Idle,
         };
         let output = browser
-            .command()
-            .arg("--version")
+            .version_command()
             .output()
             .await
             .context("Cannot execute agent-browser")?;
@@ -84,6 +97,17 @@ impl BrowserSession {
                 && String::from_utf8_lossy(&output.stdout).trim() == DRIVER_VERSION,
             "Expected agent-browser 0.36.0; set OZON_AGENT_BROWSER_BIN to the pinned binary"
         );
+        if let Some(marker) = browser.read_marker()? {
+            // A marker can survive only when the previous owner did not confirm
+            // Chromium shutdown. Reuse the same driver rendezvous and recover it
+            // before this process is allowed to launch against the profile.
+            browser.state = SessionState::Poisoned;
+            let cdp = marker.cdp.ok_or(BrowserError::SessionPoisoned)?;
+            browser
+                .confirm_close(Some(&cdp))
+                .await
+                .map_err(|_| BrowserError::SessionPoisoned)?;
+        }
         if std::env::var_os("OZON_HIDE_WINDOW").is_some() {
             eprintln!(
                 "OZON_HIDE_WINDOW is ignored; use OZON_HEADLESS=false for explicit visible mode"
@@ -111,14 +135,14 @@ impl BrowserSession {
                 cmd.env(key, value);
             }
         }
-        cmd.current_dir(self.runtime.path())
-            .env("AGENT_BROWSER_SOCKET_DIR", self.runtime.path())
+        cmd.current_dir(&self.runtime)
+            .env("AGENT_BROWSER_SOCKET_DIR", &self.runtime)
             .env("AGENT_BROWSER_PLUGINS", "[]")
             .env("AGENT_BROWSER_DEFAULT_TIMEOUT", "40000")
             .env("LANG", "ru_RU.UTF-8")
-            .args(["--config", self.runtime.path().join("config.json").to_str().unwrap()])
+            .args(["--config", self.runtime.join("config.json").to_str().unwrap()])
             .args(["--session", "ozon", "--profile", self.profile.to_str().unwrap()])
-            .args(["--headed", if self.headed { "true" } else { "false" }, "--no-webmcp", "--idle-timeout", "10m"])
+            .args(["--headed", if self.headed { "true" } else { "false" }, "--no-webmcp", "--idle-timeout", "0"])
             .args(["--args", "--disable-blink-features=AutomationControlled,--mute-audio,--lang=ru-RU,--no-first-run,--no-default-browser-check,--disable-extensions,--disable-background-networking"])
             .arg("--json");
         if let Some(executable) = &self.executable {
@@ -134,14 +158,32 @@ impl BrowserSession {
         cmd
     }
 
+    fn version_command(&self) -> Command {
+        let mut cmd = Command::new(&self.binary);
+        cmd.env_clear();
+        for key in ["PATH", "HOME", "USER", "TMPDIR", "TEMP", "SystemRoot"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        cmd.current_dir(&self.runtime)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        cmd
+    }
+
     async fn raw(
-        &self,
+        &mut self,
         args: &[&str],
         script: Option<&str>,
         cancel: &CancellationToken,
         deadline: Duration,
     ) -> Result<Value> {
-        ensure!(!cancel.is_cancelled(), "Request cancelled");
+        if cancel.is_cancelled() {
+            return Err(BrowserError::Cancelled.into());
+        }
         let mut cmd = self.command();
         cmd.args(args);
         if script.is_some() {
@@ -214,23 +256,36 @@ impl BrowserSession {
             }
             Ok(value["data"].clone())
         };
-        let result = tokio::select! {
+        let (result, interrupted) = tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err(BrowserError::Cancelled.into()),
-            _ = tokio::time::sleep(deadline) => Err(BrowserError::CommandTimeout.into()),
-            result = work => result,
+            _ = cancel.cancelled() => (Err(BrowserError::Cancelled.into()), true),
+            _ = tokio::time::sleep(deadline) => (Err(BrowserError::CommandTimeout.into()), true),
+            result = work => (result, false),
         };
         if result.is_err() {
             let _ = child.kill().await;
         }
+        if interrupted {
+            let cdp = match &self.state {
+                SessionState::Running { cdp } => Some(cdp.clone()),
+                _ => None,
+            };
+            // A cancelled CLI does not cancel the daemon-side evaluation. Do
+            // not return ownership until the captured browser is confirmed idle.
+            self.confirm_close(cdp.as_deref()).await?;
+        }
         result
     }
 
-    pub(crate) async fn run(&self, args: &[&str], cancel: &CancellationToken) -> Result<Value> {
+    pub(crate) async fn run(&mut self, args: &[&str], cancel: &CancellationToken) -> Result<Value> {
         self.raw(args, None, cancel, Duration::from_secs(45)).await
     }
 
-    pub(crate) async fn evaluate(&self, script: &str, cancel: &CancellationToken) -> Result<Value> {
+    pub(crate) async fn evaluate(
+        &mut self,
+        script: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
         Ok(self
             .raw(
                 &["eval", "--stdin"],
@@ -242,7 +297,7 @@ impl BrowserSession {
             .clone())
     }
 
-    async fn read_cdp(&self, cancel: &CancellationToken) -> Result<String> {
+    async fn read_cdp(&mut self, cancel: &CancellationToken) -> Result<String> {
         let data = self
             .raw(&["get", "cdp-url"], None, cancel, Duration::from_secs(5))
             .await?;
@@ -253,20 +308,7 @@ impl BrowserSession {
             .ok_or(BrowserError::DriverFailure {
                 operation: "CDP endpoint discovery",
             })?;
-        let url = url::Url::parse(endpoint).map_err(|_| BrowserError::DriverFailure {
-            operation: "CDP endpoint validation",
-        })?;
-        if url.scheme() != "ws"
-            || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
-            || !url.path().starts_with("/devtools/browser/")
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(BrowserError::DriverFailure {
-                operation: "CDP endpoint validation",
-            }
-            .into());
-        }
+        validate_cdp_endpoint(endpoint)?;
         Ok(endpoint.to_owned())
     }
 
@@ -277,6 +319,7 @@ impl BrowserSession {
         if matches!(self.state, SessionState::Poisoned) {
             return Err(BrowserError::SessionPoisoned.into());
         }
+        self.mark_owned()?;
         self.state = SessionState::Acquiring;
         // Acquire the private browser handle before honoring cancellation. Killing
         // the CLI halfway through startup can orphan its detached daemon before
@@ -296,25 +339,18 @@ impl BrowserSession {
         let cdp = match acquisition {
             Ok(cdp) => cdp,
             Err(error) => {
-                let closed = self
-                    .raw(
-                        &["close"],
-                        None,
-                        &CancellationToken::new(),
-                        Duration::from_secs(7),
-                    )
-                    .await
-                    .is_ok();
-                self.state = if closed {
-                    SessionState::Idle
-                } else {
-                    SessionState::Poisoned
-                };
+                let _ = self.confirm_close(None).await;
                 return Err(error);
             }
         };
+        self.update_marker(Some(&cdp))?;
         self.state = SessionState::Running { cdp };
         if cancel.is_cancelled() {
+            let cdp = match &self.state {
+                SessionState::Running { cdp } => cdp.clone(),
+                _ => unreachable!(),
+            };
+            self.confirm_close(Some(&cdp)).await?;
             return Err(BrowserError::Cancelled.into());
         }
         Ok(())
@@ -348,67 +384,310 @@ impl BrowserSession {
             SessionState::Idle => return Ok(()),
             SessionState::Running { cdp } => Some(cdp.clone()),
             SessionState::Acquiring => None,
-            SessionState::Poisoned => return Err(BrowserError::SessionPoisoned.into()),
+            SessionState::Poisoned => None,
         };
-        // agent-browser serializes commands, so `close` alone cannot interrupt eval.
-        // This single standard CDP command only closes the private browser captured above.
-        if let Some(endpoint) = cdp {
-            let _ = tokio::time::timeout(Duration::from_secs(3), async {
-                let (mut ws, _) = tokio_tungstenite::connect_async(endpoint).await?;
-                ws.send(tokio_tungstenite::tungstenite::Message::Text(
-                    json!({"id":1,"method":"Browser.close"}).to_string().into(),
-                ))
-                .await?;
-                Ok::<_, anyhow::Error>(())
-            })
-            .await;
-        }
-        let result = self
-            .raw(
-                &["close"],
-                None,
-                &CancellationToken::new(),
-                Duration::from_secs(7),
-            )
-            .await;
-        if result.is_err() {
+        self.confirm_close(cdp.as_deref()).await
+    }
+
+    async fn confirm_close(&mut self, cdp: Option<&str>) -> Result<()> {
+        // Never use an agent-browser command for recovery: its CLI starts the
+        // daemon with launch configuration before dispatching `close`. The
+        // captured browser CDP identity is the only safe process handle.
+        let Some(endpoint) = cdp else {
+            self.state = SessionState::Poisoned;
+            return Err(BrowserError::CleanupFailed.into());
+        };
+        validate_cdp_endpoint(endpoint)?;
+        if !close_and_confirm_cdp_exit(endpoint).await {
             self.state = SessionState::Poisoned;
             return Err(BrowserError::CleanupFailed.into());
         }
+        self.remove_marker()?;
         self.state = SessionState::Idle;
         Ok(())
+    }
+
+    fn marker_path(&self) -> PathBuf {
+        self.runtime.join(OWNERSHIP_MARKER)
+    }
+
+    fn read_marker(&self) -> Result<Option<OwnershipMarker>> {
+        let path = self.marker_path();
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file()
+                        && !metadata.file_type().is_symlink()
+                        && metadata.uid() == unsafe { libc::geteuid() }
+                        && metadata.permissions().mode() & 0o777 == 0o600
+                        && metadata.len() <= 2048,
+                    "BROWSER_CLEANUP_FAILED: invalid persisted browser ownership marker"
+                );
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)?;
+                let opened = file.metadata()?;
+                ensure!(
+                    opened.dev() == metadata.dev()
+                        && opened.ino() == metadata.ino()
+                        && opened.uid() == metadata.uid(),
+                    "BROWSER_CLEANUP_FAILED: browser ownership marker changed"
+                );
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                file.take(2049).read_to_end(&mut bytes)?;
+                ensure!(
+                    bytes.len() <= 2048,
+                    "BROWSER_CLEANUP_FAILED: browser ownership marker is too large"
+                );
+                let marker: OwnershipMarker = serde_json::from_slice(&bytes)
+                    .context("BROWSER_CLEANUP_FAILED: invalid browser ownership marker")?;
+                ensure!(
+                    marker.version == 1,
+                    "BROWSER_CLEANUP_FAILED: unsupported browser ownership marker"
+                );
+                if let Some(endpoint) = &marker.cdp {
+                    validate_cdp_endpoint(endpoint)?;
+                }
+                Ok(Some(marker))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn mark_owned(&self) -> Result<()> {
+        let path = self.marker_path();
+        if self.read_marker()?.is_some() {
+            return Ok(());
+        }
+        let marker = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .context("BROWSER_CLEANUP_FAILED: cannot persist browser ownership")?;
+        write_marker(&marker, None)?;
+        ensure!(
+            self.read_marker()?.is_some(),
+            "BROWSER_CLEANUP_FAILED: browser ownership marker vanished"
+        );
+        Ok(())
+    }
+
+    fn update_marker(&self, cdp: Option<&str>) -> Result<()> {
+        let path = self.marker_path();
+        let marker = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .context("BROWSER_CLEANUP_FAILED: cannot update browser ownership")?;
+        let metadata = marker.metadata()?;
+        let path_metadata = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.dev() == path_metadata.dev()
+                && metadata.ino() == path_metadata.ino()
+                && metadata.permissions().mode() & 0o777 == 0o600,
+            "BROWSER_CLEANUP_FAILED: browser ownership marker changed"
+        );
+        write_marker(&marker, cdp)
+    }
+
+    fn remove_marker(&self) -> Result<()> {
+        if self.read_marker()?.is_some() {
+            std::fs::remove_file(self.marker_path())
+                .context("BROWSER_CLEANUP_FAILED: cannot release browser ownership")?;
+        }
+        Ok(())
+    }
+}
+
+fn write_marker(mut file: &File, cdp: Option<&str>) -> Result<()> {
+    use std::io::{Seek, Write};
+    if let Some(endpoint) = cdp {
+        validate_cdp_endpoint(endpoint)?;
+    }
+    let marker = OwnershipMarker {
+        version: 1,
+        pid: std::process::id(),
+        cdp: cdp.map(str::to_owned),
+    };
+    let bytes = serde_json::to_vec(&marker)?;
+    ensure!(
+        bytes.len() <= 2048,
+        "BROWSER_CLEANUP_FAILED: browser ownership marker is too large"
+    );
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.set_len(0)?;
+    file.write_all(&bytes)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn validate_cdp_endpoint(endpoint: &str) -> Result<()> {
+    let url = url::Url::parse(endpoint).map_err(|_| BrowserError::DriverFailure {
+        operation: "CDP endpoint validation",
+    })?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
+    ensure!(
+        url.scheme() == "ws"
+            && loopback
+            && url.port().is_some()
+            && url.path().starts_with("/devtools/browser/")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        BrowserError::DriverFailure {
+            operation: "CDP endpoint validation"
+        }
+    );
+    Ok(())
+}
+
+async fn close_and_confirm_cdp_exit(endpoint: &str) -> bool {
+    let connection = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio_tungstenite::connect_async(endpoint),
+    )
+    .await;
+    let Ok(Ok((mut websocket, _))) = connection else {
+        return false;
+    };
+    if websocket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"id":1,"method":"Browser.close"}).to_string().into(),
+        ))
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+    loop {
+        let reachable = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio_tungstenite::connect_async(endpoint)
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if !reachable {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 fn lease_profile(base: &Path) -> Result<(PathBuf, File)> {
     ensure_private_directory(base).context("Cannot create Ozon profile directory")?;
+    let before =
+        std::fs::symlink_metadata(base).context("Cannot inspect Ozon profile directory")?;
     let base = std::fs::canonicalize(base).context("Cannot resolve Ozon profile directory")?;
+    let after =
+        std::fs::symlink_metadata(&base).context("Cannot recheck Ozon profile directory")?;
+    ensure!(
+        before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && after.uid() == unsafe { libc::geteuid() }
+            && after.permissions().mode() & 0o777 == 0o700,
+        "SOURCE_CHANGED: Ozon profile directory changed during acquisition"
+    );
     if let Some(lock) = try_lock_profile(&base)
         .with_context(|| format!("Cannot lock Ozon profile directory {}", base.display()))?
     {
         return Ok((base, lock));
     }
+    bail!("SERVER_BUSY: configured Ozon profile is already owned by another process")
+}
 
-    let pool = base.join(".ozon-mcp-profiles");
-    ensure_private_pool_directory(&pool).context("Cannot create Ozon profile pool")?;
-    for slot in 1..=MAX_PROFILE_SLOTS {
-        let profile = pool.join(slot.to_string());
-        ensure_private_pool_directory(&profile)
-            .with_context(|| format!("Cannot create Ozon profile slot {slot}"))?;
-        let profile = std::fs::canonicalize(&profile)
-            .with_context(|| format!("Cannot resolve Ozon profile slot {slot}"))?;
-        if let Some(lock) = try_lock_profile(&profile)
-            .with_context(|| format!("Cannot lock Ozon profile slot {slot}"))?
-        {
-            return Ok((profile, lock));
-        }
+fn write_runtime_config(runtime: &Path) -> Result<()> {
+    use std::io::Write;
+    let path = runtime.join("config.json");
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!("INVALID_ARGUMENT: browser runtime config must not be a symbolic link");
     }
-    bail!("All {MAX_PROFILE_SLOTS} Ozon profile slots are already in use")
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let metadata = file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.dev() == path_metadata.dev()
+            && metadata.ino() == path_metadata.ino()
+            && metadata.permissions().mode() & 0o777 == 0o600,
+        "INVALID_ARGUMENT: browser runtime config must be owner-only (0600)"
+    );
+    file.set_len(0)?;
+    file.write_all(b"{}")?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "profile path must be a real directory",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "profile directory must be owner-only (0700)",
+                ));
+            }
+        }
+        return Ok(());
+    }
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidInput, "profile path has no parent")
+    })?;
+    let parent_metadata = std::fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "profile parent must be a real directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if parent_metadata.uid() != unsafe { libc::geteuid() }
+            || parent_metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "profile parent must be owned by this OS user and not group/world writable",
+            ));
+        }
+    }
     let mut directories = std::fs::DirBuilder::new();
-    directories.recursive(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -418,49 +697,34 @@ fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn ensure_private_pool_directory(path: &Path) -> std::io::Result<()> {
-    let existed = match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                "profile pool path must not be a symbolic link",
-            ));
-        }
-        Ok(_) => true,
-        Err(error) if error.kind() == ErrorKind::NotFound => false,
-        Err(error) => return Err(error),
-    };
-    ensure_private_directory(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() {
+fn try_lock_profile(profile: &Path) -> std::io::Result<Option<File>> {
+    let path = profile.join(".ozon-mcp.lock");
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
-            "profile pool path must not be a symbolic link",
+            "profile lock must not be a symbolic link",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if existed && metadata.permissions().mode() & 0o077 != 0 {
-            return Err(std::io::Error::new(
-                ErrorKind::PermissionDenied,
-                "existing profile pool directory must have private permissions",
-            ));
-        }
-        if !existed {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-    Ok(())
-}
-
-fn try_lock_profile(profile: &Path) -> std::io::Result<Option<File>> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(profile.join(".ozon-mcp.lock"))?;
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let metadata = lock.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(&path)?;
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.dev() != path_metadata.dev()
+        || metadata.ino() != path_metadata.ino()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "profile lock must be owner-only (0600)",
+        ));
+    }
     match lock.try_lock_exclusive() {
         Ok(()) => Ok(Some(lock)),
         Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
@@ -495,11 +759,9 @@ mod tests {
             .write(true)
             .open(profile.join(".ozon-mcp.lock"))
             .unwrap();
-        let runtime = tempfile::Builder::new()
-            .prefix("runtime-")
-            .tempdir_in(root.path())
-            .unwrap();
-        std::fs::write(runtime.path().join("config.json"), "{}").unwrap();
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("config.json"), "{}").unwrap();
         let mut session = BrowserSession {
             binary: root.path().join("missing-agent-browser"),
             profile,
@@ -511,12 +773,14 @@ mod tests {
             state: SessionState::Acquiring,
         };
 
+        session.mark_owned().unwrap();
         let cleanup = session.shutdown().await.unwrap_err();
         assert!(matches!(
             cleanup.downcast_ref::<BrowserError>(),
             Some(BrowserError::CleanupFailed)
         ));
         assert!(matches!(session.state, SessionState::Poisoned));
+        assert!(session.marker_path().is_file());
 
         let ensure = session
             .ensure_running(&CancellationToken::new())
@@ -529,53 +793,93 @@ mod tests {
         let shutdown = session.shutdown().await.unwrap_err();
         assert!(matches!(
             shutdown.downcast_ref::<BrowserError>(),
-            Some(BrowserError::SessionPoisoned)
+            Some(BrowserError::CleanupFailed)
         ));
+        assert!(session.marker_path().is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_shutdown_removes_persisted_ownership_marker() {
+        let _guard = PROFILE_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let profile_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.join(".ozon-mcp.lock"))
+            .unwrap();
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("config.json"), "{}").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "ws://{}/devtools/browser/test-identity",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let message = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(message.to_text().unwrap().contains("Browser.close"));
+        });
+        let mut session = BrowserSession {
+            binary: root.path().join("unused-agent-browser"),
+            profile,
+            executable: None,
+            headed: false,
+            runtime,
+            _profile_lock: profile_lock,
+            user_agent: Some("test".to_owned()),
+            state: SessionState::Running {
+                cdp: endpoint.clone(),
+            },
+        };
+
+        session.mark_owned().unwrap();
+        session.update_marker(Some(&endpoint)).unwrap();
+        assert!(session.marker_path().is_file());
+        session.shutdown().await.unwrap();
+        server.await.unwrap();
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
     }
 
     #[test]
-    fn profile_leases_use_distinct_slots_and_reuse_released_slot() {
+    fn cdp_identity_requires_literal_loopback_browser_endpoint() {
+        assert!(validate_cdp_endpoint("ws://127.0.0.1:9222/devtools/browser/id").is_ok());
+        assert!(validate_cdp_endpoint("ws://[::1]:9222/devtools/browser/id").is_ok());
+        assert!(validate_cdp_endpoint("ws://localhost:9222/devtools/browser/id").is_err());
+        assert!(validate_cdp_endpoint("ws://192.0.2.1:9222/devtools/browser/id").is_err());
+        assert!(validate_cdp_endpoint("ws://127.0.0.1:9222/devtools/page/id").is_err());
+    }
+
+    #[test]
+    fn configured_profile_is_exclusive_and_reusable_after_release() {
         let _guard = profile_test_guard();
         let root = tempfile::tempdir().unwrap();
         let base = root.path().join("profile");
         let (base_profile, base_lock) = lease_profile(&base).unwrap();
-        let (first_slot, first_lock) = lease_profile(&base).unwrap();
-        let (second_slot, second_lock) = lease_profile(&base).unwrap();
-
         assert_eq!(base_profile, std::fs::canonicalize(&base).unwrap());
-        assert_eq!(first_slot, base_profile.join(".ozon-mcp-profiles/1"));
-        assert_eq!(second_slot, base_profile.join(".ozon-mcp-profiles/2"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(base_profile.join(".ozon-mcp-profiles"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o700
-            );
-            assert_eq!(
-                std::fs::metadata(&first_slot).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-        }
+        let error = lease_profile(&base).unwrap_err();
+        assert!(error.to_string().starts_with("SERVER_BUSY:"));
+        assert!(!base_profile.join(".ozon-mcp-profiles").exists());
 
         drop(base_lock);
         let (reused_base, _reused_base_lock) = lease_profile(&base).unwrap();
         assert_eq!(reused_base, base_profile);
-
-        drop(first_lock);
-        let (reused_slot, _reused_lock) = lease_profile(&base).unwrap();
-        assert_eq!(reused_slot, first_slot);
-        assert!(first_slot.join(".ozon-mcp.lock").is_file());
-        drop(second_lock);
     }
 
     #[cfg(unix)]
     #[test]
-    fn profile_lease_preserves_existing_base_permissions() {
+    fn profile_lease_rejects_non_private_existing_directory() {
         let _guard = profile_test_guard();
         use std::os::unix::fs::PermissionsExt;
 
@@ -584,10 +888,15 @@ mod tests {
         std::fs::create_dir(&base).unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let (_profile, _lock) = lease_profile(&base).unwrap();
+        let error = lease_profile(&base).unwrap_err();
         assert_eq!(
             std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
             0o755
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Cannot create Ozon profile directory")
         );
     }
 
@@ -606,28 +915,6 @@ mod tests {
                 .contains("Cannot lock Ozon profile directory")
         );
         assert!(!base.join(".ozon-mcp-profiles").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn profile_lease_rejects_symlinked_pool() {
-        let _guard = profile_test_guard();
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path().join("profile");
-        let outside = root.path().join("outside");
-        ensure_private_directory(&outside).unwrap();
-        let (_base_profile, _base_lock) = lease_profile(&base).unwrap();
-        symlink(&outside, base.join(".ozon-mcp-profiles")).unwrap();
-
-        let error = lease_profile(&base).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Cannot create Ozon profile pool")
-        );
-        assert!(!outside.join(".ozon-mcp.lock").exists());
     }
 
     #[tokio::test]
@@ -665,55 +952,16 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires pinned agent-browser, Chrome, and an explicit disposable OZON_USER_DATA_DIR"]
-    async fn concurrent_profiles_keep_browsers_independent() {
+    async fn second_browser_rejects_configured_profile_contention() {
         assert!(
             std::env::var_os("OZON_USER_DATA_DIR").is_some(),
             "Use a disposable test profile"
         );
-        let mut first = BrowserSession::from_env().await.unwrap();
-        let mut second = BrowserSession::from_env().await.unwrap();
-        let first_cancel = CancellationToken::new();
-        let second_cancel = CancellationToken::new();
-        let result = async {
-            ensure!(first.profile != second.profile, "Profiles must be distinct");
-            let (first_launch, second_launch) =
-                tokio::join!(first.launch(&first_cancel), second.launch(&second_cancel));
-            first_launch?;
-            second_launch?;
-
-            ensure!(
-                first
-                    .evaluate("globalThis.__ozonMcpProfileMarker = 'first'", &first_cancel)
-                    .await?
-                    == json!("first"),
-                "First browser marker was not retained"
-            );
-            ensure!(
-                second
-                    .evaluate(
-                        "globalThis.__ozonMcpProfileMarker = 'second'",
-                        &second_cancel,
-                    )
-                    .await?
-                    == json!("second"),
-                "Second browser marker was not retained"
-            );
-
-            first.shutdown().await?;
-            ensure!(
-                second
-                    .evaluate("globalThis.__ozonMcpProfileMarker", &second_cancel)
-                    .await?
-                    == json!("second"),
-                "Second browser stopped with the first browser"
-            );
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        let first_shutdown = first.shutdown().await;
-        let second_shutdown = second.shutdown().await;
-        result.unwrap();
-        first_shutdown.unwrap();
-        second_shutdown.unwrap();
+        let _first = BrowserSession::from_env().await.unwrap();
+        let error = match BrowserSession::from_env().await {
+            Ok(_) => panic!("second browser unexpectedly acquired the configured profile"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().starts_with("SERVER_BUSY:"));
     }
 }

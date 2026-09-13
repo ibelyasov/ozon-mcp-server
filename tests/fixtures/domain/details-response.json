@@ -3,6 +3,7 @@
   "name": "Example",
   "url": "https://www.ozon.ru/product/example-901/",
   "price": 10.5,
+  "cardPrice": 10.5,
   "priceRegular": null,
   "oldPrice": null,
   "duty": null,
@@ -10,7 +11,10 @@
   "rating": 4.5,
   "reviews": 0,
   "seller": null,
+  "deliveryLabel": null,
   "images": [],
   "characteristics": {},
-  "description": { "text": "Useful text", "images": ["/one.jpg"] }
+  "description": { "text": "Useful text", "images": ["https://www.ozon.ru/one.jpg"] },
+  "variants": { "status": "unknown", "items": [], "hasNext": null, "nextPath": null },
+  "offers": { "status": "unsupported", "items": [], "hasNext": null, "nextPath": null }
 }

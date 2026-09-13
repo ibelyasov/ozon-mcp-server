@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_get_products.output.schema.json","baseExample":"examples/positive/ozon_get_products.json","target":"output","mutation":{"path":"data.results.0.product.prices.0.amountMinor","value":627.5},"expectedInvalidAt":"schema"}

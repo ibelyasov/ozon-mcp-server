@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_get_context success output",
+  "type": "object",
+  "required": ["schemaVersion", "researchId", "data", "context", "observedAt", "evidence", "warnings"],
+  "properties": {
+    "schemaVersion": {"const": "1"},
+    "researchId": {"type": "null"},
+    "data": {
+      "type": "object",
+      "required": ["contextId", "observedAt", "region", "accountState", "accessState", "capabilities"],
+      "properties": {
+        "contextId": {"$ref": "#/$defs/opaque"},
+        "observedAt": {"$ref": "#/$defs/timestamp"},
+        "region": {
+          "type": "object",
+          "required": ["label", "verification", "evidenceRefs"],
+          "properties": {
+            "label": {"type": ["string", "null"], "maxLength": 500},
+            "verification": {"enum": ["verified", "unverified"]},
+            "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}
+          },
+          "additionalProperties": false
+        },
+        "accountState": {"enum": ["authenticated", "anonymous", "unknown"]},
+        "accessState": {"enum": ["available", "blocked", "unknown"]},
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "status", "reason"],
+            "properties": {
+              "name": {"enum": ["search", "search_refinements", "search_pagination", "card_prices", "products", "characteristics", "description", "variants", "offers", "review_text", "review_refinements", "review_pagination", "review_images", "product_images", "image_content", "region_verification", "account_observation"]},
+              "status": {"enum": ["available", "unsupported", "unverified"]},
+              "reason": {"type": ["string", "null"], "maxLength": 1000}
+            },
+            "additionalProperties": false
+          },
+          "minItems": 17,
+          "maxItems": 17
+        }
+      },
+      "additionalProperties": false
+    },
+    "context": {"$ref": "#/$defs/context"},
+    "observedAt": {"$ref": "#/$defs/timestamp"},
+    "evidence": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/evidence"}},
+    "warnings": {"type": "array", "maxItems": 30, "items": {"$ref": "#/$defs/warning"}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "evidenceRefs": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}},
+    "context": {"type": "object", "required": ["contextId", "regionLabel", "regionVerification", "accountState", "accessState"], "properties": {"contextId": {"$ref": "#/$defs/opaque"}, "regionLabel": {"type": ["string", "null"], "maxLength": 500}, "regionVerification": {"enum": ["verified", "unverified"]}, "accountState": {"enum": ["authenticated", "anonymous", "unknown"]}, "accessState": {"enum": ["available", "blocked", "unknown"]}}, "additionalProperties": false},
+    "evidence": {"type": "object", "required": ["evidenceRef", "sourceKind", "sourceUrl", "observedAt", "contextId", "sku", "fieldPaths"], "properties": {"evidenceRef": {"$ref": "#/$defs/opaque"}, "sourceKind": {"enum": ["ozon_page", "local_journal"]}, "sourceUrl": {"oneOf": [{"type": "string", "format": "uri", "maxLength": 2048}, {"type": "null"}]}, "observedAt": {"$ref": "#/$defs/timestamp"}, "contextId": {"$ref": "#/$defs/opaque"}, "sku": {"oneOf": [{"type": "string", "pattern": "^[0-9]+$", "maxLength": 64}, {"type": "null"}]}, "fieldPaths": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^(?:|/(?:[^~/]|~[01])*)*$", "maxLength": 500}}}, "additionalProperties": false, "allOf": [{"if": {"properties": {"sourceKind": {"const": "local_journal"}}}, "then": {"properties": {"sourceUrl": {"type": "null"}}}}, {"if": {"properties": {"sourceKind": {"const": "ozon_page"}}}, "then": {"properties": {"sourceUrl": {"type": "string", "format": "uri", "pattern": "^https://(?:www\\.)?ozon\\.ru/[^?#]*$"}}}}]},
+    "warning": {"type": "object", "required": ["code", "message", "evidenceRefs"], "properties": {"code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]*$", "maxLength": 128}, "message": {"type": "string", "minLength": 1, "maxLength": 2000}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false}
+  }
+}

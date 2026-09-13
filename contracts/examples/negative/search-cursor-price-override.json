@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_search.input.schema.json","instance":{"start":{"cursor":"cursor-2","priceRange":{"maxMinor":10000}}},"expectedInvalidAt":"schema"}

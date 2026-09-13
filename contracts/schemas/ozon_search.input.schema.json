@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_search input",
+  "type": "object",
+  "required": ["start"],
+  "properties": {
+    "start": {
+      "oneOf": [
+        {"$ref": "#/$defs/queryStart"},
+        {"$ref": "#/$defs/referenceStart"},
+        {"$ref": "#/$defs/cursorStart"}
+      ]
+    },
+    "researchId": {"$ref": "#/$defs/opaque"},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 36, "default": 12},
+    "includeFacets": {"type": "boolean", "default": true}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "priceRange": {
+      "type": "object",
+      "properties": {
+        "minMinor": {"type": "integer", "minimum": 0},
+        "maxMinor": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false,
+      "minProperties": 1
+    },
+    "queryStart": {
+      "type": "object",
+      "required": ["query"],
+      "properties": {
+        "query": {"type": "string", "minLength": 1, "maxLength": 500},
+        "priceRange": {"$ref": "#/$defs/priceRange"}
+      },
+      "additionalProperties": false
+    },
+    "referenceStart": {
+      "type": "object",
+      "required": ["searchRef"],
+      "properties": {
+        "searchRef": {"$ref": "#/$defs/opaque"},
+        "priceRange": {"$ref": "#/$defs/priceRange"}
+      },
+      "additionalProperties": false
+    },
+    "cursorStart": {
+      "type": "object",
+      "required": ["cursor"],
+      "properties": {"cursor": {"$ref": "#/$defs/opaque"}},
+      "additionalProperties": false
+    }
+  }
+}

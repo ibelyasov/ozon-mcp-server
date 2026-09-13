@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_get_products.input.schema.json","instance":{"products":[{"sku":"123","productRef":"product-123"}]},"expectedInvalidAt":"schema"}

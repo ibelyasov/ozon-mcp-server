@@ -1,0 +1,13 @@
+{
+  "inputSchema": "schemas/ozon_get_reviews.input.schema.json",
+  "outputSchema": "schemas/ozon_get_reviews.output.schema.json",
+  "input": {"start": {"productRef": "product-123"}, "researchId": "research-01", "limit": 10},
+  "output": {
+    "schemaVersion": "1", "researchId": "research-01",
+    "data": {"subjectSku": "123", "aggregationScope": "unknown", "aggregate": {"rating": null, "count": null}, "reviews": [{"reviewRef": "review-1", "rating": 5, "publishedAt": null, "text": "Хороший звук", "variantLabel": null, "purchaseVerified": null, "imageRefs": [], "evidenceRefs": ["ev-review"]}], "refinements": [], "refinementsIncluded": false, "refinementsTruncated": false, "coverage": {"returned": 1, "uniqueSeen": 1, "total": null, "snapshotGuaranteed": false, "completeness": "unknown"}, "nextCursor": null, "hasNext": null},
+    "context": {"contextId": "ctx-01", "regionLabel": null, "regionVerification": "unverified", "accountState": "unknown", "accessState": "available"},
+    "observedAt": "2026-09-13T09:03:00Z",
+    "evidence": [{"evidenceRef": "ev-review", "sourceKind": "ozon_page", "sourceUrl": "https://www.ozon.ru/product/123/reviews/", "observedAt": "2026-09-13T09:03:00Z", "contextId": "ctx-01", "sku": "123", "fieldPaths": ["/reviews/0/text"]}],
+    "warnings": [{"code": "AGGREGATE_UNAVAILABLE", "message": "Review aggregate was not observed on this page.", "evidenceRefs": []}]
+  }
+}

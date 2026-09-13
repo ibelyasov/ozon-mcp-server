@@ -13,7 +13,6 @@ const HOME: &str = "https://www.ozon.ru/";
 
 pub struct OzonPages {
     session: BrowserSession,
-    city: String,
     ready: bool,
     last_used: Instant,
 }
@@ -22,13 +21,78 @@ impl OzonPages {
     pub async fn from_env() -> Result<Self> {
         Ok(Self {
             session: BrowserSession::from_env().await?,
-            city: std::env::var("OZON_CITY")
-                .unwrap_or_default()
-                .trim()
-                .to_owned(),
             ready: false,
             last_used: Instant::now(),
         })
+    }
+
+    /// Observe only the narrow, privacy-filtered header context projection.
+    /// This method never opens dialogs, signs in, or changes a saved region.
+    pub async fn context_json(&mut self, cancel: &CancellationToken) -> Result<Value> {
+        let first = self.context_once(cancel).await;
+        let result = if first.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<BrowserError>()
+                .is_some_and(BrowserError::should_retry)
+        }) && !cancel.is_cancelled()
+        {
+            self.shutdown().await?;
+            self.context_once(cancel).await
+        } else {
+            first
+        };
+        if result
+            .as_ref()
+            .is_err_and(crate::browser_error::requires_reset)
+        {
+            self.shutdown().await?;
+        }
+        result
+    }
+
+    async fn context_once(&mut self, cancel: &CancellationToken) -> Result<Value> {
+        self.ensure_ready(cancel).await?;
+        // Composer fragment pages (notably secondary product layouts) can omit
+        // the global header. Retry transient rendering first, then observe the
+        // same read-only indicators on the public home page.
+        for phase in 0..2 {
+            for attempt in 0..3 {
+                match self
+                    .evaluate_outcome(json!({"mode":"context"}), cancel)
+                    .await?
+                {
+                    PageOutcome::Page(success) => {
+                        let transient =
+                            success
+                                .page
+                                .context_observation
+                                .as_ref()
+                                .is_none_or(|context| {
+                                    context.signature.is_none()
+                                        || context.access_state == "unknown"
+                                        || context.account_state == "unknown"
+                                });
+                        if transient {
+                            if attempt < 2 {
+                                self.session.run(&["wait", "500"], cancel).await?;
+                                continue;
+                            }
+                            if phase == 0 {
+                                self.session.run(&["open", HOME], cancel).await?;
+                                self.session.run(&["wait", "2000"], cancel).await?;
+                                break;
+                            }
+                        }
+                        return Ok(success.page.into_value());
+                    }
+                    PageOutcome::Error(failure) if failure.error == PageError::ResponseTooLarge => {
+                        return Err(BrowserError::ResponseTooLarge.into());
+                    }
+                    _ => return Err(BrowserError::CaptchaOrBlocked.into()),
+                }
+            }
+        }
+        unreachable!("bounded context observation loop always returns")
     }
 
     pub async fn fetch_json(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
@@ -140,41 +204,8 @@ impl OzonPages {
             .await?;
         self.session.run(&["open", HOME], cancel).await?;
         self.session.run(&["wait", "12000"], cancel).await?;
-        if !self.city.is_empty() {
-            self.try_set_city(cancel).await?;
-        }
         self.ready = true;
         self.last_used = Instant::now();
-        Ok(())
-    }
-
-    async fn try_set_city(&self, cancel: &CancellationToken) -> Result<()> {
-        let action = async {
-            self.session.run(&["find", "first", "[data-widget*=locationSelector i], [data-widget*=region i], button[aria-label*=ород]", "click"], cancel).await?;
-            self.session
-                .run(
-                    &[
-                        "find",
-                        "first",
-                        "[role=dialog] input[type=text], [role=dialog] input[placeholder*=ород i]",
-                        "fill",
-                        &self.city,
-                    ],
-                    cancel,
-                )
-                .await?;
-            self.session.run(&["wait", "1500"], cancel).await?;
-            self.session.run(&["find", "first", "[role=dialog] [role=option], [role=dialog] li, [role=dialog] [data-suggest]", "click"], cancel).await?;
-            self.session.run(&["wait", "2500"], cancel).await?;
-            Ok::<_, anyhow::Error>(())
-        };
-        match tokio::time::timeout(Duration::from_secs(10), action).await {
-            Ok(Ok(())) => {
-                eprintln!("OZON_CITY selection completed; verify the saved region if prices matter")
-            }
-            _ if cancel.is_cancelled() => return Err(BrowserError::Cancelled.into()),
-            _ => return Err(BrowserError::RegionSelectionFailed.into()),
-        }
         Ok(())
     }
 
@@ -187,10 +218,6 @@ impl OzonPages {
 impl PageSource for OzonPages {
     async fn fetch_json(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
         OzonPages::fetch_json(self, path, cancel).await
-    }
-
-    async fn shutdown(&mut self) -> Result<()> {
-        OzonPages::shutdown(self).await
     }
 }
 

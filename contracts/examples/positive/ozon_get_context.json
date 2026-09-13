@@ -1,0 +1,32 @@
+{
+  "inputSchema": "schemas/ozon_get_context.input.schema.json",
+  "outputSchema": "schemas/ozon_get_context.output.schema.json",
+  "input": {},
+  "output": {
+    "schemaVersion": "1",
+    "researchId": null,
+    "data": {"contextId": "ctx-01", "observedAt": "2026-09-13T09:00:00Z", "region": {"label": null, "verification": "unverified", "evidenceRefs": ["ev-context"]}, "accountState": "unknown", "accessState": "available", "capabilities": [
+      {"name": "search", "status": "available", "reason": null},
+      {"name": "search_refinements", "status": "unverified", "reason": "No complete refinement extraction was observed."},
+      {"name": "search_pagination", "status": "available", "reason": null},
+      {"name": "card_prices", "status": "available", "reason": null},
+      {"name": "products", "status": "available", "reason": null},
+      {"name": "characteristics", "status": "available", "reason": null},
+      {"name": "description", "status": "available", "reason": null},
+      {"name": "variants", "status": "unsupported", "reason": "No variant mapping was observed."},
+      {"name": "offers", "status": "unsupported", "reason": "No offer list was observed."},
+      {"name": "review_text", "status": "available", "reason": null},
+      {"name": "review_refinements", "status": "unsupported", "reason": "No review refinements were observed."},
+      {"name": "review_pagination", "status": "unverified", "reason": "Pagination was not exercised."},
+      {"name": "review_images", "status": "unverified", "reason": "Review image bytes were not retrieved."},
+      {"name": "product_images", "status": "available", "reason": null},
+      {"name": "image_content", "status": "unverified", "reason": "Image content retrieval was not exercised."},
+      {"name": "region_verification", "status": "unsupported", "reason": "Region label was not verified."},
+      {"name": "account_observation", "status": "unverified", "reason": "Account state was not observed."}
+    ]},
+    "context": {"contextId": "ctx-01", "regionLabel": null, "regionVerification": "unverified", "accountState": "unknown", "accessState": "available"},
+    "observedAt": "2026-09-13T09:00:00Z",
+    "evidence": [{"evidenceRef": "ev-context", "sourceKind": "ozon_page", "sourceUrl": "https://www.ozon.ru/", "observedAt": "2026-09-13T09:00:00Z", "contextId": "ctx-01", "sku": null, "fieldPaths": ["/region/label", "/accessState"]}],
+    "warnings": [{"code": "REGION_UNVERIFIED", "message": "The current region could not be verified.", "evidenceRefs": ["ev-context"]}]
+  }
+}

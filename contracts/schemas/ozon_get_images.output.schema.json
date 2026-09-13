@@ -1,0 +1,370 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_get_images success output",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "researchId",
+    "data",
+    "context",
+    "observedAt",
+    "evidence",
+    "warnings"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "1"
+    },
+    "researchId": {
+      "$ref": "#/$defs/opaque"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "results"
+      ],
+      "properties": {
+        "results": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/result"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "$ref": "#/$defs/context"
+    },
+    "observedAt": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "#/$defs/evidence"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "#/$defs/warning"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "opaque": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/opaque"
+      }
+    },
+    "imageOk": {
+      "type": "object",
+      "required": [
+        "imageRef",
+        "status",
+        "sourceKind",
+        "sourceRef",
+        "evidenceRefs",
+        "mimeType",
+        "width",
+        "height",
+        "sha256",
+        "retrievedAt",
+        "contentIndex"
+      ],
+      "properties": {
+        "imageRef": {
+          "$ref": "#/$defs/opaque"
+        },
+        "status": {
+          "const": "ok"
+        },
+        "sourceKind": {
+          "enum": [
+            "product",
+            "review"
+          ]
+        },
+        "sourceRef": {
+          "$ref": "#/$defs/opaque"
+        },
+        "evidenceRefs": {
+          "$ref": "#/$defs/evidenceRefs"
+        },
+        "mimeType": {
+          "enum": [
+            "image/jpeg",
+            "image/png",
+            "image/webp"
+          ]
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "retrievedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "contentIndex": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "imageErrorValue": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "INVALID_REFERENCE",
+            "CONTEXT_CHANGED",
+            "RESEARCH_EXPIRED",
+            "SOURCE_BLOCKED",
+            "SOURCE_CHANGED",
+            "UPSTREAM_TIMEOUT",
+            "NOT_FOUND",
+            "RESULT_TOO_LARGE",
+            "SERVER_BUSY"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "imageError": {
+      "type": "object",
+      "required": [
+        "imageRef",
+        "status",
+        "error"
+      ],
+      "properties": {
+        "imageRef": {
+          "$ref": "#/$defs/opaque"
+        },
+        "status": {
+          "const": "error"
+        },
+        "error": {
+          "$ref": "#/$defs/imageErrorValue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/imageOk"
+        },
+        {
+          "$ref": "#/$defs/imageError"
+        }
+      ]
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "contextId",
+        "regionLabel",
+        "regionVerification",
+        "accountState",
+        "accessState"
+      ],
+      "properties": {
+        "contextId": {
+          "$ref": "#/$defs/opaque"
+        },
+        "regionLabel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        },
+        "regionVerification": {
+          "enum": [
+            "verified",
+            "unverified"
+          ]
+        },
+        "accountState": {
+          "enum": [
+            "authenticated",
+            "anonymous",
+            "unknown"
+          ]
+        },
+        "accessState": {
+          "enum": [
+            "available",
+            "blocked",
+            "unknown"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "evidenceRef",
+        "sourceKind",
+        "sourceUrl",
+        "observedAt",
+        "contextId",
+        "sku",
+        "fieldPaths"
+      ],
+      "properties": {
+        "evidenceRef": {
+          "$ref": "#/$defs/opaque"
+        },
+        "sourceKind": {
+          "enum": [
+            "ozon_page",
+            "local_journal"
+          ]
+        },
+        "sourceUrl": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri",
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "observedAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "contextId": {
+          "$ref": "#/$defs/opaque"
+        },
+        "sku": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9]+$",
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "fieldPaths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(?:|/(?:[^~/]|~[01])*)*$",
+            "maxLength": 500
+          }
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "sourceKind": {
+                "const": "local_journal"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "sourceUrl": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "sourceKind": {
+                "const": "ozon_page"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "sourceUrl": {
+                "type": "string",
+                "format": "uri",
+                "pattern": "^https://(?:www\\.)?ozon\\.ru/[^?#]*$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "warning": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "evidenceRefs"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "maxLength": 128
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "evidenceRefs": {
+          "$ref": "#/$defs/evidenceRefs"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

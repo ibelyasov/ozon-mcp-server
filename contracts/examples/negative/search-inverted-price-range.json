@@ -1,0 +1,1 @@
+{"schema":"schemas/ozon_search.input.schema.json","instance":{"start":{"query":"phone","priceRange":{"minMinor":20000,"maxMinor":10000}}},"expectedInvalidAt":"semantic"}

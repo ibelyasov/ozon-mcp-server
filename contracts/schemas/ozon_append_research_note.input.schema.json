@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_append_research_note input",
+  "type": "object",
+  "required": ["researchId", "operationId", "kind", "text"],
+  "properties": {
+    "researchId": {"$ref": "#/$defs/opaque"},
+    "operationId": {"type": "string", "minLength": 1, "maxLength": 128},
+    "kind": {"enum": ["requirements", "assessment", "conclusion"]},
+    "text": {"type": "string", "minLength": 1, "maxLength": 12000},
+    "evidenceRefs": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}},
+    "productRefs": {"type": "array", "maxItems": 30, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}
+  },
+  "additionalProperties": false,
+  "$defs": {"opaque": {"type": "string", "minLength": 1, "maxLength": 2048}}
+}

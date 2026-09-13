@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PageOutcome {
-    Page(PageSuccess),
+    Page(Box<PageSuccess>),
     Error(PageFailure),
     Status(PageStatus),
 }
@@ -43,6 +43,22 @@ pub struct FilteredPage {
         skip_serializing_if = "Option::is_none"
     )]
     pub layout_tracking_info: Option<LayoutTrackingInfo>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_observation: Option<ContextObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ContextObservation {
+    pub region_label: Option<String>,
+    pub region_verified: bool,
+    pub account_state: String,
+    pub access_state: String,
+    pub signature: Option<String>,
 }
 
 fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
