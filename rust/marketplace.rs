@@ -122,6 +122,7 @@ pub fn normalize_search(
     store: &mut Store,
     research_id: &str,
     context_id: &str,
+    region_verified: bool,
     include_facets: bool,
 ) -> Result<Normalized> {
     let observed = now();
@@ -217,11 +218,7 @@ pub fn normalize_search(
         "unknown"
     };
     let mut warnings = source_warnings(raw);
-    if raw
-        .pointer("/context/regionVerified")
-        .and_then(Value::as_bool)
-        != Some(true)
-    {
+    if !region_verified {
         warnings.push(warning(
             "REGION_UNVERIFIED",
             "Price and delivery context may depend on region.",
@@ -1261,7 +1258,7 @@ mod tests {
     #[test]
     fn search_creates_durable_refs() {
         let (_d, mut s, r, c) = test_store();
-        let n=normalize_search(&json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"x","price":1.5,"priceType":"unknown","currency":"RUB","url":"https://www.ozon.ru/product/1/"}],"hasNext":false}),&mut s,&r,"c",false).unwrap();
+        let n=normalize_search(&json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"x","price":1.5,"priceType":"unknown","currency":"RUB","url":"https://www.ozon.ru/product/1/"}],"hasNext":false}),&mut s,&r,"c",false,false).unwrap();
         let p = n.data["items"][0]["productRef"].as_str().unwrap();
         assert_eq!(s.get_ref(p, "product").unwrap().research_id, r);
         s.record(&r, "search", "q", &n.product_refs, &n.evidence)
@@ -1298,7 +1295,8 @@ mod tests {
             "warnings": ["PRICE_OUTSIDE_REQUESTED_RANGE"]
         });
 
-        let normalized = normalize_search(&raw, &mut store, &research_id, "c", false).unwrap();
+        let normalized =
+            normalize_search(&raw, &mut store, &research_id, "c", false, false).unwrap();
 
         assert_eq!(
             normalized.data["items"]

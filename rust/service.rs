@@ -428,7 +428,14 @@ async fn search(
         .unwrap_or(true);
     let n = {
         let mut store = locked_store(inner)?;
-        marketplace::normalize_search(&raw, &mut store, &research_id, context_id, include)?
+        marketplace::normalize_search(
+            &raw,
+            &mut store,
+            &research_id,
+            context_id,
+            context.get("regionVerification").and_then(Value::as_str) == Some("verified"),
+            include,
+        )?
     };
     record(inner, &research_id, "search", &summary, &n)?;
     if cancel.is_cancelled() {
@@ -1632,6 +1639,58 @@ mod tests {
             .unwrap();
         assert!(!stored["payload"][0]["facts"].as_array().unwrap().is_empty());
         service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_region_warning_matches_authoritative_response_context() {
+        let cases = [
+            (
+                json!({"sourceUrl":"https://www.ozon.ru/","regionLabel":"Москва","regionVerification":"verified","accountState":"anonymous","accessState":"available","signature":"verified","capabilities":{}}),
+                json!({"regionVerified":false}),
+                false,
+            ),
+            (
+                json!({"sourceUrl":"https://www.ozon.ru/","regionLabel":"Москва","regionVerification":"unverified","accountState":"anonymous","accessState":"available","signature":"unverified","capabilities":{}}),
+                json!({"regionVerified":true}),
+                true,
+            ),
+            (
+                json!({"sourceUrl":"https://www.ozon.ru/","regionLabel":"Москва","accountState":"anonymous","accessState":"available","signature":"label-only","capabilities":{}}),
+                json!({"regionVerified":true}),
+                true,
+            ),
+        ];
+
+        for (context, raw_context, expect_warning) in cases {
+            let raw = json!({
+                "searchUrl":"https://www.ozon.ru/search/?text=x",
+                "items":[],
+                "hasNext":false,
+                "context":raw_context
+            });
+            let (_temp, service) = scripted_service(
+                vec![context.clone(), context],
+                vec![FakeAction::Value(raw)],
+                vec![],
+            )
+            .await;
+            let reply = service
+                .call(
+                    "ozon_search",
+                    json!({"start":{"query":"x"},"includeFacets":false}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+            let value = reply.structured.unwrap();
+            let has_warning = value["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning["code"] == "REGION_UNVERIFIED");
+            assert_eq!(has_warning, expect_warning, "context={}", value["context"]);
+            service.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
