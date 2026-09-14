@@ -5,9 +5,10 @@
   "output": {
     "schemaVersion": "1", "researchId": "research-01",
     "data": {
-      "items": [{"productRef": "product-123", "sku": "123", "title": "Наушники", "url": "https://www.ozon.ru/product/123/", "availability": "unknown", "prices": [{"amountMinor": 62700, "currency": "RUB", "type": "ozon_card", "condition": "с Ozon Картой", "evidenceRefs": ["ev-search"]}, {"amountMinor": 64000, "currency": "RUB", "type": "regular", "condition": null, "evidenceRefs": ["ev-search"]}], "seller": null, "deliveryLabel": null, "rating": 4.9, "reviewCount": 27, "imageRefs": ["image-123-1"], "evidenceRefs": ["ev-search"]}],
+      "items": [{"productRef": "product-123", "sku": "123", "title": "Наушники", "url": "https://www.ozon.ru/product/123/", "availability": "unknown", "prices": [{"amountMinor": 62700, "currency": "RUB", "type": "ozon_card", "condition": "с Ozon Картой", "evidenceRefs": ["ev-search"]}, {"amountMinor": 64000, "currency": "RUB", "type": "regular", "condition": null, "evidenceRefs": ["ev-search"]}], "matchesDisplayedPriceRange": true, "seller": null, "deliveryLabel": null, "rating": 4.9, "reviewCount": 27, "imageRefs": ["image-123-1"], "evidenceRefs": ["ev-search"]}],
       "refinements": [{"kind": "sort", "label": "Высокий рейтинг", "groupLabel": "Сортировка", "selected": false, "searchRef": "searchref-sort-rating"}], "refinementsIncluded": true, "refinementsTruncated": false,
       "nextCursor": "cursor-search-2", "hasNext": true,
+      "priceRangeAssessment": {"basis": "displayed_search_price", "sourceFilterGuaranteesMatch": false},
       "coverage": {"returned": 1, "uniqueSeen": 1, "total": null, "snapshotGuaranteed": false, "completeness": "partial"}
     },
     "context": {"contextId": "ctx-01", "regionLabel": null, "regionVerification": "unverified", "accountState": "unknown", "accessState": "available"},

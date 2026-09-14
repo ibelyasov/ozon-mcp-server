@@ -10,6 +10,15 @@
         }
       }
     },
+    {
+      "kind": "page",
+      "outcome": {
+        "page": {
+          "widgetStates": {},
+          "navigationProbe": { "routeValid": true, "status": 200 }
+        }
+      }
+    },
     { "kind": "status", "outcome": { "status": 403 } },
     { "kind": "error", "outcome": { "error": "CAPTCHA_OR_BLOCKED" } },
     { "kind": "error", "outcome": { "error": "FETCH_FAILED" } },
@@ -29,6 +38,7 @@
     { "page": { "widgetStates": {}, "private": true } },
     { "page": { "widgetStates": {}, "seo": null } },
     { "page": { "widgetStates": {}, "layoutTrackingInfo": null } },
+    { "page": { "widgetStates": {}, "navigationProbe": { "routeValid": true, "status": 200, "url": "private" } } },
     { "page": { "widgetStates": {} }, "status": 200 },
     { "error": "FETCH_FAILED", "status": 503 }
   ]

@@ -49,6 +49,18 @@ pub struct FilteredPage {
         skip_serializing_if = "Option::is_none"
     )]
     pub context_observation: Option<ContextObservation>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub region_probe: Option<RegionProbe>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub navigation_probe: Option<NavigationProbe>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -56,9 +68,25 @@ pub struct FilteredPage {
 pub struct ContextObservation {
     pub region_label: Option<String>,
     pub region_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region_source_url: Option<String>,
     pub account_state: String,
     pub access_state: String,
     pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RegionProbe {
+    pub address_book_modal_available: bool,
+    pub selected_region_label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NavigationProbe {
+    pub route_valid: bool,
+    pub status: Option<u64>,
 }
 
 fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>

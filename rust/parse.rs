@@ -697,6 +697,16 @@ fn walk_description(value: &Value, texts: &mut Vec<String>, images: &mut Vec<Str
     {
         texts.push(content);
     }
+    for key in ["title", "text"] {
+        if let Some(content) = record
+            .get(key)
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("content"))
+            .and_then(Value::as_array)
+        {
+            texts.extend(content.iter().filter_map(text));
+        }
+    }
     let image = image_url(record.get("img").and_then(|value| value.get("src")))
         .or_else(|| image_url(record.get("image").and_then(|value| value.get("src"))))
         .or_else(|| {
@@ -906,7 +916,7 @@ fn unix_to_date(value: Option<&Value>) -> Option<String> {
         return None;
     }
     DateTime::<Utc>::from_timestamp_millis((seconds * 1000.0) as i64)
-        .map(|date| date.format("%Y-%m-%d").to_string())
+        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 fn author_name(author: Option<&Value>) -> Option<String> {
@@ -934,7 +944,12 @@ pub fn parse_reviews(page: &Value, limit: usize) -> ReviewPage {
             .and_then(Value::as_array)
             .or_else(|| v.get("items").and_then(Value::as_array))
     });
-    let (rating, total) = parse_product_score(page);
+    let (mut rating, total) = parse_product_score(page);
+    if rating.is_none() {
+        rating = state
+            .as_ref()
+            .and_then(|value| rating_from_value(value.get("productScore")));
+    }
     let reviews: Vec<Review> = raw
         .into_iter()
         .flatten()

@@ -36,7 +36,7 @@ function validPageOutcome(value) {
   }
   if (!exactKeys(value, ["page"]) || value.page === null ||
       typeof value.page !== "object" || Array.isArray(value.page)) return false;
-  const allowed = new Set(["widgetStates", "seo", "layoutTrackingInfo", "contextObservation"]);
+  const allowed = new Set(["widgetStates", "seo", "layoutTrackingInfo", "contextObservation", "regionProbe", "navigationProbe"]);
   if (Object.keys(value.page).some((key) => !allowed.has(key)) ||
       value.page.widgetStates === null ||
       typeof value.page.widgetStates !== "object" ||
@@ -57,6 +57,18 @@ function validPageOutcome(value) {
        !["available", "unknown"].includes(value.page.contextObservation.accessState) ||
        !(value.page.contextObservation.signature === null ||
          /^[a-f0-9]{64}$/.test(value.page.contextObservation.signature)))) return false;
+  if ("regionProbe" in value.page &&
+      (!exactKeys(value.page.regionProbe,
+        ["addressBookModalAvailable", "selectedRegionLabel"]) ||
+       typeof value.page.regionProbe.addressBookModalAvailable !== "boolean" ||
+       !(value.page.regionProbe.selectedRegionLabel === null ||
+         typeof value.page.regionProbe.selectedRegionLabel === "string"))) return false;
+  if ("navigationProbe" in value.page &&
+      (!exactKeys(value.page.navigationProbe, ["routeValid", "status"]) ||
+       typeof value.page.navigationProbe.routeValid !== "boolean" ||
+       !(value.page.navigationProbe.status === null ||
+         (Number.isSafeInteger(value.page.navigationProbe.status) &&
+          value.page.navigationProbe.status >= 0)))) return false;
   return !("layoutTrackingInfo" in value.page) ||
     exactKeys(value.page.layoutTrackingInfo, ["sku"]);
 }
@@ -153,6 +165,157 @@ test("context observes the signed-in header without reading profile state", asyn
   assert.doesNotMatch(JSON.stringify(value), /PRIVATE|accountId/);
 });
 
+test("authenticated delivery timing and address are not exported as a region", async () => {
+  class MockElement {}
+  const profile = new MockElement();
+  profile.id = "state-profileMenu-1";
+  const address = {
+    getAttribute: () => JSON.stringify({ customCell: { cells: [
+      { button: { text: "Сегодня" } },
+      { text: { text: "PRIVATE STREET ADDRESS" } },
+    ] } }),
+  };
+  const value = await evaluate(
+    { mode: "context" },
+    {
+      HTMLElement: MockElement,
+      Element: MockElement,
+      getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+      crypto: webcrypto,
+      document: {
+        querySelector(selector) {
+          if (selector.startsWith('[id^="state-addressBookBarWeb-"')) return address;
+          if (selector.startsWith('[id^="state-profileMenu-"')) return profile;
+          return null;
+        },
+        querySelectorAll: () => [profile],
+      },
+    },
+  );
+
+  assert.equal(value.page.contextObservation.accountState, "authenticated");
+  assert.equal(value.page.contextObservation.regionLabel, null);
+  assert.equal(value.page.contextObservation.regionVerified, false);
+  assert.doesNotMatch(JSON.stringify(value), /Сегодня|PRIVATE STREET ADDRESS/);
+});
+
+test("authenticated header exposes only an exact address-book navigation capability", async () => {
+  class MockElement {}
+  const profile = new MockElement();
+  profile.id = "state-profileMenu-1";
+  const context = async (link) => evaluate(
+    { mode: "context" },
+    {
+      HTMLElement: MockElement,
+      Element: MockElement,
+      getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+      crypto: webcrypto,
+      URL,
+      document: {
+        querySelector(selector) {
+          if (selector.startsWith('[id^="state-addressBookBarWeb-"')) return {
+            getAttribute: () => JSON.stringify({customCell: {
+              action: { link }, cells: [{ button: { text: "Сегодня" } }],
+            }}),
+          };
+          if (selector.startsWith('[id^="state-profileMenu-"')) return profile;
+          return null;
+        },
+        querySelectorAll: () => [profile],
+      },
+    },
+  );
+
+  for (const link of ["/modal/addressbook", "/modal/addressbook?set_sm=1"]) {
+    assert.deepEqual(jsonValue((await context(link)).page.regionProbe), {
+      addressBookModalAvailable: true,
+      selectedRegionLabel: null,
+    }, link);
+  }
+  for (const link of [
+    "/modal/addressbook/", "/modal/addressbook?x=1", "/modal/addressbook?set_sm=2",
+    "/modal/addressbook?set_sm=1&set_sm=1", "/modal/addressbook?set_sm=1&x=1",
+    "/modal/addressbook?%73et_sm=%31", "/modal/addressbook?set_sm=1&&",
+    "/modal/addressbook#x",
+    "https://evil.example/modal/addressbook", "https://user@www.ozon.ru/modal/addressbook",
+  ]) {
+    assert.equal((await context(link)).page.regionProbe, undefined, link);
+  }
+});
+
+test("modal extracts only one selected bounded city prefix without exporting the address", async () => {
+  const modal = async (addresses) => evaluate(
+    { mode: "contextModal" },
+    { document: { querySelector: () => ({
+      getAttribute: () => JSON.stringify({ addresses }),
+    }) } },
+  );
+  const selected = { isSelected: true, elements: [{ text: "Москва, PRIVATE STREET ADDRESS" }] };
+  const value = await modal([selected]);
+  assert.deepEqual(jsonValue(value.page.regionProbe), {
+    addressBookModalAvailable: false,
+    selectedRegionLabel: "Москва",
+  });
+  assert.doesNotMatch(JSON.stringify(value), /PRIVATE STREET ADDRESS/);
+
+  for (const addresses of [
+    [selected, selected],
+    [{ isSelected: false, elements: [{ text: "Москва, PRIVATE" }] }],
+    [{ isSelected: true, elements: [{ text: "Москва PRIVATE" }] }],
+    [{ isSelected: true, elements: [{ text: "Сегодня, PRIVATE" }] }],
+    [{ isSelected: true, elements: [{ text: "Пункт выдачи, PRIVATE" }] }],
+    [{ isSelected: true, elements: [{ text: "---, PRIVATE" }] }],
+    [{ isSelected: true, elements: [{ text: `${"А".repeat(101)}, PRIVATE` }] }],
+  ]) {
+    assert.equal((await modal(addresses)).page.regionProbe.selectedRegionLabel, null);
+  }
+});
+
+test("navigation validation returns only status and a bounded exact-route verdict", async () => {
+  const navigation = async (target, href, status = 200) => evaluate(
+    { mode: "navigation", target },
+    {
+      location: { origin: "https://www.ozon.ru", href },
+      performance: { getEntriesByType: () => [{ responseStatus: status }] },
+    },
+  );
+  for (const [target, href] of [
+    ["home", "https://www.ozon.ru/"],
+    ["home", "https://www.ozon.ru/?__rr=7"],
+    ["addressBook", "https://www.ozon.ru/modal/addressbook?__rr=1234567890123456"],
+  ]) {
+    const result = jsonValue(await navigation(target, href));
+    assert.deepEqual(result, { page: {
+      widgetStates: {},
+      navigationProbe: { routeValid: true, status: 200 },
+    } });
+    assert.equal(JSON.stringify(result).includes("__rr"), false);
+    assert.equal(JSON.stringify(result).includes(href), false);
+  }
+  for (const href of [
+    "https://www.ozon.ru/modal/addressbook?__rr=",
+    "https://www.ozon.ru/modal/addressbook?__rr=12345678901234567",
+    "https://www.ozon.ru/modal/addressbook?__rr=a",
+    "https://www.ozon.ru/modal/addressbook?set_sm=1",
+    "https://www.ozon.ru/modal/addressbook?%5f_rr=1",
+    "https://www.ozon.ru/modal/addressbook?__rr=1&__rr=2",
+    "https://www.ozon.ru/modal/addressbook?__rr=1&x=1",
+    "https://www.ozon.ru/modal/addressbook/?__rr=1",
+    "https://www.ozon.ru/search/?__rr=1",
+    "https://www.ozon.ru/modal/addressbook?__rr=1#x",
+    "https://evil.example/modal/addressbook?__rr=1",
+    "https://user@www.ozon.ru/modal/addressbook?__rr=1",
+    "https://www.ozon.ru:444/modal/addressbook?__rr=1",
+  ]) {
+    const probe = (await navigation("addressBook", href)).page.navigationProbe;
+    assert.equal(probe.routeValid, false, href);
+    assert.equal(JSON.stringify(probe).includes(href), false, href);
+  }
+  assert.deepEqual(jsonValue((await navigation(
+    "addressBook", "https://www.ozon.ru/modal/addressbook", Number.NaN,
+  )).page.navigationProbe), { routeValid: true, status: null });
+});
+
 function response(body, { status = 200, contentLength } = {}) {
   const chunks = Array.isArray(body) ? body : [encoder.encode(body)];
   let index = 0;
@@ -190,6 +353,7 @@ async function evaluate(options, overrides = {}) {
     AbortController,
     TextDecoder,
     TextEncoder,
+    URL,
     encodeURIComponent,
     setTimeout,
     clearTimeout,
@@ -262,6 +426,7 @@ test("source widgets project variants and reviews without account or tracking da
     }], cellTrackingInfo: { secret: "PRIVATE" } },
     "webListReviews-1": {
       itemId: "901", requestedPath: "/product/901/reviews/", productsCount: 999,
+      productScore: 4.8,
       paging: { page: 1, total: 2, links: [{ text: "2", urlParams: "page=2", secret: "PRIVATE" }] },
       sortings: [{ active: true, name: "Useful", value: "usefulness_desc", action: "PRIVATE" }],
       user: { guid: "PRIVATE" }, actions: { vote: "PRIVATE" },
@@ -284,9 +449,11 @@ test("source widgets project variants and reviews without account or tracking da
     data: { value: "Blue" },
   });
   const reviews = value.page.widgetStates["webListReviews-1"];
+  assert.equal(reviews.productScore, 4.8);
   assert.equal(reviews.productsCount, 2);
   assert.deepEqual(Object.keys(reviews.products), ["901"]);
   assert.deepEqual(reviews.reviews[0].author, { firstName: "Ada" });
+  assert.equal(reviews.reviews[0].publishedAt, 1);
   assert.deepEqual(reviews.reviews[0].content.photos, [{ url: "https://ir.ozone.ru/a.jpg" }]);
 });
 

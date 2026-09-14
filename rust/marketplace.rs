@@ -2,7 +2,14 @@ use crate::evidence::{canonical_source_url, now, observed_evidence};
 use crate::store::Store;
 use anyhow::{Result, anyhow};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use uuid::Uuid;
+
+pub const MAX_SEEN_REVIEWS: usize = 30_000;
+pub const REVIEW_SEEN_CHECKPOINT_INTERVAL: usize = 256;
+pub const MAX_REVIEW_SEEN_CHECKPOINT_BYTES: usize = 2_500_000;
+pub const MAX_REVIEW_NO_PROGRESS_PAGES: usize = 3;
 
 pub struct Normalized {
     pub data: Value,
@@ -25,6 +32,12 @@ pub struct ReviewRequest<'a> {
     pub sku: &'a str,
     pub source_url: &'a str,
     pub limit: usize,
+    pub prior_seen_review_keys: &'a [String],
+    pub prior_seen_ref: Option<&'a str>,
+    pub prior_seen_depth: usize,
+    pub current_path: &'a str,
+    pub prior_no_progress_pages: usize,
+    pub prior_page_made_progress: bool,
 }
 
 struct ProductImageRequest<'a> {
@@ -40,16 +53,37 @@ pub fn normalize_context(raw: &Value) -> Normalized {
     let observed = now();
     let context_id = text(raw, "contextId").unwrap_or("context-unknown");
     let source_url = text(raw, "sourceUrl").unwrap_or("https://www.ozon.ru/");
+    let region_source =
+        text(raw, "regionSourceUrl").filter(|url| *url == "https://www.ozon.ru/modal/addressbook");
     let evidence_id = unique("evidence");
     let mut evidence = observed_evidence(
         Some(source_url),
         context_id,
         None,
-        &["/region/label", "/accessState"],
+        if region_source.is_some() {
+            &["/accountState", "/accessState"]
+        } else {
+            &["/region/label", "/accountState", "/accessState"]
+        },
         json!([]),
         &observed,
     );
     evidence["evidenceRef"] = json!(evidence_id);
+    let (region_evidence_id, all_evidence) = if let Some(region_source) = region_source {
+        let region_id = unique("evidence");
+        let mut region_evidence = observed_evidence(
+            Some(region_source),
+            context_id,
+            None,
+            &["/region/label"],
+            json!([]),
+            &observed,
+        );
+        region_evidence["evidenceRef"] = json!(region_id);
+        (region_id, vec![evidence, region_evidence])
+    } else {
+        (evidence_id.clone(), vec![evidence])
+    };
     let region_label = raw.get("regionLabel").cloned().unwrap_or(Value::Null);
     let region_verification = enum_or(
         raw.get("regionVerification"),
@@ -72,12 +106,12 @@ pub fn normalize_context(raw: &Value) -> Normalized {
         warnings.push(warning(
             "REGION_UNVERIFIED",
             "The current region could not be verified.",
-            &[evidence_id.as_str()],
+            &[region_evidence_id.as_str()],
         ));
     }
     Normalized {
-        data: json!({"contextId":context_id,"observedAt":observed,"region":{"label":region_label,"verification":region_verification,"evidenceRefs":[evidence_id]},"accountState":account,"accessState":access,"capabilities":capabilities}),
-        evidence: vec![evidence],
+        data: json!({"contextId":context_id,"observedAt":observed,"region":{"label":region_label,"verification":region_verification,"evidenceRefs":[region_evidence_id]},"accountState":account,"accessState":access,"capabilities":capabilities}),
+        evidence: all_evidence,
         warnings,
         product_refs: vec![],
     }
@@ -145,6 +179,7 @@ pub fn normalize_search(
         items.push(json!({
             "productRef":product_ref,"sku":sku,"title":item.get("name").cloned().unwrap_or(Value::Null),"url":url,
             "availability":"unknown","prices":normalized_prices,"seller":seller_from_search(item,&ev_id),
+            "matchesDisplayedPriceRange":item.get("matchesPriceRange").cloned().unwrap_or(Value::Null),
             "deliveryLabel":item.get("deliveryLabel").cloned().unwrap_or(Value::Null),"rating":item.get("rating").cloned().unwrap_or(Value::Null),
             "reviewCount":item.get("reviews").cloned().unwrap_or(Value::Null),"imageRefs":image_refs,"evidenceRefs":[ev_id]
         }));
@@ -193,8 +228,12 @@ pub fn normalize_search(
             &[],
         ));
     }
+    let mut data = json!({"items":items,"refinements":refinements,"refinementsIncluded":include_facets,"refinementsTruncated":refinements_truncated,"nextCursor":next_cursor,"hasNext":has_next,"coverage":{"returned":items.len(),"uniqueSeen":unique_seen,"total":total,"snapshotGuaranteed":false,"completeness":completeness}});
+    if let Some(assessment) = raw.get("priceRangeAssessment") {
+        data["priceRangeAssessment"] = assessment.clone();
+    }
     Ok(Normalized {
-        data: json!({"items":items,"refinements":refinements,"refinementsIncluded":include_facets,"refinementsTruncated":refinements_truncated,"nextCursor":next_cursor,"hasNext":has_next,"coverage":{"returned":items.len(),"uniqueSeen":unique_seen,"total":total,"snapshotGuaranteed":false,"completeness":completeness}}),
+        data,
         evidence,
         warnings,
         product_refs,
@@ -398,6 +437,12 @@ pub fn normalize_reviews(
         sku,
         source_url,
         limit,
+        prior_seen_review_keys,
+        prior_seen_ref,
+        prior_seen_depth,
+        current_path,
+        prior_no_progress_pages,
+        prior_page_made_progress,
     } = request;
     let observed = text(raw, "_continuationObservedAt")
         .map(str::to_owned)
@@ -409,9 +454,63 @@ pub fn normalize_reviews(
             "SOURCE_CHANGED: review result exceeds the bounded source page"
         ));
     }
+    let source_reviews = array(raw, "reviews");
+    let mut seen_review_keys = prior_seen_review_keys
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if seen_review_keys.len() > MAX_SEEN_REVIEWS {
+        return Err(anyhow!(
+            "SOURCE_CHANGED: review cursor coverage exceeds {MAX_SEEN_REVIEWS} identities"
+        ));
+    }
+    let mut new_review_keys = vec![];
+    let mut selected_reviews = vec![];
+    let mut consumed = 0usize;
+    for (index, review) in source_reviews.iter().enumerate() {
+        consumed = index + 1;
+        let identity = review_identity(review)?;
+        if seen_review_keys.insert(identity.clone()) {
+            new_review_keys.push(identity);
+            selected_reviews.push((index, review));
+            if selected_reviews.len() == limit.min(30) {
+                break;
+            }
+        }
+    }
+    if seen_review_keys.len() > MAX_SEEN_REVIEWS {
+        return Err(anyhow!(
+            "SOURCE_CHANGED: review cursor coverage exceeds {MAX_SEEN_REVIEWS} identities"
+        ));
+    }
+    let remaining = &source_reviews[consumed..];
+    let next_path = if remaining.is_empty() {
+        text(raw, "nextPath")
+    } else {
+        None
+    };
+    let has_continuation = !remaining.is_empty() || next_path.is_some();
+    let page_made_progress = prior_page_made_progress || !new_review_keys.is_empty();
+    let no_progress_pages = if remaining.is_empty() {
+        if page_made_progress {
+            0
+        } else {
+            prior_no_progress_pages.saturating_add(1)
+        }
+    } else {
+        prior_no_progress_pages
+    };
+    if has_continuation
+        && (no_progress_pages >= MAX_REVIEW_NO_PROGRESS_PAGES
+            || remaining.is_empty() && !page_made_progress && next_path == Some(current_path))
+    {
+        return Err(anyhow!(
+            "SOURCE_CHANGED: review pagination made no progress; restart reviews from productRef"
+        ));
+    }
     let mut evidence = vec![];
     let mut reviews = vec![];
-    for (index, review) in array(raw, "reviews").iter().take(limit.min(30)).enumerate() {
+    for (index, review) in selected_reviews {
         let review_ref = store.put_ref(research_id,"review",&json!({"reviewId":review.get("reviewId"),"productRef":product_ref,"sku":sku,"sourceUrl":canonical}),None)?;
         let mut image_refs = vec![];
         for (photo_index, url) in array(review, "photos")
@@ -474,9 +573,19 @@ pub fn normalize_reviews(
             refinements.push(json!({"kind":enum_or(r.get("kind"),&["filter","sort"],"filter"),"label":label,"groupLabel":null,"selected":r.get("selected").cloned().unwrap_or(Value::Null),"reviewSearchRef":rr}));
         }
     }
-    let source_reviews = array(raw, "reviews");
-    let emitted = source_reviews.len().min(limit.min(30));
-    let remaining = &source_reviews[emitted..];
+    let seen_ref = if has_continuation && !new_review_keys.is_empty() {
+        let (reference, _) = store_review_seen_state(
+            store,
+            research_id,
+            prior_seen_ref,
+            prior_seen_depth,
+            &new_review_keys,
+            &seen_review_keys,
+        )?;
+        Some(reference)
+    } else {
+        prior_seen_ref.map(str::to_owned)
+    };
     let next_cursor = if !remaining.is_empty() {
         let mut cached = raw.clone();
         cached["reviews"] = json!(remaining);
@@ -484,15 +593,15 @@ pub fn normalize_reviews(
         Some(store.put_ref(
             research_id,
             "review_cursor",
-            &json!({"cachedRaw":cached,"capturedAt":observed,"contextId":context_id,"productRef":product_ref,"sku":sku,"sourceUrl":canonical}),
+            &json!({"cachedRaw":cached,"capturedAt":observed,"contextId":context_id,"productRef":product_ref,"sku":sku,"sourceUrl":canonical,"seenRef":seen_ref,"noProgressPages":no_progress_pages,"pageMadeProgress":page_made_progress}),
             Some(1800),
         )?)
     } else {
-        match text(raw, "nextPath") {
+        match next_path {
             Some(path) => Some(store.put_ref(
                 research_id,
                 "review_cursor",
-                &json!({"path":path,"productRef":product_ref,"sku":sku,"sourceUrl":canonical}),
+                &json!({"path":path,"productRef":product_ref,"sku":sku,"sourceUrl":canonical,"seenRef":seen_ref,"noProgressPages":no_progress_pages,"pageMadeProgress":false}),
                 Some(1800),
             )?),
             None => None,
@@ -534,11 +643,43 @@ pub fn normalize_reviews(
         ));
     }
     Ok(Normalized {
-        data: json!({"subjectSku":sku,"aggregationScope":enum_or(raw.get("aggregationScope"),&["specific_sku","multiple_variants","unknown"],"unknown"),"aggregate":{"rating":raw.get("rating").cloned().unwrap_or(Value::Null),"count":raw.get("totalReviews").cloned().unwrap_or(Value::Null)},"reviews":reviews,"refinements":refinements,"refinementsIncluded":!array(raw,"refinements").is_empty(),"refinementsTruncated":array(raw,"refinements").len()>100,"coverage":{"returned":reviews.len(),"uniqueSeen":reviews.len(),"total":raw.get("totalReviews").cloned().unwrap_or(Value::Null),"snapshotGuaranteed":false,"completeness":completeness},"nextCursor":next_cursor,"hasNext":has_next}),
+        data: json!({"subjectSku":sku,"aggregationScope":enum_or(raw.get("aggregationScope"),&["specific_sku","multiple_variants","unknown"],"unknown"),"aggregate":{"rating":raw.get("rating").cloned().unwrap_or(Value::Null),"count":raw.get("totalReviews").cloned().unwrap_or(Value::Null)},"reviews":reviews,"refinements":refinements,"refinementsIncluded":!array(raw,"refinements").is_empty(),"refinementsTruncated":array(raw,"refinements").len()>100,"coverage":{"returned":reviews.len(),"uniqueSeen":seen_review_keys.len(),"total":raw.get("totalReviews").cloned().unwrap_or(Value::Null),"snapshotGuaranteed":false,"completeness":completeness},"nextCursor":next_cursor,"hasNext":has_next}),
         evidence,
         warnings,
         product_refs: vec![product_ref.into()],
     })
+}
+
+fn store_review_seen_state(
+    store: &mut Store,
+    research_id: &str,
+    parent: Option<&str>,
+    prior_depth: usize,
+    new_keys: &[String],
+    all_keys: &BTreeSet<String>,
+) -> Result<(String, usize)> {
+    if new_keys.is_empty() || new_keys.len() > 30 || all_keys.len() > MAX_SEEN_REVIEWS {
+        return Err(anyhow!("SOURCE_CHANGED: invalid review coverage chunk"));
+    }
+    let (value, depth) = if prior_depth + 1 >= REVIEW_SEEN_CHECKPOINT_INTERVAL {
+        let value = json!({"kind":"checkpoint","keys":all_keys,"count":all_keys.len(),"depth":0});
+        if serde_json::to_vec(&value)?.len() > MAX_REVIEW_SEEN_CHECKPOINT_BYTES {
+            return Err(anyhow!(
+                "SOURCE_CHANGED: review coverage checkpoint is too large"
+            ));
+        }
+        (value, 0)
+    } else {
+        let depth = prior_depth + 1;
+        (
+            json!({"kind":"delta","parent":parent,"keys":new_keys,"count":all_keys.len(),"depth":depth}),
+            depth,
+        )
+    };
+    Ok((
+        store.put_ref(research_id, "review_seen", &value, None)?,
+        depth,
+    ))
 }
 
 pub fn item_error(requested: &Value, code: &str, message: &str) -> Value {
@@ -669,7 +810,10 @@ fn description(
     ev: &str,
     observed: &str,
 ) -> Result<Value> {
-    let text = raw.pointer("/description/text").and_then(Value::as_str);
+    let text = raw
+        .pointer("/description/text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
     let offset = raw
         .pointer("/_continuation/offset")
         .and_then(Value::as_u64)
@@ -690,8 +834,9 @@ fn description(
     } else {
         None
     };
+    let observed_text = text.is_some_and(|value| !value.trim().is_empty());
     let mut m = section_base(
-        if text.is_some() {
+        if observed_text {
             if truncated { "partial" } else { "available" }
         } else {
             "unknown"
@@ -699,7 +844,11 @@ fn description(
         remaining,
         12000,
         next,
-        Value::Bool(truncated),
+        if observed_text {
+            Value::Bool(truncated)
+        } else {
+            Value::Null
+        },
     );
     m.insert(
         "text".into(),
@@ -903,6 +1052,12 @@ fn review_text(v: &Value) -> Value {
         json!(parts.join("\n\n"))
     }
 }
+fn review_identity(review: &Value) -> Result<String> {
+    Ok(match text(review, "reviewId").filter(|id| !id.is_empty()) {
+        Some(id) => format!("id:{:x}", Sha256::digest(id.as_bytes())),
+        None => format!("anonymous:{}", Uuid::new_v4()),
+    })
+}
 fn parse_timestamp(v: Option<&Value>) -> Value {
     v.and_then(Value::as_str)
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -915,9 +1070,14 @@ fn source_warnings(raw: &Value) -> Vec<Value> {
         .take(30)
         .filter_map(Value::as_str)
         .map(|code| {
+            let message = if code == "PRICE_OUTSIDE_REQUESTED_RANGE" {
+                "Returned displayed search prices do not all match the requested range. Ozon's source filter price basis is unknown; results were preserved."
+            } else {
+                "The source reported incomplete or unstable data."
+            };
             warning(
                 code,
-                "The source reported incomplete or unstable data.",
+                message,
                 &[],
             )
         })
@@ -1044,12 +1204,58 @@ mod tests {
         (d, store, rid, context)
     }
 
+    fn read_seen_chain(store: &Store, seen_ref: Option<&str>) -> Vec<String> {
+        let mut current = seen_ref.map(str::to_owned);
+        let mut keys = BTreeSet::new();
+        while let Some(reference) = current {
+            let node = store.get_ref(&reference, "review_seen").unwrap();
+            keys.extend(
+                node.value["keys"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|key| key.as_str().unwrap().to_owned()),
+            );
+            current = node.value["parent"].as_str().map(str::to_owned);
+        }
+        keys.into_iter().collect()
+    }
+
     #[test]
     fn missing_card_price_is_not_inferred() {
         assert!(
             product_prices(&json!({"price":10.0,"cardPrice":null}), "e")
                 .iter()
                 .all(|v| v["type"] != "ozon_card")
+        );
+    }
+
+    #[test]
+    fn selected_address_city_has_separate_static_source_evidence() {
+        let raw = json!({"contextId":"c","regionLabel":"Москва","regionVerification":"verified","accountState":"authenticated","accessState":"available","regionSourceUrl":"https://www.ozon.ru/modal/addressbook"});
+        let normalized = normalize_context(&raw);
+        assert_eq!(normalized.evidence.len(), 2);
+        let region_ref = &normalized.data["region"]["evidenceRefs"][0];
+        let region = normalized
+            .evidence
+            .iter()
+            .find(|item| &item["evidenceRef"] == region_ref)
+            .unwrap();
+        assert_eq!(region["sourceUrl"], "https://www.ozon.ru/modal/addressbook");
+        assert_eq!(region["fieldPaths"], json!(["/region/label"]));
+        assert_eq!(normalized.evidence[0]["sourceUrl"], "https://www.ozon.ru/");
+        assert_eq!(
+            normalized.evidence[0]["fieldPaths"],
+            json!(["/accountState", "/accessState"])
+        );
+        let mut invalid = raw;
+        invalid["regionSourceUrl"] = json!("https://www.ozon.ru/modal/addressbook?private=value");
+        let normalized = normalize_context(&invalid);
+        assert_eq!(normalized.evidence.len(), 1);
+        assert!(
+            !serde_json::to_string(&normalized.evidence)
+                .unwrap()
+                .contains("private")
         );
     }
     #[test]
@@ -1068,6 +1274,65 @@ mod tests {
         contracts::validate_output(
             "ozon_search",
             &evidence::envelope(Some(&r), n.data, &c, n.evidence, n.warnings, &observed),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_price_range_semantics_are_explicit() {
+        let (_d, mut store, research_id, context) = test_store();
+        let raw = json!({
+            "searchUrl": "https://www.ozon.ru/search/?text=x&currency_price=500.000%3B1500.000",
+            "items": [
+                {"sku":"1","name":"below","price":362.0,"priceType":"unknown","matchesPriceRange":false,"currency":"RUB","url":"https://www.ozon.ru/product/1/"},
+                {"sku":"2","name":"inside","price":500.0,"priceType":"unknown","matchesPriceRange":true,"currency":"RUB","url":"https://www.ozon.ru/product/2/"},
+                {"sku":"3","name":"unknown","price":null,"priceType":"unknown","matchesPriceRange":null,"currency":"RUB","url":"https://www.ozon.ru/product/3/"}
+            ],
+            "priceRangeAssessment": {
+                "basis": "displayed_search_price",
+                "sourceFilterGuaranteesMatch": false
+            },
+            "nextCursor": "opaque-source-cursor",
+            "hasNext": true,
+            "coverage": {"uniqueSeen": 3},
+            "warnings": ["PRICE_OUTSIDE_REQUESTED_RANGE"]
+        });
+
+        let normalized = normalize_search(&raw, &mut store, &research_id, "c", false).unwrap();
+
+        assert_eq!(
+            normalized.data["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["matchesDisplayedPriceRange"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(false), json!(true), Value::Null]
+        );
+        assert_eq!(
+            normalized.data["priceRangeAssessment"],
+            json!({
+                "basis": "displayed_search_price",
+                "sourceFilterGuaranteesMatch": false
+            })
+        );
+        assert_eq!(normalized.data["coverage"]["completeness"], "partial");
+        assert_eq!(normalized.data["coverage"]["returned"], 3);
+        assert_eq!(
+            normalized.warnings[0]["message"],
+            "Returned displayed search prices do not all match the requested range. Ozon's source filter price basis is unknown; results were preserved."
+        );
+        let observed = now();
+        contracts::validate_output(
+            "ozon_search",
+            &evidence::envelope(
+                Some(&research_id),
+                normalized.data,
+                &context,
+                normalized.evidence,
+                normalized.warnings,
+                &observed,
+            ),
         )
         .unwrap();
     }
@@ -1109,7 +1374,7 @@ mod tests {
             "ozon_card"
         );
 
-        let reviews=normalize_reviews(&json!({"rating":4.9,"totalReviews":1,"reviews":[{"reviewId":"r1","score":5.0,"comment":"ok","pros":null,"cons":null,"date":null,"purchased":false,"variantLabel":null,"photos":[]}],"nextPath":null,"hasNext":false,"refinements":[],"aggregationScope":"specific_sku","warnings":[]}),&mut store,ReviewRequest{research_id:&rid,context_id:"c",product_ref:&product.product_refs[0],sku:"123",source_url:"https://www.ozon.ru/product/headphones-123/reviews/",limit:10}).unwrap();
+        let reviews=normalize_reviews(&json!({"rating":4.9,"totalReviews":1,"reviews":[{"reviewId":"r1","score":5.0,"comment":"ok","pros":null,"cons":null,"date":null,"purchased":false,"variantLabel":null,"photos":[]}],"nextPath":null,"hasNext":false,"refinements":[],"aggregationScope":"specific_sku","warnings":[]}),&mut store,ReviewRequest{research_id:&rid,context_id:"c",product_ref:&product.product_refs[0],sku:"123",source_url:"https://www.ozon.ru/product/headphones-123/reviews/",limit:10,prior_seen_review_keys:&[],prior_seen_ref:None,prior_seen_depth:0,current_path:"",prior_no_progress_pages:0,prior_page_made_progress:false}).unwrap();
         store
             .record(
                 &rid,
@@ -1161,6 +1426,9 @@ mod tests {
         let mut current = raw;
         let mut emitted = vec![];
         let mut captured_at = None;
+        let mut prior_seen_review_keys = vec![];
+        let mut prior_seen_ref = None;
+        let mut prior_seen_depth = 0;
         for limit in [3, 5, 30] {
             let normalized = normalize_reviews(
                 &current,
@@ -1172,6 +1440,12 @@ mod tests {
                     sku: "123",
                     source_url: "https://www.ozon.ru/product/item-123/reviews/",
                     limit,
+                    prior_seen_review_keys: &prior_seen_review_keys,
+                    prior_seen_ref: prior_seen_ref.as_deref(),
+                    prior_seen_depth,
+                    current_path: "",
+                    prior_no_progress_pages: 0,
+                    prior_page_made_progress: false,
                 },
             )
             .unwrap();
@@ -1184,10 +1458,7 @@ mod tests {
                     .iter()
                     .map(|review| review["text"].as_str().unwrap().to_owned()),
             );
-            assert_eq!(
-                normalized.data["coverage"]["uniqueSeen"],
-                normalized.data["coverage"]["returned"]
-            );
+            assert_eq!(normalized.data["coverage"]["uniqueSeen"], emitted.len());
             let output = evidence::envelope(
                 Some(&rid),
                 normalized.data.clone(),
@@ -1202,6 +1473,16 @@ mod tests {
                     let stored = store.get_ref(cursor, "review_cursor").unwrap();
                     assert_eq!(stored.value["capturedAt"], observed);
                     assert_eq!(stored.value["contextId"], "c");
+                    prior_seen_ref = stored.value["seenRef"].as_str().map(str::to_owned);
+                    prior_seen_review_keys = read_seen_chain(&store, prior_seen_ref.as_deref());
+                    prior_seen_depth = prior_seen_ref
+                        .as_deref()
+                        .map(|reference| {
+                            store.get_ref(reference, "review_seen").unwrap().value["depth"]
+                                .as_u64()
+                                .unwrap() as usize
+                        })
+                        .unwrap_or(0);
                     current = stored.value["cachedRaw"].clone();
                 }
                 None => break,
@@ -1213,6 +1494,273 @@ mod tests {
                 .map(|index| format!("review-{index}"))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn all_duplicate_review_page_advances_without_growing_seen_chain() {
+        let (_directory, mut store, research_id, _context) = test_store();
+        let first = normalize_reviews(
+            &json!({"rating":5.0,"totalReviews":2,"reviews":[
+                {"reviewId":"r1","score":5.0,"comment":"one","photos":[]},
+                {"reviewId":"r2","score":5.0,"comment":"two","photos":[]}
+            ],"nextPath":"/product/item-123/reviews/?page=2","hasNext":true,"refinements":[],"aggregationScope":"specific_sku","warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id,
+                context_id: "c",
+                product_ref: "ref_product",
+                sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/",
+                limit: 10,
+                prior_seen_review_keys: &[],
+                prior_seen_ref: None,
+                prior_seen_depth: 0,
+                current_path: "",
+                prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        let cursor = store
+            .get_ref(first.data["nextCursor"].as_str().unwrap(), "review_cursor")
+            .unwrap();
+        let seen_ref = cursor.value["seenRef"].as_str().unwrap().to_owned();
+        let seen = read_seen_chain(&store, Some(&seen_ref));
+
+        let duplicate = normalize_reviews(
+            &json!({"rating":5.0,"totalReviews":2,"reviews":[
+                {"reviewId":"r1","score":5.0,"comment":"one","photos":[]},
+                {"reviewId":"r2","score":5.0,"comment":"two","photos":[]}
+            ],"nextPath":"/product/item-123/reviews/?page=3","hasNext":true,"refinements":[],"aggregationScope":"specific_sku","warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id,
+                context_id: "c",
+                product_ref: "ref_product",
+                sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/",
+                limit: 10,
+                prior_seen_review_keys: &seen,
+                prior_seen_ref: Some(&seen_ref),
+                prior_seen_depth: 1,
+                current_path: "/product/item-123/reviews/?page=2",
+                prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        assert!(duplicate.data["reviews"].as_array().unwrap().is_empty());
+        assert_eq!(duplicate.data["coverage"]["uniqueSeen"], 2);
+        let cursor = store
+            .get_ref(
+                duplicate.data["nextCursor"].as_str().unwrap(),
+                "review_cursor",
+            )
+            .unwrap();
+        assert_eq!(cursor.value["seenRef"], seen_ref);
+    }
+
+    #[test]
+    fn identical_idless_review_rows_remain_distinct_across_pages() {
+        let (_directory, mut store, research_id, _context) = test_store();
+        let row = json!({"reviewId":null,"score":5.0,"comment":"same","photos":[]});
+        let first = normalize_reviews(
+            &json!({"rating":5.0,"totalReviews":4,"reviews":[row.clone(),row.clone()],"nextPath":"/product/item-123/reviews/?page=2","hasNext":true,"refinements":[],"aggregationScope":"specific_sku","warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id,
+                context_id: "c",
+                product_ref: "ref_product",
+                sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/",
+                limit: 10,
+                prior_seen_review_keys: &[],
+                prior_seen_ref: None,
+                prior_seen_depth: 0,
+                current_path: "",
+                prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(first.data["reviews"].as_array().unwrap().len(), 2);
+        assert_eq!(first.data["coverage"]["uniqueSeen"], 2);
+        let cursor = store
+            .get_ref(first.data["nextCursor"].as_str().unwrap(), "review_cursor")
+            .unwrap();
+        let seen_ref = cursor.value["seenRef"].as_str().unwrap().to_owned();
+        let seen = read_seen_chain(&store, Some(&seen_ref));
+        let depth = store.get_ref(&seen_ref, "review_seen").unwrap().value["depth"]
+            .as_u64()
+            .unwrap() as usize;
+
+        let second = normalize_reviews(
+            &json!({"rating":5.0,"totalReviews":4,"reviews":[row.clone(),row],"nextPath":null,"hasNext":false,"refinements":[],"aggregationScope":"specific_sku","warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id,
+                context_id: "c",
+                product_ref: "ref_product",
+                sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/",
+                limit: 10,
+                prior_seen_review_keys: &seen,
+                prior_seen_ref: Some(&seen_ref),
+                prior_seen_depth: depth,
+                current_path: "/product/item-123/reviews/?page=2",
+                prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(second.data["reviews"].as_array().unwrap().len(), 2);
+        assert_eq!(second.data["coverage"]["uniqueSeen"], 4);
+    }
+
+    #[test]
+    fn duplicate_review_cycles_stop_without_hidden_writes_and_progress_resets_bound() {
+        let (directory, mut store, research_id, _context) = test_store();
+        let duplicate = json!({"reviewId":"r1","score":5.0,"comment":"same","photos":["https://ir.ozone.ru/a.jpg"]});
+        let seen = vec![review_identity(&duplicate).unwrap()];
+        let refinements = (0..100)
+            .map(|index| json!({"label":format!("f{index}"),"url":format!("/product/item-123/reviews/?f={index}")}))
+            .collect::<Vec<_>>();
+        let bytes = || {
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().metadata().unwrap().len())
+                .sum::<u64>()
+        };
+        let before = bytes();
+        let same_path = normalize_reviews(
+            &json!({"reviews":[duplicate.clone()],"nextPath":"/product/item-123/reviews/?page=1","hasNext":true,"refinements":refinements,"warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id, context_id: "c", product_ref: "ref_product", sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/", limit: 10,
+                prior_seen_review_keys: &seen, prior_seen_ref: None, prior_seen_depth: 0,
+                current_path: "/product/item-123/reviews/?page=1", prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(same_path.to_string().starts_with("SOURCE_CHANGED:"));
+        assert_eq!(bytes(), before);
+
+        let page_a = normalize_reviews(
+            &json!({"reviews":[duplicate.clone()],"nextPath":"/product/item-123/reviews/?page=b","hasNext":true,"refinements":[],"warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id, context_id: "c", product_ref: "ref_product", sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/", limit: 10,
+                prior_seen_review_keys: &seen, prior_seen_ref: None, prior_seen_depth: 0,
+                current_path: "/product/item-123/reviews/?page=a", prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        let cursor_a = store
+            .get_ref(page_a.data["nextCursor"].as_str().unwrap(), "review_cursor")
+            .unwrap();
+        assert_eq!(cursor_a.value["noProgressPages"], 1);
+        let page_b = normalize_reviews(
+            &json!({"reviews":[duplicate.clone()],"nextPath":"/product/item-123/reviews/?page=a","hasNext":true,"refinements":[],"warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id, context_id: "c", product_ref: "ref_product", sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/", limit: 10,
+                prior_seen_review_keys: &seen, prior_seen_ref: None, prior_seen_depth: 0,
+                current_path: "/product/item-123/reviews/?page=b", prior_no_progress_pages: 1,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(page_b.data["coverage"]["returned"], 0);
+        let cycle = normalize_reviews(
+            &json!({"reviews":[duplicate],"nextPath":"/product/item-123/reviews/?page=b","hasNext":true,"refinements":[],"warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id, context_id: "c", product_ref: "ref_product", sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/", limit: 10,
+                prior_seen_review_keys: &seen, prior_seen_ref: None, prior_seen_depth: 0,
+                current_path: "/product/item-123/reviews/?page=a", prior_no_progress_pages: 2,
+                prior_page_made_progress: false,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(cycle.to_string().starts_with("SOURCE_CHANGED:"));
+
+        let progress = normalize_reviews(
+            &json!({"reviews":[{"reviewId":"r2","score":5.0,"comment":"new","photos":[]}],"nextPath":"/product/item-123/reviews/?page=c","hasNext":true,"refinements":[],"warnings":[]}),
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id, context_id: "c", product_ref: "ref_product", sku: "123",
+                source_url: "https://www.ozon.ru/product/item-123/reviews/", limit: 10,
+                prior_seen_review_keys: &seen, prior_seen_ref: None, prior_seen_depth: 0,
+                current_path: "/product/item-123/reviews/?page=b", prior_no_progress_pages: 2,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+        let progress_cursor = store
+            .get_ref(
+                progress.data["nextCursor"].as_str().unwrap(),
+                "review_cursor",
+            )
+            .unwrap();
+        assert_eq!(progress_cursor.value["noProgressPages"], 0);
+    }
+
+    #[test]
+    fn large_small_limit_review_seen_chain_stays_bounded_and_under_quota() {
+        let (directory, mut store, research_id, _context) = test_store();
+        let mut parent = None;
+        let mut last_cursor = None;
+        let mut all_keys = BTreeSet::new();
+        let mut prior_seen_depth = 0;
+        let total = 23_091usize;
+        for start in (0..total).step_by(10) {
+            let end = (start + 10).min(total);
+            let keys = (start..end)
+                .map(|index| format!("id:{index:064x}"))
+                .collect::<Vec<_>>();
+            all_keys.extend(keys.iter().cloned());
+            let (next_parent, next_depth) = store_review_seen_state(
+                &mut store,
+                &research_id,
+                parent.as_deref(),
+                prior_seen_depth,
+                &keys,
+                &all_keys,
+            )
+            .unwrap();
+            parent = Some(next_parent);
+            prior_seen_depth = next_depth;
+            last_cursor = Some(
+                store
+                .put_ref(
+                    &research_id,
+                    "review_cursor",
+                    &json!({"path":"/product/item-123/reviews/?page=2","seenRef":parent.as_deref()}),
+                    Some(1800),
+                )
+                .unwrap(),
+            );
+        }
+        assert_eq!(read_seen_chain(&store, parent.as_deref()).len(), total);
+        let cursor = store
+            .get_ref(last_cursor.as_deref().unwrap(), "review_cursor")
+            .unwrap();
+        assert!(cursor.value.get("seenReviewIds").is_none());
+        assert!(serde_json::to_vec(&cursor.value).unwrap().len() < 256);
+        let bytes = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        eprintln!("review_seen_storage identities={total} bytes={bytes}");
+        assert!(bytes < 32 * 1024 * 1024, "seen chain used {bytes} bytes");
     }
 
     #[test]
@@ -1290,5 +1838,81 @@ mod tests {
         );
         contracts::validate_output("ozon_get_products", &second_output).unwrap();
         assert_eq!(second_output["observedAt"], first_observed);
+    }
+    #[test]
+    fn empty_description_is_unverified_instead_of_available() {
+        let (_directory, mut store, research_id, _context) = test_store();
+        let raw = json!({
+            "sku": "123",
+            "name": "x",
+            "url": "https://www.ozon.ru/product/x-123/",
+            "cardPrice": null,
+            "priceRegular": 1.0,
+            "available": true,
+            "rating": null,
+            "reviews": null,
+            "seller": null,
+            "images": [],
+            "characteristics": {},
+            "description": {"text": "", "images": []},
+            "variants": {"status": "unsupported", "items": [], "hasNext": null, "nextPath": null},
+            "offers": {"status": "unsupported", "items": [], "hasNext": null, "nextPath": null},
+            "warnings": []
+        });
+
+        let product = normalize_product(
+            &raw,
+            &json!({"sku": "123"}),
+            &mut store,
+            &research_id,
+            "c",
+            &["description".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            product.result["product"]["description"]["status"],
+            "unknown"
+        );
+        assert!(product.result["product"]["description"]["text"].is_null());
+        assert!(product.result["product"]["description"]["hasNext"].is_null());
+        assert!(product.result["product"]["description"]["nextCursor"].is_null());
+    }
+
+    #[test]
+    fn observed_review_timestamp_survives_parse_and_normalization() {
+        let page = json!({"widgetStates": {
+            "webListReviews-0": {"reviews": [{
+                "uuid": "review-1",
+                "content": {"score": 5},
+                "publishedAt": 1704067200
+            }]}
+        }});
+        let raw = serde_json::to_value(crate::parse::parse_reviews(&page, 10)).unwrap();
+        let (_directory, mut store, research_id, _context) = test_store();
+        let normalized = normalize_reviews(
+            &raw,
+            &mut store,
+            ReviewRequest {
+                research_id: &research_id,
+                context_id: "c",
+                product_ref: "ref_product",
+                sku: "123",
+                source_url: "https://www.ozon.ru/product/x-123/reviews/",
+                limit: 10,
+                prior_seen_review_keys: &[],
+                prior_seen_ref: None,
+                prior_seen_depth: 0,
+                current_path: "",
+                prior_no_progress_pages: 0,
+                prior_page_made_progress: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            normalized.data["reviews"][0]["publishedAt"],
+            "2024-01-01T00:00:00+00:00"
+        );
     }
 }

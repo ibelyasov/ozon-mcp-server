@@ -20,6 +20,7 @@ pub struct Gateway {
 
 #[derive(Default)]
 struct CapabilityObservations {
+    context_signature: Option<Value>,
     search: bool,
     search_refinements: bool,
     search_pagination: bool,
@@ -28,6 +29,7 @@ struct CapabilityObservations {
     characteristics: bool,
     description: bool,
     product_images: bool,
+    image_content: bool,
     review_text: bool,
     review_images: bool,
     review_pagination: bool,
@@ -50,6 +52,8 @@ impl Gateway {
         let page = self.pages.context_json(cancel).await?;
         ensure_not_cancelled(cancel)?;
         let observation = page.get("contextObservation");
+        self.observed
+            .update_context_signature(context_capability_signature(observation));
         self.observed.region_verification |= observation
             .and_then(|value| value.get("regionVerified"))
             .and_then(Value::as_bool)
@@ -65,6 +69,10 @@ impl Gateway {
                 .and_then(Value::as_bool)
                 .filter(|verified| *verified)
                 .map_or("unverified", |_| "verified"),
+            "regionSourceUrl": observation
+                .and_then(|value| value.get("regionSourceUrl"))
+                .cloned()
+                .unwrap_or(Value::Null),
             "accountState": observed_enum(observation, "accountState", &["authenticated", "anonymous"], "unknown"),
             "accessState": observed_enum(observation, "accessState", &["available", "blocked"], "unknown"),
             // The page layer hashes only the observed account-state class and
@@ -79,7 +87,7 @@ impl Gateway {
                 "characteristics": observed_status(self.observed.characteristics),
                 "description": observed_status(self.observed.description),
                 "product_images": observed_status(self.observed.product_images),
-                "image_content": "unverified",
+                "image_content": observed_status(self.observed.image_content),
                 "review_text": observed_status(self.observed.review_text),
                 "review_images": observed_status(self.observed.review_images),
                 "review_pagination": observed_status(self.observed.review_pagination),
@@ -90,6 +98,10 @@ impl Gateway {
                 "account_observation": observed_status(self.observed.account_observation)
             }
         }))
+    }
+
+    pub fn mark_image_content_available(&mut self) {
+        self.observed.image_content = true;
     }
 
     pub async fn search(&mut self, args: SearchArgs, cancel: &CancellationToken) -> Result<Value> {
@@ -213,6 +225,33 @@ impl Gateway {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.pages.shutdown().await
     }
+}
+
+impl CapabilityObservations {
+    fn update_context_signature(&mut self, signature: Value) {
+        if self
+            .context_signature
+            .as_ref()
+            .is_some_and(|previous| previous != &signature)
+        {
+            self.image_content = false;
+        }
+        self.context_signature = Some(signature);
+    }
+}
+
+fn context_capability_signature(observation: Option<&Value>) -> Value {
+    observation
+        .and_then(|value| value.get("signature"))
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "regionLabel": observation.and_then(|value| value.get("regionLabel")).cloned().unwrap_or(Value::Null),
+                "regionVerified": observation.and_then(|value| value.get("regionVerified")).cloned().unwrap_or(Value::Null),
+                "accountState": observation.and_then(|value| value.get("accountState")).cloned().unwrap_or(Value::Null)
+            })
+        })
 }
 
 fn observed_status(observed: bool) -> &'static str {
@@ -340,5 +379,16 @@ mod tests {
                 "accepted unsafe navigation {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn image_content_observation_resets_when_context_signature_changes() {
+        let mut observed = CapabilityObservations::default();
+        observed.update_context_signature(json!("context-a"));
+        observed.image_content = true;
+        observed.update_context_signature(json!("context-a"));
+        assert!(observed.image_content);
+        observed.update_context_signature(json!("context-b"));
+        assert!(!observed.image_content);
     }
 }

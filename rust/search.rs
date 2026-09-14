@@ -5,7 +5,8 @@
 use crate::{
     model::{
         ActiveFilter, ActiveFilterValue, Facet, FacetOption, FacetRange, Facets, NumericValue,
-        SearchContext, SearchCoverage, SearchItem, SearchResponse, SortOption, Warning,
+        PriceRangeAssessment, PriceRangeBasis, SearchContext, SearchCoverage, SearchItem,
+        SearchResponse, SortOption, Warning,
     },
     page_source::PageSource,
     parse,
@@ -591,7 +592,7 @@ fn facets(page: &Value, base: &str) -> Option<Facets> {
     })
 }
 
-fn annotate_price_range(products: &mut [SearchItem], request_url: &url::Url) -> bool {
+fn annotate_price_range(products: &mut [SearchItem], request_url: &url::Url) -> Option<bool> {
     let bounds = request_url
         .query_pairs()
         .find(|(k, _)| k == "currency_price")
@@ -612,7 +613,7 @@ fn annotate_price_range(products: &mut [SearchItem], request_url: &url::Url) -> 
         outside |= matches == Some(false);
         product.matches_price_range = Some(matches);
     }
-    outside
+    bounds.map(|_| outside)
 }
 
 fn trim_metadata(result: &mut SearchResponse) -> Result<()> {
@@ -752,7 +753,8 @@ fn finish(
             }
         })
         .unwrap_or_else(|| "popular".into());
-    if annotate_price_range(&mut products, &u) {
+    let price_range_mismatch = annotate_price_range(&mut products, &u);
+    if price_range_mismatch == Some(true) {
         warnings.push(Warning::PriceOutsideRequestedRange);
     }
     let count = products.len();
@@ -780,6 +782,10 @@ fn finish(
             calls_in_chain: request.calls,
         },
         warnings,
+        price_range_assessment: price_range_mismatch.map(|_| PriceRangeAssessment {
+            basis: PriceRangeBasis::DisplayedSearchPrice,
+            source_filter_guarantees_match: false,
+        }),
         facets: None,
         sort_options: None,
         active_filters: None,
@@ -1177,7 +1183,7 @@ mod tests {
         ];
         let u =
             url::Url::parse("https://www.ozon.ru/search/?currency_price=100.000;200.000").unwrap();
-        assert!(annotate_price_range(&mut products, &u));
+        assert_eq!(annotate_price_range(&mut products, &u), Some(true));
         assert_eq!(
             products
                 .iter()
@@ -1192,12 +1198,72 @@ mod tests {
             "https://www.ozon.ru/search/?currency_price=broken",
             "https://www.ozon.ru/search/?currency_price=NaN;200",
         ] {
-            assert!(!annotate_price_range(
-                &mut products,
-                &url::Url::parse(url).unwrap()
-            ));
+            assert_eq!(
+                annotate_price_range(&mut products, &url::Url::parse(url).unwrap()),
+                None
+            );
             assert!(products.iter().all(|p| p.matches_price_range == Some(None)));
         }
+    }
+
+    #[test]
+    fn source_price_refinement_does_not_claim_strict_displayed_price_filtering() {
+        let priced_item = |sku: &str, price: &str| {
+            json!({
+                "sku": sku,
+                "action": {"link": format!("/product/test-{sku}/")},
+                "mainState": [{
+                    "type": "priceV2",
+                    "priceV2": {"price": [{"textStyle": "PRICE", "text": price}]}
+                }]
+            })
+        };
+        let page = json!({"widgetStates": {
+            "tileGridDesktop-x": {"items": [
+                priced_item("5705143151", "362 ₽"),
+                priced_item("1746233283", "479 ₽"),
+                priced_item("5165920559", "491 ₽")
+            ]},
+            "infiniteVirtualPaginator-x": {"nextPage": "/search/?text=x&currency_price=500.000%3B1500.000&page=2"}
+        }});
+        let args = args(json!({
+            "query": "x",
+            "priceMin": 50_000,
+            "priceMax": 150_000,
+            "limit": 3
+        }));
+
+        let result = finish(&page, &args, prepare(&args).unwrap()).unwrap();
+
+        assert_eq!(result["count"], 3);
+        assert_eq!(
+            result["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| (&item["sku"], &item["matchesPriceRange"]))
+                .collect::<Vec<_>>(),
+            vec![
+                (&json!("5705143151"), &json!(false)),
+                (&json!("1746233283"), &json!(false)),
+                (&json!("5165920559"), &json!(false)),
+            ]
+        );
+        assert_eq!(
+            result["priceRangeAssessment"],
+            json!({
+                "basis": "displayed_search_price",
+                "sourceFilterGuaranteesMatch": false
+            })
+        );
+        assert_eq!(result["coverage"]["returned"], 3);
+        assert_eq!(result["hasNext"], true);
+        assert!(
+            result["warnings"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("PRICE_OUTSIDE_REQUESTED_RANGE"))
+        );
     }
 
     #[test]

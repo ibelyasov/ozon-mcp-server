@@ -25,6 +25,19 @@ pub enum PriceType {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceRangeBasis {
+    DisplayedSearchPrice,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PriceRangeAssessment {
+    pub basis: PriceRangeBasis,
+    pub source_filter_guarantees_match: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Warning {
     SearchResultsMayChangeBetweenCalls,
@@ -177,6 +190,8 @@ pub struct SearchResponse {
     pub context: SearchContext,
     pub coverage: SearchCoverage,
     pub warnings: Vec<Warning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_range_assessment: Option<PriceRangeAssessment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub facets: Option<Option<Facets>>,
     #[serde(skip_serializing_if = "Option::is_none")]

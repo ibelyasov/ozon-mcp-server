@@ -1,15 +1,17 @@
 use crate::{
-    browser::BrowserSession,
+    browser::{BrowserSession, RunningCommandOutcome},
     browser_error::BrowserError,
-    page_outcome::{PageError, PageOutcome},
+    page_outcome::{FilteredPage, PageError, PageOutcome},
     page_source::PageSource,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 const HOME: &str = "https://www.ozon.ru/";
+const ADDRESS_BOOK: &str = "https://www.ozon.ru/modal/addressbook";
 
 pub struct OzonPages {
     session: BrowserSession,
@@ -26,10 +28,11 @@ impl OzonPages {
         })
     }
 
-    /// Observe only the narrow, privacy-filtered header context projection.
-    /// This method never opens dialogs, signs in, or changes a saved region.
+    /// Observe a narrow, privacy-filtered context projection. Authenticated
+    /// contexts may read the selected saved-address city through an exact,
+    /// read-only same-origin modal navigation; no address or action is exported.
     pub async fn context_json(&mut self, cancel: &CancellationToken) -> Result<Value> {
-        let first = self.context_once(cancel).await;
+        let first = self.context_with_region_once(cancel).await;
         let result = if first.as_ref().is_err_and(|error| {
             error
                 .downcast_ref::<BrowserError>()
@@ -37,7 +40,7 @@ impl OzonPages {
         }) && !cancel.is_cancelled()
         {
             self.shutdown().await?;
-            self.context_once(cancel).await
+            self.context_with_region_once(cancel).await
         } else {
             first
         };
@@ -50,7 +53,25 @@ impl OzonPages {
         result
     }
 
-    async fn context_once(&mut self, cancel: &CancellationToken) -> Result<Value> {
+    async fn context_with_region_once(&mut self, cancel: &CancellationToken) -> Result<Value> {
+        let mut before = self.context_header_once(cancel).await?;
+        let should_probe = before.context_observation.as_ref().is_some_and(|context| {
+            context.account_state == "authenticated" && context.region_label.is_none()
+        }) && before
+            .region_probe
+            .as_ref()
+            .is_some_and(|probe| probe.address_book_modal_available);
+        if !should_probe {
+            before.region_probe = None;
+            return Ok(before.into_value());
+        }
+
+        let selected_region = self.address_book_region(cancel).await?;
+        let after = self.context_header_once(cancel).await?;
+        Ok(merge_context_region(before, after, selected_region)?.into_value())
+    }
+
+    async fn context_header_once(&mut self, cancel: &CancellationToken) -> Result<FilteredPage> {
         self.ensure_ready(cancel).await?;
         // Composer fragment pages (notably secondary product layouts) can omit
         // the global header. Retry transient rendering first, then observe the
@@ -83,7 +104,7 @@ impl OzonPages {
                                 break;
                             }
                         }
-                        return Ok(success.page.into_value());
+                        return Ok(success.page);
                     }
                     PageOutcome::Error(failure) if failure.error == PageError::ResponseTooLarge => {
                         return Err(BrowserError::ResponseTooLarge.into());
@@ -93,6 +114,100 @@ impl OzonPages {
             }
         }
         unreachable!("bounded context observation loop always returns")
+    }
+
+    async fn address_book_region(&mut self, cancel: &CancellationToken) -> Result<Option<String>> {
+        let operation = async {
+            self.session.run(&["open", ADDRESS_BOOK], cancel).await?;
+            self.session.run(&["wait", "1000"], cancel).await?;
+            let navigation = navigation_probe(
+                self.evaluate_outcome(json!({"mode":"navigation", "target":"addressBook"}), cancel)
+                    .await?,
+            )?;
+            let status = navigation
+                .status
+                .ok_or(BrowserError::NavigationStatusUnavailable)?;
+            if !(200..400).contains(&status) {
+                return Err(BrowserError::HttpStatus(status).into());
+            }
+            if !navigation.route_valid {
+                return Err(BrowserError::UnexpectedRedirect.into());
+            }
+            match self
+                .evaluate_outcome(json!({"mode":"contextModal"}), cancel)
+                .await?
+            {
+                PageOutcome::Page(success) => Ok(success
+                    .page
+                    .region_probe
+                    .and_then(|probe| probe.selected_region_label)),
+                PageOutcome::Error(failure) if failure.error == PageError::ResponseTooLarge => {
+                    Err(BrowserError::ResponseTooLarge.into())
+                }
+                _ => Err(BrowserError::CaptchaOrBlocked.into()),
+            }
+        }
+        .await;
+
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        let restore = async {
+            let completed = |outcome| match outcome {
+                RunningCommandOutcome::Completed(value) => Some(value),
+                RunningCommandOutcome::AlreadyClosed => None,
+            };
+            if completed(
+                self.session
+                    .run_if_running(&["open", HOME], cleanup_remaining(cleanup_deadline)?)
+                    .await?,
+            )
+            .is_none()
+            {
+                return Ok(false);
+            }
+            if completed(
+                self.session
+                    .run_if_running(&["wait", "1000"], cleanup_remaining(cleanup_deadline)?)
+                    .await?,
+            )
+            .is_none()
+            {
+                return Ok(false);
+            }
+            let script = page_script(&json!({"mode":"navigation", "target":"home"}));
+            let Some(navigation) = completed(
+                self.session
+                    .evaluate_if_running(&script, cleanup_remaining(cleanup_deadline)?)
+                    .await?,
+            ) else {
+                return Ok(false);
+            };
+            let navigation = navigation_probe(
+                serde_json::from_value(navigation)
+                    .map_err(|_| BrowserError::InvalidBridgeResponse)?,
+            )?;
+            let status = navigation
+                .status
+                .ok_or(BrowserError::NavigationStatusUnavailable)?;
+            if !(200..400).contains(&status) {
+                return Err(BrowserError::HttpStatus(status).into());
+            }
+            if !navigation.route_valid {
+                return Err(BrowserError::UnexpectedRedirect.into());
+            }
+            Ok(true)
+        }
+        .await;
+
+        match restore {
+            Ok(true) => {}
+            Ok(false) if operation.is_err() => return operation,
+            Ok(false) => return Err(BrowserError::CleanupFailed.into()),
+            Err(restore_error) => {
+                self.shutdown().await?;
+                return Err(restore_error);
+            }
+        }
+        operation
     }
 
     pub async fn fetch_json(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
@@ -185,7 +300,7 @@ impl OzonPages {
         options: Value,
         cancel: &CancellationToken,
     ) -> Result<PageOutcome> {
-        let script = format!("({})({options})", include_str!("page.js"));
+        let script = page_script(&options);
         let response = self.session.evaluate(&script, cancel).await?;
         self.last_used = Instant::now();
         serde_json::from_value(response).map_err(|_| BrowserError::InvalidBridgeResponse.into())
@@ -213,6 +328,77 @@ impl OzonPages {
         self.ready = false;
         self.session.shutdown().await
     }
+}
+
+fn merge_context_region(
+    mut before: FilteredPage,
+    mut after: FilteredPage,
+    selected_region: Option<String>,
+) -> Result<FilteredPage> {
+    before.region_probe = None;
+    after.region_probe = None;
+    let before_context = before
+        .context_observation
+        .as_ref()
+        .ok_or_else(|| anyhow!("CONTEXT_CHANGED: context disappeared before region observation"))?;
+    let after_context = after
+        .context_observation
+        .as_mut()
+        .ok_or_else(|| anyhow!("CONTEXT_CHANGED: context disappeared after region observation"))?;
+    if before_context.account_state != "authenticated"
+        || after_context.account_state != before_context.account_state
+        || after_context.access_state != before_context.access_state
+        || after_context.signature != before_context.signature
+    {
+        return Err(anyhow!(
+            "CONTEXT_CHANGED: account or header changed during region observation"
+        ));
+    }
+    let Some(selected_region) = selected_region else {
+        return Ok(after);
+    };
+    if [&before_context.region_label, &after_context.region_label]
+        .into_iter()
+        .flatten()
+        .any(|region| region != &selected_region)
+    {
+        return Err(anyhow!(
+            "CONTEXT_CHANGED: header region changed during region observation"
+        ));
+    }
+    after_context.region_label = Some(selected_region.clone());
+    after_context.region_verified = true;
+    after_context.region_source_url = Some(ADDRESS_BOOK.to_owned());
+    let digest = Sha256::digest(format!(
+        "{}\n{selected_region}",
+        after_context.account_state
+    ));
+    after_context.signature = Some(digest.iter().map(|byte| format!("{byte:02x}")).collect());
+    Ok(after)
+}
+
+fn page_script(options: &Value) -> String {
+    format!("({})({options})", include_str!("page.js"))
+}
+
+fn navigation_probe(outcome: PageOutcome) -> Result<crate::page_outcome::NavigationProbe> {
+    match outcome {
+        PageOutcome::Page(success) => success
+            .page
+            .navigation_probe
+            .ok_or_else(|| BrowserError::InvalidBridgeResponse.into()),
+        PageOutcome::Error(failure) if failure.error == PageError::ResponseTooLarge => {
+            Err(BrowserError::ResponseTooLarge.into())
+        }
+        _ => Err(BrowserError::UnexpectedRedirect.into()),
+    }
+}
+
+fn cleanup_remaining(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| BrowserError::CommandTimeout.into())
 }
 
 impl PageSource for OzonPages {
@@ -338,6 +524,73 @@ fn is_navigation_metadata(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page_outcome::{ContextObservation, FilteredPage, RegionProbe};
+
+    fn context_page(account_state: &str, signature: &str) -> FilteredPage {
+        FilteredPage {
+            widget_states: serde_json::Map::new(),
+            seo: None,
+            layout_tracking_info: None,
+            context_observation: Some(ContextObservation {
+                region_label: None,
+                region_verified: false,
+                region_source_url: None,
+                account_state: account_state.to_owned(),
+                access_state: "available".to_owned(),
+                signature: Some(signature.to_owned()),
+            }),
+            region_probe: Some(RegionProbe {
+                address_book_modal_available: true,
+                selected_region_label: None,
+            }),
+            navigation_probe: None,
+        }
+    }
+
+    #[test]
+    fn authenticated_modal_region_requires_stable_before_and_after_context() {
+        let merged = merge_context_region(
+            context_page("authenticated", "same"),
+            context_page("authenticated", "same"),
+            Some("Москва".to_owned()),
+        )
+        .unwrap();
+        let observation = merged.context_observation.unwrap();
+        assert_eq!(observation.region_label.as_deref(), Some("Москва"));
+        assert!(observation.region_verified);
+        assert!(observation.signature.is_some_and(|value| value.len() == 64));
+        assert!(merged.region_probe.is_none());
+
+        assert!(
+            merge_context_region(
+                context_page("authenticated", "before"),
+                context_page("authenticated", "after"),
+                Some("Москва".to_owned()),
+            )
+            .is_err()
+        );
+        assert!(
+            merge_context_region(
+                context_page("authenticated", "same"),
+                context_page("anonymous", "same"),
+                Some("Москва".to_owned()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn navigation_probe_rejects_url_fields_crossing_the_page_boundary() {
+        assert!(
+            serde_json::from_value::<PageOutcome>(json!({
+                "page": {
+                    "widgetStates": {},
+                    "navigationProbe": {"routeValid": true, "status": 200, "url": "private"}
+                }
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn fallback_must_match_product_or_search() {

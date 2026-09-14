@@ -49,14 +49,30 @@ struct FakeGateway {
     searches: std::collections::VecDeque<FakeAction>,
     products: std::collections::VecDeque<FakeAction>,
     reviews: std::collections::VecDeque<FakeAction>,
+    image_content_observed: bool,
+    context_signature: Option<Value>,
 }
 
 #[cfg(test)]
 impl FakeGateway {
     async fn context(&mut self, _cancel: &CancellationToken) -> Result<Value> {
-        self.contexts
+        let mut context = self
+            .contexts
             .pop_front()
-            .ok_or_else(|| anyhow!("SOURCE_CHANGED: fake context script exhausted"))
+            .ok_or_else(|| anyhow!("SOURCE_CHANGED: fake context script exhausted"))?;
+        let signature = context.get("signature").cloned().unwrap_or(Value::Null);
+        if self
+            .context_signature
+            .as_ref()
+            .is_some_and(|previous| previous != &signature)
+        {
+            self.image_content_observed = false;
+        }
+        self.context_signature = Some(signature);
+        if self.image_content_observed {
+            context["capabilities"]["image_content"] = json!("available");
+        }
+        Ok(context)
     }
 
     async fn search(&mut self, _args: SearchArgs, cancel: &CancellationToken) -> Result<Value> {
@@ -143,6 +159,14 @@ impl GatewayBackend {
             Self::Real(gateway) => gateway.shutdown().await,
             #[cfg(test)]
             Self::Fake(_) => Ok(()),
+        }
+    }
+
+    fn mark_image_content_available(&mut self) {
+        match self {
+            Self::Real(gateway) => gateway.mark_image_content_available(),
+            #[cfg(test)]
+            Self::Fake(gateway) => gateway.image_content_observed = true,
         }
     }
 }
@@ -437,22 +461,24 @@ async fn products(
     let mut resolved = Vec::with_capacity(selectors.len());
     let mut inferred: Option<String> = research_arg(args).map(str::to_owned);
     for selector in selectors {
-        let resolved_product = resolve_product(inner, selector)?;
-        if resolved_product
-            .context_id
-            .as_ref()
-            .is_some_and(|bound| bound != &context_id)
-        {
-            return Err(anyhow!(
-                "CONTEXT_CHANGED: product reference belongs to another context"
-            ));
-        }
-        if let Some(rid) = &resolved_product.research_id {
-            if inferred.as_ref().is_some_and(|v| v != rid) {
-                return Err(anyhow!("INVALID_REFERENCE: mixed-research product batch"));
+        let resolved_product = resolve_product(inner, selector).and_then(|resolved_product| {
+            if resolved_product
+                .context_id
+                .as_ref()
+                .is_some_and(|bound| bound != &context_id)
+            {
+                return Err(anyhow!(
+                    "CONTEXT_CHANGED: product reference belongs to another context"
+                ));
             }
-            inferred = Some(rid.clone());
-        }
+            if let Some(rid) = &resolved_product.research_id {
+                if inferred.as_ref().is_some_and(|v| v != rid) {
+                    return Err(anyhow!("INVALID_REFERENCE: mixed-research product batch"));
+                }
+                inferred = Some(rid.clone());
+            }
+            Ok(resolved_product)
+        });
         resolved.push(resolved_product);
     }
     let research_id = match inferred {
@@ -480,6 +506,17 @@ async fn products(
         if cancel.is_cancelled() {
             break;
         }
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                results.push(item_error(
+                    selector,
+                    error_code(&error),
+                    &safe_message(&error),
+                ));
+                continue;
+            }
+        };
         let target = resolved.target;
         let item_include = resolved.include.unwrap_or_else(|| includes.clone());
         let cached = resolved.cached_raw;
@@ -569,48 +606,117 @@ async fn reviews(
     let context = observe_context(inner, cancel, deadline).await?;
     let cid = required_text(&context, "contextId")?;
     let start = &args["start"];
-    let (rid, pref, sku, path, source, cached_raw) =
-        if let Some(pref) = start.get("productRef").and_then(Value::as_str) {
-            let r = locked_store(inner)?.get_ref(pref, "product")?;
-            verify_bound(&r, args, cid)?;
-            (
-                r.research_id,
-                pref.to_owned(),
-                required_text(&r.value, "sku")?.to_owned(),
-                r.value
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-                r.value
-                    .get("url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-                None,
-            )
+    let (
+        rid,
+        pref,
+        sku,
+        path,
+        source,
+        cached_raw,
+        prior_seen_review_keys,
+        prior_seen_ref,
+        prior_seen_depth,
+        prior_no_progress_pages,
+        prior_page_made_progress,
+    ) = if let Some(pref) = start.get("productRef").and_then(Value::as_str) {
+        let r = locked_store(inner)?.get_ref(pref, "product")?;
+        verify_bound(&r, args, cid)?;
+        (
+            r.research_id,
+            pref.to_owned(),
+            required_text(&r.value, "sku")?.to_owned(),
+            r.value
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            r.value
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            None,
+            vec![],
+            None,
+            0,
+            0,
+            false,
+        )
+    } else {
+        let (key, kind) = if start.get("reviewSearchRef").is_some() {
+            ("reviewSearchRef", "review_search")
         } else {
-            let (key, kind) = if start.get("reviewSearchRef").is_some() {
-                ("reviewSearchRef", "review_search")
-            } else {
-                ("cursor", "review_cursor")
-            };
-            let r = locked_store(inner)?.get_ref(required_text(start, key)?, kind)?;
-            verify_bound(&r, args, cid)?;
-            let cached_raw = r.value.get("cachedRaw").cloned();
-            (
-                r.research_id,
-                required_text(&r.value, "productRef")?.to_owned(),
-                required_text(&r.value, "sku")?.to_owned(),
-                r.value
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned(),
-                required_text(&r.value, "sourceUrl")?.to_owned(),
-                cached_raw,
-            )
+            ("cursor", "review_cursor")
         };
+        let reference = required_text(start, key)?;
+        let store = locked_store(inner)?;
+        let r = store.get_ref(reference, kind)?;
+        verify_bound(&r, args, cid)?;
+        if kind == "review_cursor"
+            && !r.value.as_object().is_some_and(|value| {
+                value.contains_key("seenRef")
+                    && value.contains_key("noProgressPages")
+                    && value.contains_key("pageMadeProgress")
+            })
+        {
+            return Err(anyhow!(
+                "INVALID_REFERENCE: review cursor predates cumulative coverage; restart reviews from productRef"
+            ));
+        }
+        let cached_raw = r.value.get("cachedRaw").cloned();
+        let prior_seen_ref = if kind == "review_cursor" {
+            r.value
+                .get("seenRef")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        let prior_no_progress_pages = if kind == "review_cursor" {
+            r.value
+                .get("noProgressPages")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value < marketplace::MAX_REVIEW_NO_PROGRESS_PAGES)
+                .ok_or_else(|| anyhow!("INVALID_REFERENCE: invalid review cursor progress"))?
+        } else {
+            0
+        };
+        let prior_page_made_progress = if kind == "review_cursor" {
+            r.value
+                .get("pageMadeProgress")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("INVALID_REFERENCE: invalid review cursor progress"))?
+        } else {
+            false
+        };
+        let loaded_seen = load_review_seen(
+            &store,
+            prior_seen_ref.as_deref(),
+            &r.research_id,
+            cid,
+            cancel,
+            deadline,
+        )?;
+        debug_assert!(loaded_seen.nodes_read <= marketplace::REVIEW_SEEN_CHECKPOINT_INTERVAL);
+        (
+            r.research_id,
+            required_text(&r.value, "productRef")?.to_owned(),
+            required_text(&r.value, "sku")?.to_owned(),
+            r.value
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            required_text(&r.value, "sourceUrl")?.to_owned(),
+            cached_raw,
+            loaded_seen.keys,
+            prior_seen_ref,
+            loaded_seen.depth,
+            prior_no_progress_pages,
+            prior_page_made_progress,
+        )
+    };
     let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
     let fetched_live = cached_raw.is_none();
     let raw_result = match cached_raw {
@@ -650,6 +756,12 @@ async fn reviews(
                 sku: &sku,
                 source_url: &source,
                 limit,
+                prior_seen_review_keys: &prior_seen_review_keys,
+                prior_seen_ref: prior_seen_ref.as_deref(),
+                prior_seen_depth,
+                current_path: &path,
+                prior_no_progress_pages,
+                prior_page_made_progress,
             },
         )?
     };
@@ -710,6 +822,7 @@ async fn get_images(
     let mut blocks = vec![];
     let mut evidence_values = vec![];
     let mut wire_bytes = 0usize;
+    let mut image_content_observed = false;
     for (image_ref, binding) in bindings {
         if binding.value.get("bindingError").is_some() {
             results.push(image_error(
@@ -756,6 +869,7 @@ async fn get_images(
                     continue;
                 }
                 wire_bytes += approx;
+                image_content_observed = true;
                 let ev_id = format!("evidence_{}", Uuid::new_v4());
                 let observed = &image.retrieved_at;
                 let mut ev = evidence::observed_evidence(
@@ -795,7 +909,9 @@ async fn get_images(
         }
         tokio::task::yield_now().await;
     }
-    if let Err(error) = confirm_context(inner, cancel, deadline, cid).await {
+    if let Err(error) =
+        confirm_context_after_images(inner, cancel, deadline, cid, image_content_observed).await
+    {
         if error_code(&error) == "CANCELLED" {
             record_cancelled(inner, &rid)?;
         }
@@ -886,6 +1002,30 @@ async fn confirm_context(
     expected: &str,
 ) -> Result<()> {
     let current = observe_context(inner, cancel, deadline).await?;
+    if required_text(&current, "contextId")? != expected {
+        return Err(anyhow!(
+            "CONTEXT_CHANGED: marketplace context changed during the operation"
+        ));
+    }
+    Ok(())
+}
+async fn confirm_context_after_images(
+    inner: &Inner,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    expected: &str,
+    image_content_observed: bool,
+) -> Result<()> {
+    let raw = gateway_call(inner, cancel, deadline, move |gateway, token| {
+        Box::pin(async move {
+            if image_content_observed {
+                gateway.mark_image_content_available();
+            }
+            gateway.context(token).await
+        })
+    })
+    .await?;
+    let current = bind_context(inner, &raw)?;
     if required_text(&current, "contextId")? != expected {
         return Err(anyhow!(
             "CONTEXT_CHANGED: marketplace context changed during the operation"
@@ -1194,6 +1334,149 @@ fn research_arg_fallback(_name: &str) -> Option<&str> {
     None
 }
 
+#[derive(Debug)]
+struct LoadedReviewSeen {
+    keys: Vec<String>,
+    depth: usize,
+    nodes_read: usize,
+}
+
+fn load_review_seen(
+    store: &Store,
+    seen_ref: Option<&str>,
+    research_id: &str,
+    context_id: &str,
+    cancel: &CancellationToken,
+    deadline: Instant,
+) -> Result<LoadedReviewSeen> {
+    let mut current = seen_ref.map(str::to_owned);
+    let mut visited = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    let mut expected_count = None;
+    let mut expected_depth = None;
+    let mut head_depth = 0usize;
+    let mut nodes_read = 0usize;
+    while let Some(reference) = current {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("CANCELLED: request cancelled"));
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "UPSTREAM_TIMEOUT: review coverage deadline expired"
+            ));
+        }
+        if !visited.insert(reference.clone())
+            || visited.len() > marketplace::REVIEW_SEEN_CHECKPOINT_INTERVAL
+        {
+            return Err(anyhow!("SOURCE_CHANGED: invalid review coverage chain"));
+        }
+        let node = store
+            .get_ref(&reference, "review_seen")
+            .map_err(|_| anyhow!("SOURCE_CHANGED: review coverage state is unavailable"))?;
+        nodes_read += 1;
+        if node.research_id != research_id || node.context_id != context_id {
+            return Err(anyhow!("SOURCE_CHANGED: invalid review coverage binding"));
+        }
+        let count = node
+            .value
+            .get("count")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("SOURCE_CHANGED: invalid review coverage count"))?;
+        expected_count.get_or_insert(count);
+        let depth = node
+            .value
+            .get("depth")
+            .and_then(Value::as_u64)
+            .and_then(|depth| usize::try_from(depth).ok())
+            .ok_or_else(|| anyhow!("SOURCE_CHANGED: invalid review coverage depth"))?;
+        if nodes_read == 1 {
+            head_depth = depth;
+        }
+        if expected_depth.is_some_and(|expected| expected != depth) {
+            return Err(anyhow!("SOURCE_CHANGED: invalid review coverage depth"));
+        }
+        let checkpoint = node.value.get("kind").and_then(Value::as_str) == Some("checkpoint");
+        let node_keys = node
+            .value
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("SOURCE_CHANGED: invalid review coverage state"))?;
+        if node_keys.is_empty()
+            || node_keys.len()
+                > if checkpoint {
+                    marketplace::MAX_SEEN_REVIEWS
+                } else {
+                    30
+                }
+            || checkpoint
+                && serde_json::to_vec(&node.value)?.len()
+                    > marketplace::MAX_REVIEW_SEEN_CHECKPOINT_BYTES
+        {
+            return Err(anyhow!("SOURCE_CHANGED: invalid review coverage chunk"));
+        }
+        for key in node_keys {
+            let key = key
+                .as_str()
+                .filter(|key| valid_review_identity(key))
+                .ok_or_else(|| anyhow!("SOURCE_CHANGED: invalid review coverage identity"))?;
+            keys.insert(key.to_owned());
+        }
+        if keys.len() > marketplace::MAX_SEEN_REVIEWS {
+            return Err(anyhow!("SOURCE_CHANGED: review coverage exceeds its bound"));
+        }
+        if checkpoint {
+            if depth != 0
+                || node
+                    .value
+                    .get("parent")
+                    .is_some_and(|value| !value.is_null())
+            {
+                return Err(anyhow!(
+                    "SOURCE_CHANGED: invalid review coverage checkpoint"
+                ));
+            }
+            current = None;
+        } else if node.value.get("kind").and_then(Value::as_str) == Some("delta")
+            && (1..marketplace::REVIEW_SEEN_CHECKPOINT_INTERVAL).contains(&depth)
+        {
+            current = node
+                .value
+                .get("parent")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            expected_depth = Some(depth - 1);
+            if current.is_none() && depth != 1 {
+                return Err(anyhow!("SOURCE_CHANGED: truncated review coverage chain"));
+            }
+        } else {
+            return Err(anyhow!("SOURCE_CHANGED: invalid review coverage node"));
+        }
+    }
+    if expected_count != Some(keys.len() as u64) && expected_count.is_some() {
+        return Err(anyhow!(
+            "SOURCE_CHANGED: inconsistent review coverage state"
+        ));
+    }
+    Ok(LoadedReviewSeen {
+        keys: keys.into_iter().collect(),
+        depth: head_depth,
+        nodes_read,
+    })
+}
+
+fn valid_review_identity(key: &str) -> bool {
+    if let Some(hash) = key.strip_prefix("id:") {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    } else if let Some(id) = key.strip_prefix("anonymous:") {
+        Uuid::parse_str(id).is_ok()
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,6 +1511,8 @@ mod tests {
             searches: searches.into(),
             products: products.into(),
             reviews: std::collections::VecDeque::new(),
+            image_content_observed: false,
+            context_signature: None,
         }));
         (temp, service)
     }
@@ -1350,6 +1635,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_image_observation_updates_context_capability() {
+        let source_context = fake_context("same");
+        let (_temp, service) = scripted_service(
+            vec![
+                source_context.clone(),
+                source_context.clone(),
+                fake_context("changed"),
+            ],
+            vec![],
+            vec![],
+        )
+        .await;
+        let bound_context = bind_context(&service.inner, &source_context).unwrap();
+        confirm_context_after_images(
+            &service.inner,
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(1),
+            bound_context["contextId"].as_str().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let reply = service
+            .call("ozon_get_context", json!({}), CancellationToken::new())
+            .await;
+        assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+        let capabilities = reply.structured.unwrap()["data"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(capabilities.iter().any(|capability| {
+            capability["name"] == "image_content" && capability["status"] == "available"
+        }));
+
+        let changed = service
+            .call("ozon_get_context", json!({}), CancellationToken::new())
+            .await;
+        assert!(!changed.error, "{}", changed.text.unwrap_or_default());
+        let capabilities = changed.structured.unwrap()["data"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(capabilities.iter().any(|capability| {
+            capability["name"] == "image_content" && capability["status"] == "unverified"
+        }));
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn scripted_context_change_rejects_search_before_recording_success() {
         let raw =
             json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[],"hasNext":false});
@@ -1452,10 +1787,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn product_batch_reports_invalid_reference_per_item_and_keeps_valid_sku() {
+        let context = fake_context("same");
+        let (_temp, service) = scripted_service(
+            vec![context.clone(), context],
+            vec![],
+            vec![FakeAction::Value(product_fixture("2"))],
+        )
+        .await;
+        let reply = service
+            .call(
+                "ozon_get_products",
+                json!({"products":[{"productRef":"ref_missing"},{"sku":"2"}]}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+        let value = reply.structured.unwrap();
+        assert_eq!(
+            value["data"]["results"][0]["error"]["code"],
+            "INVALID_REFERENCE"
+        );
+        assert_eq!(value["data"]["results"][1]["status"], "ok");
+        contracts::validate_output("ozon_get_products", &value).unwrap();
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_review_cursor_requires_restart_instead_of_resetting_coverage() {
+        let source_context = fake_context("same");
+        let (_temp, service) = scripted_service(vec![source_context.clone()], vec![], vec![]).await;
+        let bound_context = bind_context(&service.inner, &source_context).unwrap();
+        let (research_id, cursor) = {
+            let mut store = locked_store(&service.inner).unwrap();
+            let research_id = store
+                .create_research("legacy reviews", &bound_context)
+                .unwrap();
+            let cursor = store
+                .put_ref(
+                    &research_id,
+                    "review_cursor",
+                    &json!({"path":"/product/item-123/reviews/?page=2","productRef":"ref_product","sku":"123","sourceUrl":"https://www.ozon.ru/product/item-123/reviews/"}),
+                    Some(1800),
+                )
+                .unwrap();
+            (research_id, cursor)
+        };
+        let reply = service
+            .call(
+                "ozon_get_reviews",
+                json!({"start":{"cursor":cursor},"researchId":research_id,"limit":10}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(reply.error);
+        assert_eq!(failure_code(&reply), "INVALID_REFERENCE");
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn review_handler_drains_cached_source_page_before_upstream_continuation() {
         let source_context = fake_context("same");
         let (_temp, service) = scripted_service(
             vec![
+                source_context.clone(),
+                source_context.clone(),
+                source_context.clone(),
                 source_context.clone(),
                 source_context.clone(),
                 source_context.clone(),
@@ -1481,22 +1878,36 @@ mod tests {
         };
         let source_reviews = (0..30)
             .map(|index| {
-                json!({"reviewId":format!("r{index}"),"score":5.0,"comment":format!("review-{index}"),"pros":null,"cons":null,"date":null,"purchased":null,"variantLabel":null,"photos":[]})
+                let review_id = if index == 1 {
+                    Value::Null
+                } else if index == 3 {
+                    json!("r0")
+                } else {
+                    json!(format!("r{index}"))
+                };
+                json!({"reviewId":review_id,"score":5.0,"comment":format!("review-{index}"),"pros":null,"cons":null,"date":null,"purchased":null,"variantLabel":null,"photos":[]})
             })
             .collect::<Vec<_>>();
-        let raw = json!({"rating":5.0,"totalReviews":30,"reviews":source_reviews,"nextPath":null,"hasNext":false,"refinements":[],"aggregationScope":"specific_sku","warnings":[]});
+        let raw = json!({"rating":5.0,"totalReviews":31,"reviews":source_reviews,"nextPath":"/product/item-123/reviews/?page=2","hasNext":true,"refinements":[],"aggregationScope":"specific_sku","warnings":[]});
+        let upstream = json!({"rating":5.0,"totalReviews":31,"reviews":[
+            {"reviewId":"r29","score":5.0,"comment":"upstream-duplicate","photos":[]},
+            {"reviewId":"r30","score":5.0,"comment":"upstream-new","photos":[]}
+        ],"nextPath":null,"hasNext":false,"refinements":[],"aggregationScope":"specific_sku","warnings":[]});
         {
             let mut gateway = service.inner.gateway.lock().await;
             let Some(GatewayBackend::Fake(gateway)) = gateway.as_mut() else {
                 panic!("scripted gateway missing")
             };
             gateway.reviews.push_back(FakeAction::Value(raw));
+            gateway.reviews.push_back(FakeAction::Value(upstream));
         }
 
         let mut start = json!({"productRef":product_ref});
         let mut emitted = vec![];
+        let mut unique_seen = vec![];
         let mut observed_at = None;
-        for limit in [3, 5, 30] {
+        let mut first_cursor = None;
+        for limit in [3, 5, 30, 30] {
             let reply = service
                 .call(
                     "ozon_get_reviews",
@@ -1507,10 +1918,12 @@ mod tests {
             assert!(!reply.error, "{}", reply.text.unwrap_or_default());
             let value = reply.structured.unwrap();
             contracts::validate_output("ozon_get_reviews", &value).unwrap();
-            assert_eq!(
-                observed_at.get_or_insert(value["observedAt"].clone()),
-                &value["observedAt"]
-            );
+            if unique_seen.len() < 3 {
+                assert_eq!(
+                    observed_at.get_or_insert(value["observedAt"].clone()),
+                    &value["observedAt"]
+                );
+            }
             emitted.extend(
                 value["data"]["reviews"]
                     .as_array()
@@ -1518,17 +1931,135 @@ mod tests {
                     .iter()
                     .map(|review| review["text"].as_str().unwrap().to_owned()),
             );
+            unique_seen.push(value["data"]["coverage"]["uniqueSeen"].as_u64().unwrap());
             match value["data"]["nextCursor"].as_str() {
-                Some(cursor) => start = json!({"cursor":cursor}),
+                Some(cursor) => {
+                    if first_cursor.is_none() {
+                        first_cursor = Some(cursor.to_owned());
+                    }
+                    start = json!({"cursor":cursor});
+                }
                 None => break,
             }
         }
         assert_eq!(
             emitted,
             (0..30)
+                .filter(|index| *index != 3)
                 .map(|index| format!("review-{index}"))
+                .chain(["upstream-new".into()])
                 .collect::<Vec<_>>()
         );
+        assert_eq!(unique_seen, vec![3, 8, 29, 30]);
+
+        let replay = service
+            .call(
+                "ozon_get_reviews",
+                json!({"start":{"cursor":first_cursor.unwrap()},"researchId":rid,"limit":5}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!replay.error, "{}", replay.text.unwrap_or_default());
+        let replay = replay.structured.unwrap();
+        assert_eq!(replay["data"]["coverage"]["uniqueSeen"], 8);
+        assert_eq!(
+            replay["data"]["reviews"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|review| review["text"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["review-4", "review-5", "review-6", "review-7", "review-8"]
+        );
         service.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn review_seen_checkpoint_bounds_loader_and_honors_cancellation() {
+        let temp = tempfile::Builder::new()
+            .prefix("service-review-seen-")
+            .tempdir()
+            .unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let context = json!({"contextId":"c","regionLabel":null,"regionVerification":"unverified","accountState":"unknown","accessState":"unknown"});
+        let research_id = store.create_research("late reviews", &context).unwrap();
+        let checkpoint_keys = (0..100)
+            .map(|index| format!("id:{index:064x}"))
+            .collect::<Vec<_>>();
+        let mut head = store
+            .put_ref(
+                &research_id,
+                "review_seen",
+                &json!({"kind":"checkpoint","keys":checkpoint_keys,"count":100,"depth":0}),
+                None,
+            )
+            .unwrap();
+        for offset in 0..255usize {
+            let key = format!("id:{:064x}", offset + 100);
+            head = store
+                .put_ref(
+                    &research_id,
+                    "review_seen",
+                    &json!({"kind":"delta","parent":head,"keys":[key],"count":101+offset,"depth":offset+1}),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let loaded = load_review_seen(
+            &store,
+            Some(&head),
+            &research_id,
+            "c",
+            &CancellationToken::new(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(loaded.keys.len(), 355);
+        assert_eq!(loaded.depth, 255);
+        assert_eq!(loaded.nodes_read, 256);
+        eprintln!(
+            "review_seen_load nodes={} elapsed_ms={}",
+            loaded.nodes_read,
+            started.elapsed().as_millis()
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            error_code(
+                &load_review_seen(
+                    &store,
+                    Some(&head),
+                    &research_id,
+                    "c",
+                    &cancelled,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap_err()
+            ),
+            "CANCELLED"
+        );
+        assert_eq!(
+            error_code(
+                &load_review_seen(
+                    &store,
+                    Some(&head),
+                    &research_id,
+                    "c",
+                    &CancellationToken::new(),
+                    Instant::now(),
+                )
+                .unwrap_err()
+            ),
+            "UPSTREAM_TIMEOUT"
+        );
     }
 }

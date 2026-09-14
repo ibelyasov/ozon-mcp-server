@@ -156,6 +156,21 @@ fn reviews_preserves_variant_specific_unknowns() {
 }
 
 #[test]
+fn reviews_uses_the_review_widget_product_score_for_the_aggregate() {
+    let page = json!({
+        "widgetStates": {
+            "webListReviews-0": {
+                "productScore": 4.8,
+                "reviews": [{"content": {"score": 5}}]
+            }
+        }
+    });
+
+    let parsed = parse_reviews(&page, 10);
+    assert_eq!(parsed["rating"], 4.8);
+}
+
+#[test]
 fn reviews_exposes_only_safe_observed_identity_photos_and_continuation() {
     let page = json!({"widgetStates": {"webListReviews-a": {
         "requestedPath": "/product/example-901/reviews/",
@@ -227,6 +242,21 @@ fn description_falls_back_from_malformed_json_and_deduplicates_images() {
         json!({
             "text": "Fresh & clean", "images": ["https://www.ozon.ru/same.jpg"]
         })
+    );
+}
+
+#[test]
+fn description_extracts_observed_rich_title_and_text_content_arrays() {
+    let page = json!({"widgetStates": {"webDescription-0": {
+        "richAnnotationJson": {"content": [{"blocks": [{
+            "title": {"content": ["Комфорт, скорость, яркость"]},
+            "text": {"content": ["Яркая беспроводная мышка.", "", "Бесшумные клавиши."]}
+        }]}]}
+    }}});
+
+    assert_eq!(
+        parse_description(&page)["text"],
+        "Комфорт, скорость, яркость Яркая беспроводная мышка. Бесшумные клавиши."
     );
 }
 

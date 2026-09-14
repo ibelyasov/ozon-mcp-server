@@ -40,6 +40,12 @@ pub struct BrowserSession {
 }
 
 #[derive(Debug)]
+pub(crate) enum RunningCommandOutcome {
+    Completed(Value),
+    AlreadyClosed,
+}
+
+#[derive(Debug)]
 enum SessionState {
     Idle,
     Acquiring,
@@ -295,6 +301,57 @@ impl BrowserSession {
             )
             .await?["result"]
             .clone())
+    }
+
+    async fn raw_if_running(
+        &mut self,
+        args: &[&str],
+        script: Option<&str>,
+        deadline: Duration,
+    ) -> Result<RunningCommandOutcome> {
+        let captured_cdp = match &self.state {
+            SessionState::Idle => return Ok(RunningCommandOutcome::AlreadyClosed),
+            SessionState::Running { cdp } => cdp.clone(),
+            SessionState::Acquiring | SessionState::Poisoned => {
+                return Err(BrowserError::SessionPoisoned.into());
+            }
+        };
+        let cleanup = CancellationToken::new();
+        match self
+            .raw(args, script, &cleanup, deadline.min(Duration::from_secs(5)))
+            .await
+        {
+            Ok(value) => Ok(RunningCommandOutcome::Completed(value)),
+            Err(error) => {
+                if matches!(self.state, SessionState::Running { .. }) {
+                    self.confirm_close(Some(&captured_cdp)).await?;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn run_if_running(
+        &mut self,
+        args: &[&str],
+        deadline: Duration,
+    ) -> Result<RunningCommandOutcome> {
+        self.raw_if_running(args, None, deadline).await
+    }
+
+    pub(crate) async fn evaluate_if_running(
+        &mut self,
+        script: &str,
+        deadline: Duration,
+    ) -> Result<RunningCommandOutcome> {
+        self.raw_if_running(&["eval", "--stdin"], Some(script), deadline)
+            .await
+            .map(|outcome| match outcome {
+                RunningCommandOutcome::Completed(value) => {
+                    RunningCommandOutcome::Completed(value["result"].clone())
+                }
+                RunningCommandOutcome::AlreadyClosed => RunningCommandOutcome::AlreadyClosed,
+            })
     }
 
     async fn read_cdp(&mut self, cancel: &CancellationToken) -> Result<String> {
@@ -743,6 +800,92 @@ mod tests {
 
     fn profile_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
         PROFILE_TEST_LOCK.blocking_lock()
+    }
+
+    fn test_session(root: &tempfile::TempDir, state: SessionState) -> BrowserSession {
+        let profile = root.path().join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let profile_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.join(".ozon-mcp.lock"))
+            .unwrap();
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("config.json"), "{}").unwrap();
+        BrowserSession {
+            binary: root.path().join("missing-agent-browser"),
+            profile,
+            executable: None,
+            headed: false,
+            runtime,
+            _profile_lock: profile_lock,
+            user_agent: Some("test".to_owned()),
+            state,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_command_never_invokes_the_driver_from_idle_or_poisoned() {
+        let root = tempfile::tempdir().unwrap();
+        let mut idle = test_session(&root, SessionState::Idle);
+        assert!(matches!(
+            idle.run_if_running(&["open", "https://www.ozon.ru/"], Duration::from_secs(1))
+                .await
+                .unwrap(),
+            RunningCommandOutcome::AlreadyClosed
+        ));
+        assert!(!idle.marker_path().exists());
+
+        idle.state = SessionState::Poisoned;
+        let error = idle
+            .run_if_running(&["open", "https://www.ozon.ru/"], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<BrowserError>(),
+            Some(BrowserError::SessionPoisoned)
+        ));
+        assert!(!idle.marker_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_restore_command_closes_only_the_captured_browser() {
+        let _guard = PROFILE_TEST_LOCK.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "ws://{}/devtools/browser/test-restore",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let message = futures_util::StreamExt::next(&mut websocket)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(message.to_text().unwrap().contains("Browser.close"));
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(
+            &root,
+            SessionState::Running {
+                cdp: endpoint.clone(),
+            },
+        );
+        session.mark_owned().unwrap();
+        session.update_marker(Some(&endpoint)).unwrap();
+
+        session
+            .run_if_running(&["open", "https://www.ozon.ru/"], Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
     }
 
     #[cfg(unix)]

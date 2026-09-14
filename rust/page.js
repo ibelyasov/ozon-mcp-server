@@ -233,6 +233,12 @@ function parseOptions(value) {
         return { mode: "widgets" };
     if (value.mode === "context")
         return { mode: "context" };
+    if (value.mode === "contextModal")
+        return { mode: "contextModal" };
+    if (value.mode === "navigation" &&
+        (value.target === "home" || value.target === "addressBook")) {
+        return { mode: "navigation", target: value.target };
+    }
     if (value.mode === "fetch" && typeof value.path === "string") {
         return { mode: "fetch", path: value.path };
     }
@@ -287,6 +293,49 @@ async function ozonPage(rawOptions) {
     const options = parseOptions(rawOptions);
     if (options === null)
         return { error: "INVALID_OPTIONS" };
+    if (options.mode === "navigation") {
+        const current = new URL(location.href);
+        const responseQuery = current.search === "" || /^\?__rr=[0-9]{1,16}$/.test(current.search);
+        const expectedPath = options.target === "home" ? "/" : "/modal/addressbook";
+        const routeValid = current.origin === "https://www.ozon.ru" &&
+            current.protocol === "https:" && current.username === "" && current.password === "" &&
+            current.port === "" && current.pathname === expectedPath && responseQuery &&
+            current.hash === "";
+        const navigation = performance.getEntriesByType("navigation")[0];
+        const status = navigation !== undefined && Number.isSafeInteger(navigation.responseStatus) &&
+            navigation.responseStatus >= 0 ? navigation.responseStatus : null;
+        return { page: { widgetStates: {}, navigationProbe: { routeValid, status } } };
+    }
+    if (options.mode === "contextModal") {
+        const raw = document.querySelector('[id^="state-commonAddressBook-"][data-state]')
+            ?.getAttribute("data-state");
+        let selectedRegionLabel = null;
+        try {
+            const value = raw === undefined || raw === null ? null : JSON.parse(raw);
+            if (isRecord(value) && Array.isArray(value.addresses)) {
+                const selected = records(value.addresses)
+                    .filter((address) => address.isSelected === true);
+                const selectedAddress = selected.length === 1 ? selected[0] : undefined;
+                const label = selectedAddress !== undefined && Array.isArray(selectedAddress.elements) &&
+                    isRecord(selectedAddress.elements[0]) &&
+                    typeof selectedAddress.elements[0].text === "string"
+                    ? selectedAddress.elements[0].text : "";
+                const comma = label.indexOf(",");
+                const city = comma > 0
+                    ? label.slice(0, comma).split(/\s+/u).filter(Boolean).join(" ") : "";
+                selectedRegionLabel = city.length <= 100 && /\p{L}/u.test(city) &&
+                    /^[\p{L} -]+$/u.test(city) &&
+                    !/(?:адрес|улиц|дом|квартир|подъезд|этаж|достав|пункт|выдач|укажите|сегодня|завтра|послезавтра)/iu.test(city)
+                    ? city : null;
+            }
+        }
+        catch {
+        }
+        return { page: {
+                widgetStates: {},
+                regionProbe: { addressBookModalAvailable: false, selectedRegionLabel },
+            } };
+    }
     if (options.mode === "context") {
         const visible = (element) => {
             if (!(element instanceof HTMLElement))
@@ -308,12 +357,28 @@ async function ozonPage(rawOptions) {
             }
         };
         const address = state("addressBookBarWeb");
+        const modalLink = isRecord(address?.customCell) && isRecord(address.customCell.action) &&
+            typeof address.customCell.action.link === "string"
+            ? address.customCell.action.link : null;
+        let addressBookModalAvailable = false;
+        if (modalLink !== null) {
+            try {
+                const target = new URL(modalLink, location.origin);
+                const observedShellFlag = target.search === "?set_sm=1";
+                addressBookModalAvailable = target.origin === location.origin &&
+                    target.protocol === "https:" && target.username === "" && target.password === "" &&
+                    target.port === "" && target.pathname === "/modal/addressbook" &&
+                    (target.search === "" || observedShellFlag) && target.hash === "";
+            }
+            catch {
+            }
+        }
         const cityValue = address?.customCell;
         const city = isRecord(cityValue) && Array.isArray(cityValue.cells) &&
             isRecord(cityValue.cells[0]) && isRecord(cityValue.cells[0].button) &&
             typeof cityValue.cells[0].button.text === "string"
             ? cityValue.cells[0].button.text.split(/\s+/u).filter(Boolean).join(" ") : "";
-        const regionLabel = city.length <= 100 && /^[\p{L} -]+$/u.test(city) &&
+        const anonymousRegionLabel = city.length <= 100 && /^[\p{L} -]+$/u.test(city) &&
             !/(?:адрес|улиц|дом|квартир|подъезд|этаж|достав|укажите)/iu.test(city)
             ? city : null;
         const anonymous = document.querySelector('[id^="state-profileMenuAnonymous-"][data-state]') !== null ||
@@ -327,6 +392,7 @@ async function ozonPage(rawOptions) {
                 sourceWidgetNames.has(name);
         });
         const accountState = anonymous ? "anonymous" : authenticated ? "authenticated" : "unknown";
+        const regionLabel = accountState === "anonymous" ? anonymousRegionLabel : null;
         const indicatorText = regionLabel !== null || accountState !== "unknown"
             ? `${accountState}\n${regionLabel ?? ""}` : "";
         let signature = null;
@@ -338,16 +404,20 @@ async function ozonPage(rawOptions) {
             catch {
             }
         }
-        return { page: {
-                widgetStates: {},
-                contextObservation: {
-                    regionLabel,
-                    regionVerified: regionLabel !== null,
-                    accountState,
-                    accessState: anonymous || authenticated || publicState ? "available" : "unknown",
-                    signature,
-                },
-            } };
+        const page = {
+            widgetStates: {},
+            contextObservation: {
+                regionLabel,
+                regionVerified: regionLabel !== null,
+                accountState,
+                accessState: anonymous || authenticated || publicState ? "available" : "unknown",
+                signature,
+            },
+        };
+        if (accountState === "authenticated" && addressBookModalAvailable) {
+            page.regionProbe = { addressBookModalAvailable: true, selectedRegionLabel: null };
+        }
+        return { page };
     }
     if (options.mode === "widgets") {
         const widgetStates = Object.create(null);
