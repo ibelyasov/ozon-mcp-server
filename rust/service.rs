@@ -2303,16 +2303,12 @@ mod tests {
             .collect();
         let (_temp, service) =
             scripted_service(vec![context.clone(), context], vec![], products).await;
-        match service.inner.gateway.lock().await.as_mut().unwrap() {
-            GatewayBackend::Fake(gateway) => gateway.context_delay = Duration::from_millis(10),
-            GatewayBackend::Real(_) => unreachable!(),
-        }
         let reply = execute(
             service.inner.clone(),
             "ozon_get_products",
             json!({"products": (1..=8).map(|sku| json!({"sku":sku.to_string()})).collect::<Vec<_>>() }),
             CancellationToken::new(),
-            Instant::now() + Duration::from_millis(65),
+            Instant::now() + Duration::from_secs(30),
         )
         .await;
         assert!(!reply.error, "{}", reply.text.unwrap_or_default());
@@ -2327,6 +2323,13 @@ mod tests {
             8,
             "{value}"
         );
+        match service.inner.gateway.lock().await.as_ref().unwrap() {
+            GatewayBackend::Fake(gateway) => assert!(
+                gateway.contexts.is_empty(),
+                "the initial observation and one post-fetch confirmation must consume both scripted contexts"
+            ),
+            GatewayBackend::Real(_) => unreachable!(),
+        }
         contracts::validate_output("ozon_get_products", &value).unwrap();
         service.shutdown().await.unwrap();
     }
