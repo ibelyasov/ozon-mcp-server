@@ -1,0 +1,10 @@
+{
+  "schema": "schemas/ozon_search.output.schema.json",
+  "baseExample": "examples/positive/ozon_search_delta.json",
+  "target": "output",
+  "mutation": {
+    "path": "data.items.0.prices",
+    "value": null
+  },
+  "expectedInvalidAt": "schema"
+}

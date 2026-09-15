@@ -98,7 +98,8 @@ def pair_errors(case: dict[str, Any]) -> list[str]:
     if len(inputs) != len(results):
         errors.append("product result count differs from selector count")
         return errors
-    requested = set(case["input"].get("include", ["characteristics", "offers"]))
+    default_sections = ["characteristics", "offers"] if case["input"].get("view", "compact") == "full" else ["characteristics"]
+    requested = set(case["input"].get("include", default_sections))
     section_names = {"characteristics", "description", "variants", "offers", "images"}
     for index, (selector, result) in enumerate(zip(inputs, results)):
         if result["requested"] != selector:

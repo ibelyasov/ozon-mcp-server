@@ -1,0 +1,92 @@
+{
+  "inputSchema": "schemas/ozon_search.input.schema.json",
+  "outputSchema": "schemas/ozon_search.output.schema.json",
+  "input": {
+    "start": {
+      "query": "беспроводные наушники",
+      "priceRange": {
+        "maxMinor": 1000000
+      }
+    },
+    "limit": 12,
+    "includeFacets": false,
+    "view": "compact",
+    "repeatMode": "delta"
+  },
+  "output": {
+    "schemaVersion": "1",
+    "researchId": "research-01",
+    "data": {
+      "items": [
+        {
+          "productRef": "product-123",
+          "sku": "123",
+          "availability": "unknown",
+          "prices": [
+            {
+              "amountMinor": 62700,
+              "currency": "RUB",
+              "type": "ozon_card",
+              "condition": "с Ozon Картой"
+            },
+            {
+              "amountMinor": 64000,
+              "currency": "RUB",
+              "type": "regular",
+              "condition": null
+            }
+          ],
+          "matchesDisplayedPriceRange": true,
+          "evidenceRefs": [
+            "ev-search"
+          ],
+          "novelty": {
+            "status": "unchanged",
+            "previousProductRef": "product-previous",
+            "changedFields": []
+          },
+          "representation": "delta",
+          "baselineProductRef": "product-previous"
+        }
+      ],
+      "refinements": [],
+      "refinementsIncluded": false,
+      "refinementsTruncated": false,
+      "nextCursor": "cursor-search-2",
+      "hasNext": true,
+      "priceRangeAssessment": {
+        "basis": "displayed_search_price",
+        "sourceFilterGuaranteesMatch": false
+      },
+      "coverage": {
+        "returned": 1,
+        "uniqueSeen": 1,
+        "total": null,
+        "snapshotGuaranteed": false,
+        "completeness": "partial"
+      },
+      "refinementsNextCursor": null,
+      "refinementsTotal": 0,
+      "refinementsSourceTruncated": false
+    },
+    "context": {
+      "contextId": "ctx-01",
+      "regionLabel": null,
+      "regionVerification": "unverified",
+      "accountState": "unknown",
+      "accessState": "available"
+    },
+    "observedAt": "2026-09-13T09:01:00Z",
+    "evidence": [],
+    "warnings": [
+      {
+        "code": "REGION_UNVERIFIED",
+        "message": "Price and delivery context may depend on region.",
+        "evidenceRefs": []
+      }
+    ],
+    "view": "compact",
+    "evidenceDetail": "journal",
+    "repeatMode": "delta"
+  }
+}

@@ -6,6 +6,8 @@
   "properties": {
     "schemaVersion": {"const": "1"},
     "researchId": {"$ref": "#/$defs/opaque"},
+    "view": {"enum": ["compact", "comparison", "full"]},
+    "evidenceDetail": {"enum": ["journal", "inline"]},
     "data": {
       "type": "object",
       "required": ["subjectSku", "aggregationScope", "aggregate", "reviews", "refinements", "refinementsIncluded", "refinementsTruncated", "coverage", "nextCursor", "hasNext"],
@@ -29,11 +31,17 @@
     "warnings": {"type": "array", "maxItems": 30, "items": {"$ref": "#/$defs/warning"}}
   },
   "additionalProperties": false,
+  "allOf": [
+    {"if": {"required": ["view"]}, "then": {"required": ["view", "evidenceDetail"]}},
+    {"if": {"properties": {"view": {"enum": ["compact", "comparison"]}}, "required": ["view"]}, "then": {"properties": {"evidenceDetail": {"const": "journal"}, "evidence": {"maxItems": 0}}}},
+    {"if": {"properties": {"view": {"const": "full"}}, "required": ["view"]}, "then": {"properties": {"evidenceDetail": {"const": "inline"}, "data": {"properties": {"reviews": {"items": {"required": ["variantLabel", "purchaseVerified", "imageRefs"]}}}}}}},
+    {"if": {"not": {"required": ["view"]}}, "then": {"properties": {"data": {"properties": {"reviews": {"items": {"required": ["variantLabel", "purchaseVerified", "imageRefs"]}}}}}}}
+  ],
   "$defs": {
     "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
     "timestamp": {"type": "string", "format": "date-time"},
     "evidenceRefs": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}},
-    "review": {"type": "object", "required": ["reviewRef", "rating", "publishedAt", "text", "variantLabel", "purchaseVerified", "imageRefs", "evidenceRefs"], "properties": {"reviewRef": {"$ref": "#/$defs/opaque"}, "rating": {"type": ["integer", "null"], "minimum": 1, "maximum": 5}, "publishedAt": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]}, "text": {"type": ["string", "null"], "maxLength": 12000}, "variantLabel": {"type": ["string", "null"], "maxLength": 1000}, "purchaseVerified": {"type": ["boolean", "null"]}, "imageRefs": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false},
+    "review": {"type": "object", "required": ["reviewRef", "rating", "publishedAt", "text", "variantLabel", "purchaseVerified", "evidenceRefs"], "properties": {"reviewRef": {"$ref": "#/$defs/opaque"}, "rating": {"type": ["integer", "null"], "minimum": 1, "maximum": 5}, "publishedAt": {"oneOf": [{"$ref": "#/$defs/timestamp"}, {"type": "null"}]}, "text": {"type": ["string", "null"], "maxLength": 12000}, "variantLabel": {"type": ["string", "null"], "maxLength": 1000}, "purchaseVerified": {"type": ["boolean", "null"]}, "imageRefs": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false},
     "refinement": {"type": "object", "required": ["kind", "label", "groupLabel", "selected", "reviewSearchRef"], "properties": {"kind": {"enum": ["filter", "sort"]}, "label": {"type": "string", "minLength": 1, "maxLength": 500}, "groupLabel": {"type": ["string", "null"], "maxLength": 500}, "selected": {"type": ["boolean", "null"]}, "reviewSearchRef": {"$ref": "#/$defs/opaque"}}, "additionalProperties": false},
     "coverage": {"type": "object", "required": ["returned", "uniqueSeen", "total", "snapshotGuaranteed", "completeness"], "properties": {"returned": {"type": "integer", "minimum": 0}, "uniqueSeen": {"type": "integer", "minimum": 0, "description": "Distinct review identities (stable source IDs are deduplicated; ID-less rows remain distinct) returned across this cursor chain, including the current response; replaying a cursor is stable and a fresh query/refinement starts a new chain."}, "total": {"type": ["integer", "null"], "minimum": 0}, "snapshotGuaranteed": {"const": false}, "completeness": {"enum": ["complete", "partial", "unknown"]}}, "additionalProperties": false},
     "context": {"type": "object", "required": ["contextId", "regionLabel", "regionVerification", "accountState", "accessState"], "properties": {"contextId": {"$ref": "#/$defs/opaque"}, "regionLabel": {"type": ["string", "null"], "maxLength": 500}, "regionVerification": {"enum": ["verified", "unverified"]}, "accountState": {"enum": ["authenticated", "anonymous", "unknown"]}, "accessState": {"enum": ["available", "blocked", "unknown"]}}, "additionalProperties": false},

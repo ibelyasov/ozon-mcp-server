@@ -6,6 +6,9 @@
   "properties": {
     "schemaVersion": {"const": "1"},
     "researchId": {"$ref": "#/$defs/opaque"},
+    "view": {"enum": ["compact", "comparison", "full"]},
+    "evidenceDetail": {"enum": ["journal", "inline"]},
+    "repeatMode": {"enum": ["full", "delta"]},
     "data": {
       "type": "object",
       "required": ["items", "refinements", "refinementsIncluded", "refinementsTruncated", "nextCursor", "hasNext", "coverage"],
@@ -14,6 +17,9 @@
         "refinements": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/refinement"}},
         "refinementsIncluded": {"type": "boolean"},
         "refinementsTruncated": {"type": "boolean"},
+        "refinementsNextCursor": {"oneOf": [{"$ref": "#/$defs/opaque"}, {"type": "null"}]},
+        "refinementsTotal": {"type": ["integer", "null"], "minimum": 0},
+        "refinementsSourceTruncated": {"type": "boolean"},
         "nextCursor": {"oneOf": [{"$ref": "#/$defs/opaque"}, {"type": "null"}]},
         "hasNext": {"type": ["boolean", "null"]},
         "priceRangeAssessment": {"type": "object", "required": ["basis", "sourceFilterGuaranteesMatch"], "properties": {"basis": {"const": "displayed_search_price"}, "sourceFilterGuaranteesMatch": {"const": false}}, "additionalProperties": false},
@@ -27,13 +33,48 @@
     "warnings": {"type": "array", "maxItems": 30, "items": {"$ref": "#/$defs/warning"}}
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {"required": ["view"]},
+      "then": {"required": ["view", "evidenceDetail", "repeatMode"]}
+    },
+    {
+      "if": {"properties": {"view": {"enum": ["compact", "comparison"]}}, "required": ["view"]},
+      "then": {"properties": {"evidenceDetail": {"const": "journal"}, "evidence": {"maxItems": 0}}}
+    },
+    {
+      "if": {"properties": {"view": {"const": "full"}}, "required": ["view"]},
+      "then": {"properties": {"evidenceDetail": {"const": "inline"}, "data": {"properties": {"items": {"items": {"if": {"not": {"required": ["representation"]}}, "then": {"required": ["title", "rating", "reviewCount", "url", "seller", "deliveryLabel", "imageRefs"]}}}}}}}
+    },
+    {
+      "if": {"properties": {"view": {"const": "comparison"}}, "required": ["view"]},
+      "then": {"properties": {"data": {"properties": {"items": {"items": {"if": {"not": {"required": ["representation"]}}, "then": {"required": ["title", "rating", "reviewCount", "url", "seller", "deliveryLabel"]}}}}}}}
+    },
+    {
+      "if": {"properties": {"view": {"const": "compact"}}, "required": ["view"]},
+      "then": {"properties": {"data": {"properties": {"items": {"items": {"if": {"not": {"required": ["representation"]}}, "then": {"required": ["title", "rating", "reviewCount"]}}}}}}}
+    },
+    {
+      "if": {"not": {"required": ["view"]}},
+      "then": {"properties": {"data": {"properties": {"items": {"items": {"required": ["title", "rating", "reviewCount", "url", "seller", "deliveryLabel", "imageRefs"]}}}}}}
+    },
+    {
+      "if": {"properties": {"repeatMode": {"const": "full"}}, "required": ["repeatMode"]},
+      "then": {"properties": {"data": {"properties": {"items": {"items": {"not": {"required": ["representation"]}}}}}}}
+    },
+    {
+      "if": {"properties": {"repeatMode": {"const": "delta"}}, "required": ["repeatMode"]},
+      "then": {"properties": {"data": {"properties": {"items": {"items": {"if": {"required": ["representation"]}, "then": {"required": ["baselineProductRef", "novelty"]}}}}}}}
+    }
+  ],
   "$defs": {
     "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
     "timestamp": {"type": "string", "format": "date-time"},
     "evidenceRefs": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}},
-    "price": {"type": "object", "required": ["amountMinor", "currency", "type", "condition", "evidenceRefs"], "properties": {"amountMinor": {"type": ["integer", "null"], "minimum": 0}, "currency": {"const": "RUB"}, "type": {"enum": ["ozon_card", "regular", "unknown"]}, "condition": {"type": ["string", "null"], "maxLength": 500}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false},
+    "price": {"type": "object", "required": ["amountMinor", "currency", "type", "condition"], "properties": {"amountMinor": {"type": ["integer", "null"], "minimum": 0}, "currency": {"const": "RUB"}, "type": {"enum": ["ozon_card", "regular", "unknown"]}, "condition": {"type": ["string", "null"], "maxLength": 500}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false},
     "seller": {"type": "object", "required": ["name", "rating", "url", "evidenceRefs"], "properties": {"name": {"type": ["string", "null"], "maxLength": 500}, "rating": {"type": ["number", "null"], "minimum": 0, "maximum": 5}, "url": {"oneOf": [{"type": "string", "format": "uri", "pattern": "^https://(?:www\\.)?ozon\\.ru/[^?#]*$", "maxLength": 2048}, {"type": "null"}]}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false},
-    "productSummary": {"type": "object", "required": ["productRef", "sku", "title", "url", "availability", "prices", "seller", "deliveryLabel", "rating", "reviewCount", "imageRefs", "evidenceRefs"], "properties": {"productRef": {"$ref": "#/$defs/opaque"}, "sku": {"type": "string", "pattern": "^[0-9]+$", "maxLength": 64}, "title": {"type": ["string", "null"], "maxLength": 1000}, "url": {"type": "string", "format": "uri", "pattern": "^https://(?:www\\.)?ozon\\.ru(?:/|$)", "maxLength": 2048}, "availability": {"enum": ["available", "unavailable", "unknown"]}, "prices": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/price"}}, "matchesDisplayedPriceRange": {"type": ["boolean", "null"]}, "seller": {"oneOf": [{"$ref": "#/$defs/seller"}, {"type": "null"}]}, "deliveryLabel": {"type": ["string", "null"], "maxLength": 1000}, "rating": {"type": ["number", "null"], "minimum": 0, "maximum": 5}, "reviewCount": {"type": ["integer", "null"], "minimum": 0}, "imageRefs": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}}, "additionalProperties": false},
+    "novelty": {"type": "object", "required": ["status", "previousProductRef", "changedFields"], "properties": {"status": {"enum": ["new", "unchanged", "changed"]}, "previousProductRef": {"oneOf": [{"$ref": "#/$defs/opaque"}, {"type": "null"}]}, "changedFields": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}}, "additionalProperties": false},
+    "productSummary": {"type": "object", "required": ["productRef", "sku", "availability", "prices", "matchesDisplayedPriceRange", "evidenceRefs"], "properties": {"productRef": {"$ref": "#/$defs/opaque"}, "sku": {"type": "string", "pattern": "^[0-9]+$", "maxLength": 64}, "title": {"type": ["string", "null"], "maxLength": 1000}, "url": {"type": "string", "format": "uri", "pattern": "^https://(?:www\\.)?ozon\\.ru(?:/|$)", "maxLength": 2048}, "availability": {"enum": ["available", "unavailable", "unknown"]}, "prices": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/price"}}, "matchesDisplayedPriceRange": {"type": ["boolean", "null"]}, "seller": {"oneOf": [{"$ref": "#/$defs/seller"}, {"type": "null"}]}, "deliveryLabel": {"type": ["string", "null"], "maxLength": 1000}, "rating": {"type": ["number", "null"], "minimum": 0, "maximum": 5}, "reviewCount": {"type": ["integer", "null"], "minimum": 0}, "imageRefs": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}, "evidenceRefs": {"$ref": "#/$defs/evidenceRefs"}, "novelty": {"$ref": "#/$defs/novelty"}, "representation": {"const": "delta"}, "baselineProductRef": {"$ref": "#/$defs/opaque"}}, "additionalProperties": false},
     "refinement": {"type": "object", "required": ["kind", "label", "groupLabel", "selected", "searchRef"], "properties": {"kind": {"enum": ["filter", "sort"]}, "label": {"type": "string", "minLength": 1, "maxLength": 500}, "groupLabel": {"type": ["string", "null"], "maxLength": 500}, "selected": {"type": ["boolean", "null"]}, "searchRef": {"$ref": "#/$defs/opaque"}}, "additionalProperties": false},
     "coverage": {"type": "object", "required": ["returned", "uniqueSeen", "total", "snapshotGuaranteed", "completeness"], "properties": {"returned": {"type": "integer", "minimum": 0}, "uniqueSeen": {"type": "integer", "minimum": 0}, "total": {"type": ["integer", "null"], "minimum": 0}, "snapshotGuaranteed": {"const": false}, "completeness": {"enum": ["complete", "partial", "unknown"]}}, "additionalProperties": false},
     "context": {"type": "object", "required": ["contextId", "regionLabel", "regionVerification", "accountState", "accessState"], "properties": {"contextId": {"$ref": "#/$defs/opaque"}, "regionLabel": {"type": ["string", "null"], "maxLength": 500}, "regionVerification": {"enum": ["verified", "unverified"]}, "accountState": {"enum": ["authenticated", "anonymous", "unknown"]}, "accessState": {"enum": ["available", "blocked", "unknown"]}}, "additionalProperties": false},

@@ -264,6 +264,145 @@ impl Store {
         })
     }
 
+    pub fn record_search(
+        &mut self,
+        research_id: &str,
+        summary: &str,
+        product_refs: &[String],
+        evidence: &[Value],
+        items: &mut Value,
+    ) -> Result<()> {
+        let context_id = research_context_id(&self.conn, research_id)?;
+        let rows = items
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("INVALID_ARGUMENT: search items must be an array"))?;
+        if rows.len() != product_refs.len() || rows.len() > 36 {
+            return Err(anyhow!(
+                "INVALID_ARGUMENT: search items and productRefs mismatch"
+            ));
+        }
+
+        let observed = evidence
+            .iter()
+            .filter_map(|value| value.get("observedAt").and_then(Value::as_str))
+            .filter_map(normalize_time)
+            .min()
+            .unwrap_or_else(now);
+        let prepared_evidence = prepare_evidence(evidence, &context_id, &observed)?;
+        let estimated = summary.len()
+            + product_refs.iter().map(String::len).sum::<usize>()
+            + rows.iter().map(|row| canonical(row).len()).sum::<usize>()
+            + prepared_evidence
+                .iter()
+                .map(|(id, value)| id.len() + value.len())
+                .sum::<usize>()
+            + 4096;
+
+        let mut committed_rows = rows.clone();
+        self.capacity_transaction(estimated, Some(research_id), |tx| {
+            let mut latest_updates = Vec::with_capacity(committed_rows.len());
+            for (row, product_ref) in committed_rows.iter_mut().zip(product_refs) {
+                let sku = string_field(row, "sku")?.to_owned();
+                if row.get("productRef").and_then(Value::as_str) != Some(product_ref) {
+                    return Err(anyhow!("INVALID_ARGUMENT: search productRef mismatch"));
+                }
+                let stored: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT context_id,value_json FROM refs WHERE id=? AND research_id=? AND kind='product'",
+                        params![product_ref, research_id],
+                        |record| Ok((record.get(0)?, record.get(1)?)),
+                    )
+                    .optional()?;
+                let (stored_context, stored_raw) = stored.ok_or_else(|| {
+                    anyhow!("INVALID_REFERENCE: foreign or missing product reference")
+                })?;
+                if stored_context != context_id {
+                    return Err(anyhow!("CONTEXT_CHANGED: product reference belongs to another context"));
+                }
+                let stored_value: Value = serde_json::from_str(&stored_raw)
+                    .context("STORE_CORRUPT: invalid product reference")?;
+                if stored_value.get("searchSnapshot").is_some() {
+                    return Err(anyhow!("INVALID_REFERENCE: product snapshot is immutable"));
+                }
+                if stored_value.get("sku").and_then(Value::as_str) != Some(sku.as_str())
+                    || stored_value.get("url") != row.get("url")
+                {
+                    return Err(anyhow!("INVALID_REFERENCE: product reference binding mismatch"));
+                }
+                // Validate every image binding even for a newly observed SKU; later
+                // comparisons use the same lookup to compare stable source URLs.
+                semantic_image_urls(tx, research_id, &context_id, row)?;
+
+                let previous: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT product_ref,observed_at FROM search_candidate_latest WHERE research_id=? AND sku=?",
+                        params![research_id, &sku],
+                        |record| Ok((record.get(0)?, record.get(1)?)),
+                    )
+                    .optional()?;
+                if previous
+                    .as_ref()
+                    .is_some_and(|(_, previous_observed)| previous_observed.as_str() > observed.as_str())
+                {
+                    return Err(anyhow!(
+                        "SOURCE_CHANGED: search observation predates the committed candidate baseline"
+                    ));
+                }
+                let previous_ref = previous.map(|(product_ref, _)| product_ref);
+                let (status, changed_fields) = if let Some(previous_ref) = &previous_ref {
+                    let previous_raw: String = tx.query_row(
+                        "SELECT value_json FROM refs WHERE id=? AND research_id=? AND kind='product'",
+                        params![previous_ref, research_id],
+                        |record| record.get(0),
+                    )?;
+                    let previous: Value = serde_json::from_str(&previous_raw)
+                        .context("STORE_CORRUPT: invalid candidate snapshot")?;
+                    let previous = previous.get("searchSnapshot").ok_or_else(|| {
+                        anyhow!("STORE_CORRUPT: candidate reference has no search snapshot")
+                    })?;
+                    let changed = changed_search_fields(
+                        tx,
+                        research_id,
+                        &context_id,
+                        previous,
+                        row,
+                    )?;
+                    (if changed.is_empty() { "unchanged" } else { "changed" }, changed)
+                } else {
+                    ("new", Vec::new())
+                };
+                row["novelty"] = json!({
+                    "status": status,
+                    "previousProductRef": previous_ref,
+                    "changedFields": changed_fields
+                });
+                let mut snapshot = row.clone();
+                snapshot["observedAt"] = json!(observed);
+                snapshot["contextId"] = json!(context_id);
+                let ref_value = canonical(&json!({
+                    "sku": sku,
+                    "url": row.get("url").cloned().unwrap_or(Value::Null),
+                    "searchSnapshot": snapshot
+                }));
+                tx.execute(
+                    "UPDATE refs SET value_json=? WHERE id=? AND research_id=? AND kind='product'",
+                    params![ref_value, product_ref, research_id],
+                )?;
+                latest_updates.push((sku, product_ref));
+            }
+            for (sku, product_ref) in latest_updates {
+                tx.execute(
+                    "INSERT INTO search_candidate_latest(research_id,sku,product_ref,observed_at) VALUES(?,?,?,?) ON CONFLICT(research_id,sku) DO UPDATE SET product_ref=excluded.product_ref,observed_at=excluded.observed_at WHERE excluded.observed_at>=search_candidate_latest.observed_at",
+                    params![research_id, sku, product_ref, observed],
+                )?;
+            }
+
+            insert_record(tx, research_id, "search", summary, product_refs, &prepared_evidence, &observed)
+        })?;
+        *rows = committed_rows;
+        Ok(())
+    }
+
     pub fn append_note(&mut self, args: &Value) -> Result<Value> {
         let research_id = string_field(args, "researchId")?;
         let operation_id = string_field(args, "operationId")?;
@@ -353,6 +492,33 @@ impl Store {
             return Ok(
                 json!({"section":"summary","payload":self.summary(&rid)?,"nextCursor":null}),
             );
+        }
+        if section == "candidates" {
+            let product_refs = strings(args.get("productRefs"))?;
+            if product_refs.is_empty()
+                || product_refs.len() > 20
+                || product_refs.iter().collect::<BTreeSet<_>>().len() != product_refs.len()
+            {
+                return Err(anyhow!(
+                    "INVALID_ARGUMENT: candidates requires 1..20 productRefs"
+                ));
+            }
+            let mut payload = Vec::with_capacity(product_refs.len());
+            for product_ref in product_refs {
+                let raw: Option<String> = self.conn.query_row(
+                    "SELECT value_json FROM refs WHERE id=? AND research_id=? AND kind='product'",
+                    params![product_ref, rid],
+                    |record| record.get(0),
+                ).optional()?;
+                let value: Value = serde_json::from_str(&raw.ok_or_else(|| {
+                    anyhow!("INVALID_REFERENCE: foreign or missing product reference")
+                })?)
+                .context("STORE_CORRUPT: invalid product reference")?;
+                payload.push(value.get("searchSnapshot").cloned().ok_or_else(|| {
+                    anyhow!("INVALID_REFERENCE: product reference has no search snapshot")
+                })?);
+            }
+            return Ok(json!({"section":"candidates","payload":payload,"nextCursor":null}));
         }
         let cap = match section {
             "events" => 25,
@@ -715,6 +881,198 @@ fn canonical(value: &Value) -> String {
     }
     serde_json::to_string(&sort(value)).expect("JSON serialization")
 }
+
+fn prepare_evidence(
+    evidence: &[Value],
+    context_id: &str,
+    observed: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut prepared = Vec::with_capacity(evidence.len());
+    for input in evidence {
+        let obj = input
+            .as_object()
+            .ok_or_else(|| anyhow!("INVALID_ARGUMENT: evidence must be objects"))?;
+        let eid = obj
+            .get("evidenceRef")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| id("evidence"));
+        let evidence_context = obj
+            .get("contextId")
+            .and_then(Value::as_str)
+            .unwrap_or(context_id);
+        if evidence_context != context_id {
+            return Err(anyhow!(
+                "CONTEXT_CHANGED: evidence belongs to another context"
+            ));
+        }
+        let source_kind = obj
+            .get("sourceKind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("INVALID_ARGUMENT: evidence sourceKind is required"))?;
+        if !matches!(source_kind, "ozon_page" | "local_journal") {
+            return Err(anyhow!("INVALID_ARGUMENT: invalid evidence sourceKind"));
+        }
+        let source_url = obj.get("sourceUrl").cloned().unwrap_or(Value::Null);
+        if source_kind == "local_journal" && !source_url.is_null() {
+            return Err(anyhow!(
+                "INVALID_ARGUMENT: local journal evidence cannot have sourceUrl"
+            ));
+        }
+        let value = json!({
+            "evidenceRef": eid.clone(),
+            "sourceKind": source_kind,
+            "sourceUrl": source_url,
+            "observedAt": obj.get("observedAt").and_then(Value::as_str).and_then(normalize_time).unwrap_or_else(|| observed.to_owned()),
+            "contextId": context_id,
+            "sku": obj.get("sku").cloned().unwrap_or(Value::Null),
+            "facts": obj.get("facts").cloned().unwrap_or_else(|| json!([]))
+        });
+        prepared.push((eid, canonical(&value)));
+    }
+    Ok(prepared)
+}
+
+fn insert_record(
+    tx: &Transaction<'_>,
+    research_id: &str,
+    kind: &str,
+    summary: &str,
+    product_refs: &[String],
+    evidence: &[(String, String)],
+    observed: &str,
+) -> Result<()> {
+    let mut evidence_ids = Vec::with_capacity(evidence.len());
+    for (eid, value) in evidence {
+        tx.execute(
+            "INSERT INTO evidence(id,research_id,seq,value_json) VALUES(?,?,(SELECT COALESCE(MAX(seq),0)+1 FROM evidence WHERE research_id=?),?)",
+            params![eid, research_id, research_id, value],
+        )?;
+        evidence_ids.push(eid.clone());
+    }
+    let chunks: Vec<&[String]> = if product_refs.is_empty() {
+        vec![&[]]
+    } else {
+        product_refs.chunks(36).collect()
+    };
+    for chunk in chunks {
+        tx.execute(
+            "INSERT INTO events(id,research_id,seq,kind,observed_at,summary,product_refs,evidence_refs) VALUES(?,?,(SELECT COALESCE(MAX(seq),0)+1 FROM events WHERE research_id=?),?,?,?,?,?)",
+            params![id("event"), research_id, research_id, kind, observed, summary, canonical(&json!(chunk)), canonical(&json!(evidence_ids))],
+        )?;
+    }
+    tx.execute(
+        "UPDATE researches SET updated_at=? WHERE id=?",
+        params![now(), research_id],
+    )?;
+    Ok(())
+}
+
+fn changed_search_fields(
+    conn: &Connection,
+    research_id: &str,
+    context_id: &str,
+    previous: &Value,
+    current: &Value,
+) -> Result<Vec<&'static str>> {
+    const FIELDS: [&str; 9] = [
+        "title",
+        "url",
+        "prices",
+        "seller",
+        "deliveryLabel",
+        "availability",
+        "rating",
+        "reviewCount",
+        "imageRefs",
+    ];
+    FIELDS
+        .into_iter()
+        .filter_map(|field| {
+            let values = if field == "imageRefs" {
+                semantic_image_urls(conn, research_id, context_id, previous).and_then(|before| {
+                    semantic_image_urls(conn, research_id, context_id, current)
+                        .map(|after| (before, after))
+                })
+            } else {
+                Ok((
+                    semantic_search_value(previous, field),
+                    semantic_search_value(current, field),
+                ))
+            };
+            match values {
+                Ok((before, after)) if before != after => Some(Ok(field)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect()
+}
+
+fn semantic_image_urls(
+    conn: &Connection,
+    research_id: &str,
+    context_id: &str,
+    item: &Value,
+) -> Result<Value> {
+    let refs = strings(item.get("imageRefs"))?;
+    let mut urls = Vec::with_capacity(refs.len());
+    for image_ref in refs {
+        let stored: Option<(String, String)> = conn
+            .query_row(
+                "SELECT context_id,value_json FROM refs WHERE id=? AND research_id=? AND kind='image'",
+                params![image_ref, research_id],
+                |record| Ok((record.get(0)?, record.get(1)?)),
+            )
+            .optional()?;
+        let (stored_context, raw) = stored
+            .ok_or_else(|| anyhow!("INVALID_REFERENCE: foreign or missing image reference"))?;
+        if stored_context != context_id {
+            return Err(anyhow!(
+                "CONTEXT_CHANGED: image reference belongs to another context"
+            ));
+        }
+        let value: Value =
+            serde_json::from_str(&raw).context("STORE_CORRUPT: invalid image reference")?;
+        urls.push(
+            value
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("STORE_CORRUPT: image reference has no URL"))?
+                .to_owned(),
+        );
+    }
+    Ok(json!(urls))
+}
+
+fn semantic_search_value(item: &Value, field: &str) -> Value {
+    let value = item.get(field).cloned().unwrap_or(Value::Null);
+    match field {
+        "prices" => {
+            let mut prices: Vec<Value> = value
+                .as_array()
+                .map(|prices| {
+                    prices.iter().map(|price| {
+                json!({
+                    "amountMinor": price.get("amountMinor").cloned().unwrap_or(Value::Null),
+                    "currency": price.get("currency").cloned().unwrap_or(Value::Null),
+                    "type": price.get("type").cloned().unwrap_or(Value::Null),
+                    "condition": price.get("condition").cloned().unwrap_or(Value::Null)
+                })
+            }).collect()
+                })
+                .unwrap_or_default();
+            prices.sort_by_key(canonical);
+            Value::Array(prices)
+        }
+        "seller" if value.is_object() => json!({
+            "name": value.get("name").cloned().unwrap_or(Value::Null),
+            "rating": value.get("rating").cloned().unwrap_or(Value::Null),
+            "url": value.get("url").cloned().unwrap_or(Value::Null)
+        }),
+        _ => value,
+    }
+}
 fn string_field<'a>(v: &'a Value, k: &str) -> Result<&'a str> {
     v.get(k)
         .and_then(Value::as_str)
@@ -892,6 +1250,7 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS researches(id TEXT PRIMARY KEY,title TEXT NOT NULL,context_id TEXT NOT NULL,context_json TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,protected_until TEXT);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS refs(id TEXT PRIMARY KEY,research_id TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,context_id TEXT NOT NULL,kind TEXT NOT NULL,value_json TEXT NOT NULL,expires_at TEXT);
+CREATE TABLE IF NOT EXISTS search_candidate_latest(research_id TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,sku TEXT NOT NULL,product_ref TEXT NOT NULL REFERENCES refs(id),observed_at TEXT NOT NULL,PRIMARY KEY(research_id,sku));
 CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,research_id TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,seq INTEGER NOT NULL,value_json TEXT NOT NULL,UNIQUE(research_id,seq));
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,research_id TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,seq INTEGER NOT NULL,kind TEXT NOT NULL,observed_at TEXT NOT NULL,summary TEXT,product_refs TEXT NOT NULL,evidence_refs TEXT NOT NULL,UNIQUE(research_id,seq));
 CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY,research_id TEXT NOT NULL REFERENCES researches(id) ON DELETE CASCADE,seq INTEGER NOT NULL,operation_id TEXT NOT NULL,kind TEXT NOT NULL,text TEXT NOT NULL,created_at TEXT NOT NULL,evidence_refs TEXT NOT NULL,product_refs TEXT NOT NULL,payload_json TEXT NOT NULL,UNIQUE(research_id,operation_id),UNIQUE(research_id,seq));
@@ -929,6 +1288,326 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .starts_with("CONTEXT_CHANGED")
+        );
+    }
+
+    fn search_item(product_ref: &str, sku: &str, price_type: &str, seller: Value) -> Value {
+        json!({
+            "productRef": product_ref,
+            "sku": sku,
+            "title": "Item",
+            "url": format!("https://www.ozon.ru/product/{sku}/"),
+            "availability": "unknown",
+            "prices": [{"amountMinor":100,"currency":"RUB","type":price_type,"condition":null,"evidenceRefs":["generated"]}],
+            "seller": seller,
+            "matchesDisplayedPriceRange": null,
+            "deliveryLabel": null,
+            "rating": null,
+            "reviewCount": null,
+            "imageRefs": [],
+            "evidenceRefs": ["generated"]
+        })
+    }
+
+    fn new_search_ref(store: &mut Store, research_id: &str, sku: &str) -> String {
+        new_search_ref_at_url(
+            store,
+            research_id,
+            sku,
+            &format!("https://www.ozon.ru/product/{sku}/"),
+        )
+    }
+
+    fn new_search_ref_at_url(store: &mut Store, research_id: &str, sku: &str, url: &str) -> String {
+        store
+            .put_ref(research_id, "product", &json!({"sku":sku,"url":url}), None)
+            .unwrap()
+    }
+
+    fn new_image_ref(store: &mut Store, research_id: &str, url: &str) -> String {
+        store
+            .put_ref(research_id, "image", &json!({"url":url}), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn search_candidate_novelty_is_research_scoped_and_snapshots_are_immutable() {
+        let d = private_tempdir();
+        let mut store = Store::open(d.path()).unwrap();
+        let first_research = store.create_research("first", &context("c")).unwrap();
+        let other_research = store.create_research("other", &context("c")).unwrap();
+
+        let first_ref = new_search_ref(&mut store, &first_research, "123");
+        let mut first_items = json!([search_item(&first_ref, "123", "regular", Value::Null)]);
+        store
+            .record_search(
+                &first_research,
+                "search",
+                std::slice::from_ref(&first_ref),
+                &[],
+                &mut first_items,
+            )
+            .unwrap();
+        assert_eq!(first_items[0]["novelty"]["status"], "new");
+        assert_eq!(first_items[0]["novelty"]["previousProductRef"], Value::Null);
+
+        let unchanged_ref = new_search_ref(&mut store, &first_research, "123");
+        let mut unchanged = json!([search_item(&unchanged_ref, "123", "regular", Value::Null)]);
+        unchanged[0]["evidenceRefs"] = json!(["different-generated-id"]);
+        unchanged[0]["prices"][0]["evidenceRefs"] = json!(["different-price-evidence"]);
+        store
+            .record_search(
+                &first_research,
+                "search",
+                std::slice::from_ref(&unchanged_ref),
+                &[],
+                &mut unchanged,
+            )
+            .unwrap();
+        assert_eq!(unchanged[0]["novelty"]["status"], "unchanged");
+        assert_eq!(unchanged[0]["novelty"]["previousProductRef"], first_ref);
+        assert_eq!(unchanged[0]["novelty"]["changedFields"], json!([]));
+
+        let changed_ref = new_search_ref(&mut store, &first_research, "123");
+        let seller = json!({"name":"Seller","rating":null,"url":null,"evidenceRefs":["new"]});
+        let mut changed = json!([search_item(&changed_ref, "123", "ozon_card", seller)]);
+        store
+            .record_search(
+                &first_research,
+                "search",
+                std::slice::from_ref(&changed_ref),
+                &[],
+                &mut changed,
+            )
+            .unwrap();
+        assert_eq!(changed[0]["novelty"]["status"], "changed");
+        assert_eq!(
+            changed[0]["novelty"]["changedFields"],
+            json!(["prices", "seller"])
+        );
+
+        let other_ref = new_search_ref(&mut store, &other_research, "123");
+        let mut other = json!([search_item(&other_ref, "123", "regular", Value::Null)]);
+        store
+            .record_search(&other_research, "search", &[other_ref], &[], &mut other)
+            .unwrap();
+        assert_eq!(other[0]["novelty"]["status"], "new");
+
+        let stored = store
+            .read(&json!({"researchId":first_research,"section":"candidates","productRefs":[first_ref,changed_ref]}))
+            .unwrap();
+        assert_eq!(stored["payload"][0]["novelty"]["status"], "new");
+        assert_eq!(stored["payload"][1]["novelty"]["status"], "changed");
+        assert_eq!(stored["payload"][0]["contextId"], "c");
+        assert!(stored["payload"][0]["observedAt"].as_str().is_some());
+        assert!(
+            store
+                .read(&json!({"researchId":other_research,"section":"candidates","productRefs":[unchanged_ref]}))
+                .unwrap_err()
+                .to_string()
+                .starts_with("INVALID_REFERENCE")
+        );
+    }
+
+    #[test]
+    fn failed_search_record_does_not_advance_candidate_baseline_and_success_persists() {
+        let d = private_tempdir();
+        let research_id;
+        let first_ref;
+        {
+            let mut store = Store::open(d.path()).unwrap();
+            research_id = store.create_research("search", &context("c")).unwrap();
+            first_ref = new_search_ref(&mut store, &research_id, "123");
+            let mut first = json!([search_item(&first_ref, "123", "regular", Value::Null)]);
+            store
+                .record_search(
+                    &research_id,
+                    "search",
+                    std::slice::from_ref(&first_ref),
+                    &[],
+                    &mut first,
+                )
+                .unwrap();
+
+            let failed_ref = new_search_ref(&mut store, &research_id, "123");
+            let mut failed = json!([search_item(&failed_ref, "123", "original", Value::Null)]);
+            store.set_cap_bytes(1);
+            assert!(
+                store
+                    .record_search(&research_id, "search", &[failed_ref], &[], &mut failed)
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("STORAGE_FULL")
+            );
+        }
+
+        let mut reopened = Store::open(d.path()).unwrap();
+        let next_ref = new_search_ref(&mut reopened, &research_id, "123");
+        let mut next = json!([search_item(&next_ref, "123", "original", Value::Null)]);
+        reopened
+            .record_search(
+                &research_id,
+                "search",
+                std::slice::from_ref(&next_ref),
+                &[],
+                &mut next,
+            )
+            .unwrap();
+        assert_eq!(next[0]["novelty"]["previousProductRef"], first_ref);
+        assert_eq!(next[0]["novelty"]["changedFields"], json!(["prices"]));
+        assert_eq!(
+            reopened
+                .read(&json!({"researchId":research_id,"section":"candidates","productRefs":[next_ref]}))
+                .unwrap()["payload"][0]["novelty"]["status"],
+            "changed"
+        );
+    }
+
+    #[test]
+    fn search_candidate_images_compare_source_urls_and_product_url_is_semantic() {
+        let d = private_tempdir();
+        let mut store = Store::open(d.path()).unwrap();
+        let research_id = store.create_research("images", &context("c")).unwrap();
+
+        let first_image = new_image_ref(&mut store, &research_id, "https://ir.ozone.ru/a.jpg");
+        let first_ref = new_search_ref(&mut store, &research_id, "123");
+        let mut first = json!([search_item(&first_ref, "123", "regular", Value::Null)]);
+        first[0]["imageRefs"] = json!([first_image]);
+        store
+            .record_search(
+                &research_id,
+                "first",
+                std::slice::from_ref(&first_ref),
+                &[],
+                &mut first,
+            )
+            .unwrap();
+
+        let same_image = new_image_ref(&mut store, &research_id, "https://ir.ozone.ru/a.jpg");
+        let same_ref = new_search_ref(&mut store, &research_id, "123");
+        let mut same = json!([search_item(&same_ref, "123", "regular", Value::Null)]);
+        same[0]["imageRefs"] = json!([same_image]);
+        store
+            .record_search(
+                &research_id,
+                "same",
+                std::slice::from_ref(&same_ref),
+                &[],
+                &mut same,
+            )
+            .unwrap();
+        assert_eq!(same[0]["novelty"]["status"], "unchanged");
+        assert_eq!(same[0]["novelty"]["changedFields"], json!([]));
+
+        let new_image = new_image_ref(&mut store, &research_id, "https://ir.ozone.ru/b.jpg");
+        let image_changed_ref = new_search_ref(&mut store, &research_id, "123");
+        let mut image_changed = json!([search_item(
+            &image_changed_ref,
+            "123",
+            "regular",
+            Value::Null
+        )]);
+        image_changed[0]["imageRefs"] = json!([new_image]);
+        store
+            .record_search(
+                &research_id,
+                "image changed",
+                std::slice::from_ref(&image_changed_ref),
+                &[],
+                &mut image_changed,
+            )
+            .unwrap();
+        assert_eq!(
+            image_changed[0]["novelty"]["changedFields"],
+            json!(["imageRefs"])
+        );
+
+        let same_new_image = new_image_ref(&mut store, &research_id, "https://ir.ozone.ru/b.jpg");
+        let changed_url = "https://www.ozon.ru/product/item-123/";
+        let url_changed_ref = new_search_ref_at_url(&mut store, &research_id, "123", changed_url);
+        let mut url_changed = json!([search_item(&url_changed_ref, "123", "regular", Value::Null)]);
+        url_changed[0]["url"] = json!(changed_url);
+        url_changed[0]["imageRefs"] = json!([same_new_image]);
+        store
+            .record_search(
+                &research_id,
+                "url changed",
+                &[url_changed_ref],
+                &[],
+                &mut url_changed,
+            )
+            .unwrap();
+        assert_eq!(url_changed[0]["novelty"]["changedFields"], json!(["url"]));
+    }
+
+    #[test]
+    fn older_search_commit_does_not_replace_newer_candidate_baseline() {
+        let d = private_tempdir();
+        let mut store = Store::open(d.path()).unwrap();
+        let research_id = store.create_research("search", &context("c")).unwrap();
+        let evidence_at = |id: &str, observed: &str| {
+            json!({
+                "evidenceRef": id,
+                "sourceKind": "ozon_page",
+                "sourceUrl": "https://www.ozon.ru/search/",
+                "observedAt": observed,
+                "contextId": "c",
+                "sku": "123",
+                "facts": []
+            })
+        };
+
+        let newer_ref = new_search_ref(&mut store, &research_id, "123");
+        let mut newer = json!([search_item(&newer_ref, "123", "regular", Value::Null)]);
+        store
+            .record_search(
+                &research_id,
+                "newer",
+                std::slice::from_ref(&newer_ref),
+                &[evidence_at("evidence_newer", "2026-01-02T00:00:00Z")],
+                &mut newer,
+            )
+            .unwrap();
+
+        let older_ref = new_search_ref(&mut store, &research_id, "123");
+        let mut older = json!([search_item(&older_ref, "123", "original", Value::Null)]);
+        let error = store
+            .record_search(
+                &research_id,
+                "older",
+                std::slice::from_ref(&older_ref),
+                &[evidence_at("evidence_older", "2026-01-01T00:00:00Z")],
+                &mut older,
+            )
+            .unwrap_err();
+        assert!(error.to_string().starts_with("SOURCE_CHANGED"));
+        assert!(older[0].get("novelty").is_none());
+        assert!(
+            store
+                .get_ref(&older_ref, "product")
+                .unwrap()
+                .value
+                .get("searchSnapshot")
+                .is_none()
+        );
+
+        let final_ref = new_search_ref(&mut store, &research_id, "123");
+        let mut final_items = json!([search_item(&final_ref, "123", "ozon_card", Value::Null)]);
+        store
+            .record_search(
+                &research_id,
+                "final",
+                &[final_ref],
+                &[evidence_at("evidence_final", "2026-01-03T00:00:00Z")],
+                &mut final_items,
+            )
+            .unwrap();
+        assert_eq!(final_items[0]["novelty"]["previousProductRef"], newer_ref);
+        assert_eq!(
+            store
+                .read(&json!({"researchId":research_id,"section":"candidates","productRefs":[final_items[0]["productRef"]]}))
+                .unwrap()["payload"][0]["observedAt"],
+            "2026-01-03T00:00:00.000Z"
         );
     }
     #[test]

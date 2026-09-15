@@ -305,6 +305,89 @@ impl Service {
     }
 }
 
+// Bind presentation to continuation authority before any source operation.
+fn presentation_args(inner: &Inner, name: &str, mut args: Value) -> Result<Value> {
+    if !matches!(
+        name,
+        "ozon_search" | "ozon_get_products" | "ozon_get_reviews"
+    ) {
+        return Ok(args);
+    }
+    let mut bindings = Vec::new();
+    if name == "ozon_get_products" {
+        // Cursor views are resolved only after per-item research/context checks.
+        args["_viewExplicit"] = json!(args.get("view").is_some());
+    } else if let Some(cursor) = args.pointer("/start/cursor").and_then(Value::as_str) {
+        let kind = if name == "ozon_search" {
+            "search_cursor"
+        } else {
+            "review_cursor"
+        };
+        let stored = locked_store(inner)?.get_ref(cursor, kind)?;
+        bindings.push(
+            stored
+                .value
+                .get("presentation")
+                .filter(|v| v.is_object())
+                .cloned()
+                .unwrap_or_else(|| json!({"view":"full"})),
+        );
+    } else if let Some(cursor) = args
+        .pointer("/start/refinementsCursor")
+        .and_then(Value::as_str)
+    {
+        let stored = locked_store(inner)?.get_ref(cursor, "search_refinements")?;
+        bindings.push(stored.value.clone());
+    }
+    for binding in bindings {
+        let keys: &[&str] = if name == "ozon_get_reviews" {
+            &["view", "includeFacets"]
+        } else {
+            &["view", "repeatMode"]
+        };
+        for &key in keys {
+            if let Some(value) = binding.get(key).filter(|v| !v.is_null()) {
+                if args.get(key).is_some_and(|requested| requested != value) {
+                    return Err(anyhow!(
+                        "INVALID_ARGUMENT: continuation presentation cannot be changed"
+                    ));
+                }
+                args[key] = value.clone();
+            }
+        }
+        if args.pointer("/start/refinementsCursor").is_some()
+            && let Some(limit) = binding.get("limit")
+        {
+            if args.get("refinementLimit").is_some_and(|v| v != limit) {
+                return Err(anyhow!(
+                    "INVALID_ARGUMENT: refinement page limit cannot be changed"
+                ));
+            }
+            args["refinementLimit"] = limit.clone();
+        }
+    }
+    if args.get("view").is_none() {
+        args["view"] = json!("compact");
+    }
+    if name == "ozon_search" {
+        if args.get("repeatMode").is_none() {
+            args["repeatMode"] = json!("full");
+        }
+        if args.get("refinementLimit").is_none() {
+            args["refinementLimit"] = json!(12);
+        }
+    }
+    if matches!(name, "ozon_search" | "ozon_get_reviews") && args.get("includeFacets").is_none() {
+        args["includeFacets"] =
+            json!(args["view"] == "full" && args.pointer("/start/cursor").is_none());
+    }
+    Ok(args)
+}
+
+fn presentation_binding(args: &Value) -> Value {
+    json!({"view":args["view"],"repeatMode":args.get("repeatMode").cloned().unwrap_or(json!("full")),"includeFacets":args.get("includeFacets").cloned().unwrap_or(json!(false))})
+}
+
 async fn execute(
     inner: Arc<Inner>,
     name: &str,
@@ -312,6 +395,10 @@ async fn execute(
     cancel: CancellationToken,
     deadline: Instant,
 ) -> ToolReply {
+    let args = match presentation_args(&inner, name, args) {
+        Ok(args) => args,
+        Err(error) => return contracts::failure(error_code(&error), &safe_message(&error), None),
+    };
     let result = match name {
         "ozon_get_context" => get_context(&inner, &cancel, deadline).await,
         "ozon_search" => search(&inner, &args, &cancel, deadline).await,
@@ -324,7 +411,37 @@ async fn execute(
         _ => Err(anyhow!("INVALID_ARGUMENT: unknown tool")),
     };
     match result {
-        Ok((value, images)) => success(name, value, images, research_arg(&args)),
+        Ok((mut value, images)) => {
+            let projected = (|| -> Result<Value> {
+                if name == "ozon_search" {
+                    crate::presentation::apply_repeat_mode(
+                        &mut value,
+                        args["repeatMode"].as_str().unwrap_or("full"),
+                    )?;
+                }
+                if matches!(
+                    name,
+                    "ozon_search" | "ozon_get_products" | "ozon_get_reviews"
+                ) {
+                    let view = value
+                        .get("view")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| args["view"].as_str().unwrap_or("compact"))
+                        .to_owned();
+                    crate::presentation::apply(name, value, &view)
+                } else {
+                    Ok(value)
+                }
+            })();
+            match projected {
+                Ok(value) => success(name, value, images, research_arg(&args)),
+                Err(error) => contracts::failure(
+                    error_code(&error),
+                    &safe_message(&error),
+                    research_arg(&args),
+                ),
+            }
+        }
         Err(error) => contracts::failure(
             error_code(&error),
             &safe_message(&error),
@@ -364,6 +481,27 @@ async fn search(
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<(Value, Vec<ImagePayload>)> {
+    if let Some(cursor) = args
+        .pointer("/start/refinementsCursor")
+        .and_then(Value::as_str)
+    {
+        if cancel.is_cancelled() {
+            return Err(anyhow!("CANCELLED: request cancelled"));
+        }
+        let mut store = locked_store(inner)?;
+        let context = cached_context(&store)?;
+        let context_id = required_text(&context, "contextId")?;
+        let value = crate::refinements::continue_page(
+            &mut store,
+            cursor,
+            research_arg(args),
+            context_id,
+            args["view"].as_str(),
+            args["repeatMode"].as_str(),
+            args["refinementLimit"].as_u64().map(|n| n as usize),
+        )?;
+        return Ok((value, vec![]));
+    }
     let context = observe_context(inner, cancel, deadline).await?;
     let context_id = required_text(&context, "contextId")?;
     let start = &args["start"];
@@ -411,7 +549,7 @@ async fn search(
                 "Continued search".into(),
             )
         };
-    let raw = match gateway_call(inner, cancel, deadline, move |gateway, token| {
+    let mut raw = match gateway_call(inner, cancel, deadline, move |gateway, token| {
         Box::pin(gateway.search(search_args, token))
     })
     .await
@@ -430,22 +568,42 @@ async fn search(
         }
         return Err(error);
     }
+    raw["_presentation"] = presentation_binding(args);
     let include = args
         .get("includeFacets")
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let n = {
         let mut store = locked_store(inner)?;
-        marketplace::normalize_search(
+        let mut n = marketplace::normalize_search(
             &raw,
             &mut store,
             &research_id,
             context_id,
             context.get("regionVerification").and_then(Value::as_str) == Some("verified"),
             include,
-        )?
+        )?;
+        let observed = oldest_observation(&n.evidence);
+        // Admit refinement continuation before publishing the candidate baseline.
+        crate::refinements::first_page(
+            &mut store,
+            &research_id,
+            &mut n.data,
+            &context,
+            &observed,
+            args["view"].as_str().unwrap_or("compact"),
+            args["repeatMode"].as_str().unwrap_or("full"),
+            args["refinementLimit"].as_u64().unwrap_or(12) as usize,
+        )?;
+        store.record_search(
+            &research_id,
+            &summary,
+            &n.product_refs,
+            &n.evidence,
+            &mut n.data["items"],
+        )?;
+        n
     };
-    record(inner, &research_id, "search", &summary, &n)?;
     if cancel.is_cancelled() {
         record_cancelled(inner, &research_id)?;
         return Err(anyhow!("CANCELLED: request cancelled"));
@@ -496,6 +654,28 @@ async fn products(
         });
         resolved.push(resolved_product);
     }
+    let mut selected_view = args["view"].as_str().unwrap_or("compact").to_owned();
+    let mut view_bound = args["_viewExplicit"].as_bool().unwrap_or(false);
+    for item in &mut resolved {
+        let Ok(product) = item else {
+            continue;
+        };
+        let Some(binding) = &product.presentation else {
+            continue;
+        };
+        let view = binding
+            .get("view")
+            .and_then(Value::as_str)
+            .unwrap_or("full");
+        if view_bound && selected_view != view {
+            *item = Err(anyhow!(
+                "INVALID_REFERENCE: product cursor presentation cannot be changed"
+            ));
+        } else {
+            selected_view = view.to_owned();
+            view_bound = true;
+        }
+    }
     let research_id = match inferred {
         Some(rid) => {
             locked_store(inner)?.ensure_research(&rid, &context_id)?;
@@ -512,7 +692,13 @@ async fn products(
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_else(|| vec!["characteristics".into(), "offers".into()]);
+        .unwrap_or_else(|| {
+            if selected_view == "full" {
+                vec!["characteristics".into(), "offers".into()]
+            } else {
+                vec!["characteristics".into()]
+            }
+        });
     let mut results = vec![];
     let mut all_evidence = vec![];
     let mut product_refs = vec![];
@@ -549,6 +735,7 @@ async fn products(
             if fetched_live {
                 raw["_continuationObservedAt"] = json!(evidence::now());
             }
+            raw["_presentation"] = json!({"view":selected_view,"repeatMode":"full"});
             (raw, item_include, fetched_live)
         }));
         tokio::task::yield_now().await;
@@ -628,17 +815,16 @@ async fn products(
         return Err(anyhow!("CANCELLED: request cancelled"));
     }
     let observed = oldest_observation(&n.evidence);
-    Ok((
-        envelope(
-            Some(&research_id),
-            n.data,
-            &context,
-            n.evidence,
-            n.warnings,
-            &observed,
-        ),
-        vec![],
-    ))
+    let mut value = envelope(
+        Some(&research_id),
+        n.data,
+        &context,
+        n.evidence,
+        n.warnings,
+        &observed,
+    );
+    value["view"] = json!(selected_view);
+    Ok((value, vec![]))
 }
 
 async fn reviews(
@@ -773,7 +959,7 @@ async fn reviews(
             .await
         }
     };
-    let raw = match raw_result {
+    let mut raw = match raw_result {
         Ok(raw) => raw,
         Err(error) => {
             if error_code(&error) == "CANCELLED" {
@@ -788,7 +974,8 @@ async fn reviews(
         }
         return Err(error);
     }
-    let n = {
+    raw["_presentation"] = presentation_binding(args);
+    let mut n = {
         let mut store = locked_store(inner)?;
         marketplace::normalize_reviews(
             &raw,
@@ -809,6 +996,11 @@ async fn reviews(
             },
         )?
     };
+    let include_facets = args["includeFacets"].as_bool().unwrap_or(false);
+    if !include_facets {
+        n.data["refinements"] = json!([]);
+    }
+    n.data["refinementsIncluded"] = json!(include_facets);
     record(inner, &rid, "reviews", "Fetched product reviews", &n)?;
     if cancel.is_cancelled() {
         record_cancelled(inner, &rid)?;
@@ -1255,6 +1447,7 @@ fn make_search_args(
 }
 struct ResolvedProduct {
     target: String,
+    presentation: Option<Value>,
     research_id: Option<String>,
     include: Option<Vec<String>>,
     cached_raw: Option<Value>,
@@ -1264,6 +1457,7 @@ fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
     if let Some(reference) = selector.get("productRef").and_then(Value::as_str) {
         let r = locked_store(inner)?.get_ref(reference, "product")?;
         return Ok(ResolvedProduct {
+            presentation: None,
             target: r
                 .value
                 .get("url")
@@ -1280,6 +1474,13 @@ fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
     if let Some(cursor) = selector.get("cursor").and_then(Value::as_str) {
         let r = locked_store(inner)?.get_ref(cursor, "product_cursor")?;
         return Ok(ResolvedProduct {
+            presentation: Some(
+                r.value
+                    .get("presentation")
+                    .filter(|v| v.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({"view":"full"})),
+            ),
             target: r
                 .value
                 .get("path")
@@ -1299,6 +1500,7 @@ fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
     }
     if let Some(sku) = selector.get("sku").and_then(Value::as_str) {
         return Ok(ResolvedProduct {
+            presentation: None,
             target: sku.into(),
             research_id: None,
             include: None,
@@ -1309,6 +1511,7 @@ fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
     let url = required_text(selector, "url")?;
     validate_product_url(url)?;
     Ok(ResolvedProduct {
+        presentation: None,
         target: url.into(),
         research_id: None,
         include: None,
@@ -1660,6 +1863,199 @@ mod tests {
                 .len(),
             1
         );
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_search_delta_and_snapshot_expansion_preserve_observations() {
+        let context = fake_context("same");
+        let first_raw = json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"Server","price":100.0,"priceType":"unknown","currency":"RUB","seller":"First seller","url":"https://www.ozon.ru/product/item-1/"}],"hasNext":false});
+        let mut changed_raw = first_raw.clone();
+        changed_raw["items"][0]["price"] = json!(120.0);
+        changed_raw["items"][0]["seller"] = json!("Second seller");
+        let (_temp, service) = scripted_service(
+            vec![context; 4],
+            vec![FakeAction::Value(first_raw), FakeAction::Value(changed_raw)],
+            vec![],
+        )
+        .await;
+        let first = service
+            .call(
+                "ozon_search",
+                json!({"start":{"query":"server"}}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!first.error, "{:?}", first.text);
+        let first = first.structured.unwrap();
+        assert_eq!(first["view"], "compact");
+        assert_eq!(first["data"]["items"][0]["novelty"]["status"], "new");
+        assert_eq!(first["evidence"], json!([]));
+        let rid = first["researchId"].as_str().unwrap();
+        let baseline = first["data"]["items"][0]["productRef"].clone();
+        let second = service
+            .call(
+                "ozon_search",
+                json!({"researchId":rid,"start":{"query":"other search"},"repeatMode":"delta"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!second.error, "{:?}", second.text);
+        let second = second.structured.unwrap();
+        let row = &second["data"]["items"][0];
+        assert_eq!(row["representation"], "delta");
+        assert_eq!(row["baselineProductRef"], baseline);
+        assert_eq!(row["prices"][0]["amountMinor"], 12000);
+        assert_eq!(row["prices"][0]["type"], "unknown");
+        assert_eq!(row["seller"]["name"], "Second seller");
+        let snapshot = service
+            .call(
+                "ozon_get_research",
+                json!({"researchId":rid,"section":"candidates","productRefs":[baseline]}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!snapshot.error, "{:?}", snapshot.text);
+        let snapshot = snapshot.structured.unwrap();
+        assert_eq!(
+            snapshot["data"]["payload"][0]["prices"][0]["amountMinor"],
+            10000
+        );
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_cursors_bind_view_and_local_refinements_need_no_gateway() {
+        let context = fake_context("same");
+        let raw = json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"Server","price":1.0,"url":"https://www.ozon.ru/product/item-1/"}],"hasNext":true,"nextCursor":"source-cursor", "facets":{"items":[{"title":"Type","options":[{"label":"A","searchUrl":"https://www.ozon.ru/category/a-1/"},{"label":"B","searchUrl":"https://www.ozon.ru/category/b-2/"}]}]}});
+        let (_temp, service) =
+            scripted_service(vec![context; 2], vec![FakeAction::Value(raw)], vec![]).await;
+        let first = service.call("ozon_search", json!({"start":{"query":"x"},"view":"comparison","includeFacets":true,"refinementLimit":1}), CancellationToken::new()).await;
+        assert!(!first.error, "{:?}", first.text);
+        let first = first.structured.unwrap();
+        let cursor = first["data"]["nextCursor"].as_str().unwrap();
+        let invalid = service
+            .call(
+                "ozon_search",
+                json!({"start":{"cursor":cursor},"view":"full"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(invalid.error);
+        assert_eq!(failure_code(&invalid), "INVALID_ARGUMENT");
+        let metadata_cursor = first["data"]["refinementsNextCursor"].as_str().unwrap();
+        let more = service
+            .call(
+                "ozon_search",
+                json!({"start":{"refinementsCursor":metadata_cursor}}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!more.error, "{:?}", more.text);
+        let more = more.structured.unwrap();
+        assert_eq!(more["view"], "comparison");
+        assert_eq!(more["observedAt"], first["observedAt"]);
+        assert_eq!(more["data"]["items"], json!([]));
+        assert_eq!(more["data"]["refinements"].as_array().unwrap().len(), 1);
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_product_cursors_cannot_change_valid_sibling_view() {
+        let source = fake_context("same");
+        let (_temp, service) = scripted_service(
+            vec![source.clone(); 2],
+            vec![],
+            vec![FakeAction::Value(product_fixture("1"))],
+        )
+        .await;
+        let context = bind_context(&service.inner, &source).unwrap();
+        let (rid, cursors) = {
+            let mut store = locked_store(&service.inner).unwrap();
+            let rid = store.create_research("valid", &context).unwrap();
+            let foreign = store.create_research("foreign", &context).unwrap();
+            let cursors = ["full", "comparison"]
+                .iter()
+                .map(|view| {
+                    store
+                        .put_ref(
+                            &foreign,
+                            "product_cursor",
+                            &json!({"cachedRaw":product_fixture("2"),"presentation":{"view":view}}),
+                            Some(1800),
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            (rid, cursors)
+        };
+        let reply = service.call("ozon_get_products", json!({"researchId":rid,"products":[{"cursor":cursors[0]},{"cursor":cursors[1]},{"sku":"1"}]}), CancellationToken::new()).await;
+        assert!(!reply.error, "{:?}", reply.text);
+        let value = reply.structured.unwrap();
+        assert_eq!(value["view"], "compact");
+        assert_eq!(
+            value["data"]["results"][0]["error"]["code"],
+            "INVALID_REFERENCE"
+        );
+        assert_eq!(
+            value["data"]["results"][1]["error"]["code"],
+            "INVALID_REFERENCE"
+        );
+        assert_eq!(value["data"]["results"][2]["status"], "ok");
+        assert!(value["data"]["results"][2]["product"].get("url").is_none());
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_refinement_admission_does_not_advance_candidate_baseline() {
+        let context = fake_context("same");
+        let raw = json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"Server","price":1.0,"url":"https://www.ozon.ru/product/item-1/"}],"hasNext":false});
+        let mut too_large = raw.clone();
+        too_large["items"][0]["price"] = json!(2.0);
+        too_large["facets"] = json!({"items":[{"title":"Huge","options":[{"label":"x".repeat(9000),"searchUrl":"https://www.ozon.ru/category/x-1/"}]}]});
+        let (_temp, service) = scripted_service(
+            vec![context; 6],
+            vec![
+                FakeAction::Value(raw.clone()),
+                FakeAction::Value(too_large),
+                FakeAction::Value(raw),
+            ],
+            vec![],
+        )
+        .await;
+        let first = service
+            .call(
+                "ozon_search",
+                json!({"start":{"query":"x"}}),
+                CancellationToken::new(),
+            )
+            .await
+            .structured
+            .unwrap();
+        let rid = first["researchId"].as_str().unwrap();
+        let failed = service
+            .call(
+                "ozon_search",
+                json!({"researchId":rid,"start":{"query":"x"},"includeFacets":true}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(failed.error);
+        assert_eq!(failure_code(&failed), "RESULT_TOO_LARGE");
+        let last = service
+            .call(
+                "ozon_search",
+                json!({"researchId":rid,"start":{"query":"x"}}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!last.error, "{:?}", last.text);
+        let last = last.structured.unwrap();
+        assert_eq!(
+            last["data"]["items"][0]["novelty"]["previousProductRef"],
+            first["data"]["items"][0]["productRef"]
+        );
+        assert_eq!(last["data"]["items"][0]["novelty"]["status"], "unchanged");
         service.shutdown().await.unwrap();
     }
 
@@ -2135,6 +2531,22 @@ mod tests {
                 Some(cursor) => {
                     if first_cursor.is_none() {
                         first_cursor = Some(cursor.to_owned());
+                        let mismatch = service
+                            .call(
+                                "ozon_get_reviews",
+                                json!({"start":{"cursor":cursor},"includeFacets":true}),
+                                CancellationToken::new(),
+                            )
+                            .await;
+                        assert!(mismatch.error);
+                        assert_eq!(failure_code(&mismatch), "INVALID_ARGUMENT");
+                        let inherited = presentation_args(
+                            &service.inner,
+                            "ozon_get_reviews",
+                            json!({"start":{"cursor":cursor}}),
+                        )
+                        .unwrap();
+                        assert_eq!(inherited["includeFacets"], false);
                     }
                     start = json!({"cursor":cursor});
                 }

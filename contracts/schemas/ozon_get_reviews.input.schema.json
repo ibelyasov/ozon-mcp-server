@@ -2,23 +2,88 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ozon_get_reviews input",
   "type": "object",
-  "required": ["start"],
+  "required": [
+    "start"
+  ],
   "properties": {
     "start": {
       "oneOf": [
-        {"$ref": "#/$defs/productStart"},
-        {"$ref": "#/$defs/referenceStart"},
-        {"$ref": "#/$defs/cursorStart"}
+        {
+          "$ref": "#/$defs/productStart"
+        },
+        {
+          "$ref": "#/$defs/referenceStart"
+        },
+        {
+          "$ref": "#/$defs/cursorStart"
+        }
       ]
     },
-    "researchId": {"$ref": "#/$defs/opaque"},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10}
+    "researchId": {
+      "$ref": "#/$defs/opaque"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30,
+      "default": 10
+    },
+    "view": {
+      "enum": [
+        "compact",
+        "comparison",
+        "full"
+      ],
+      "default": "compact",
+      "description": "Response presentation. Continuations inherit their captured view; a different explicit view is rejected."
+    },
+    "includeFacets": {
+      "type": "boolean",
+      "description": "Default false for compact/comparison and true for a fresh full request. Continuations inherit the captured setting and reject incompatible overrides."
+    }
   },
   "additionalProperties": false,
   "$defs": {
-    "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
-    "productStart": {"type": "object", "required": ["productRef"], "properties": {"productRef": {"$ref": "#/$defs/opaque"}}, "additionalProperties": false},
-    "referenceStart": {"type": "object", "required": ["reviewSearchRef"], "properties": {"reviewSearchRef": {"$ref": "#/$defs/opaque"}}, "additionalProperties": false},
-    "cursorStart": {"type": "object", "required": ["cursor"], "properties": {"cursor": {"$ref": "#/$defs/opaque"}}, "additionalProperties": false}
+    "opaque": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "productStart": {
+      "type": "object",
+      "required": [
+        "productRef"
+      ],
+      "properties": {
+        "productRef": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    },
+    "referenceStart": {
+      "type": "object",
+      "required": [
+        "reviewSearchRef"
+      ],
+      "properties": {
+        "reviewSearchRef": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cursorStart": {
+      "type": "object",
+      "required": [
+        "cursor"
+      ],
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    }
   }
 }

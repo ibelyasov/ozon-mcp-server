@@ -6,7 +6,8 @@
     {"$ref": "#/$defs/defaultSummary"},
     {"$ref": "#/$defs/pagedSection"},
     {"$ref": "#/$defs/pagedEvidence"},
-    {"$ref": "#/$defs/selectedEvidence"}
+    {"$ref": "#/$defs/selectedEvidence"},
+    {"$ref": "#/$defs/selectedCandidates"}
   ],
   "$defs": {
     "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
@@ -43,6 +44,16 @@
         "researchId": {"$ref": "#/$defs/opaque"},
         "section": {"const": "evidence"},
         "evidenceRefs": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}
+      },
+      "additionalProperties": false
+    },
+    "selectedCandidates": {
+      "type": "object",
+      "required": ["researchId", "section", "productRefs"],
+      "properties": {
+        "researchId": {"$ref": "#/$defs/opaque"},
+        "section": {"const": "candidates"},
+        "productRefs": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/opaque"}}
       },
       "additionalProperties": false
     }

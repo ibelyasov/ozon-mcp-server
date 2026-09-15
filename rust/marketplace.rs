@@ -199,7 +199,7 @@ pub fn normalize_search(
         Some(cursor) => Some(store.put_ref(
             research_id,
             "search_cursor",
-            &json!({"cursor":cursor}),
+            &json!({"cursor":cursor,"presentation":raw.get("_presentation").cloned().unwrap_or(Value::Null)}),
             Some(1800),
         )?),
         None => None,
@@ -613,7 +613,7 @@ pub fn normalize_reviews(
         Some(store.put_ref(
             research_id,
             "review_cursor",
-            &json!({"cachedRaw":cached,"capturedAt":observed,"contextId":context_id,"productRef":product_ref,"sku":sku,"sourceUrl":canonical,"seenRef":seen_ref,"noProgressPages":no_progress_pages,"pageMadeProgress":page_made_progress}),
+            &json!({"cachedRaw":cached,"capturedAt":observed,"contextId":context_id,"productRef":product_ref,"sku":sku,"sourceUrl":canonical,"seenRef":seen_ref,"noProgressPages":no_progress_pages,"pageMadeProgress":page_made_progress,"presentation":raw.get("_presentation").cloned().unwrap_or(Value::Null)}),
             Some(1800),
         )?)
     } else {
@@ -621,7 +621,7 @@ pub fn normalize_reviews(
             Some(path) => Some(store.put_ref(
                 research_id,
                 "review_cursor",
-                &json!({"path":path,"productRef":product_ref,"sku":sku,"sourceUrl":canonical,"seenRef":seen_ref,"noProgressPages":no_progress_pages,"pageMadeProgress":false}),
+                &json!({"path":path,"productRef":product_ref,"sku":sku,"sourceUrl":canonical,"seenRef":seen_ref,"noProgressPages":no_progress_pages,"pageMadeProgress":false,"presentation":raw.get("_presentation").cloned().unwrap_or(Value::Null)}),
                 Some(1800),
             )?),
             None => None,
@@ -906,7 +906,7 @@ fn cached_product_cursor(
     store.put_ref(
         rid,
         "product_cursor",
-        &json!({"cachedRaw":cached,"include":[section],"capturedAt":observed,"contextId":context_id}),
+        &json!({"cachedRaw":cached,"include":[section],"capturedAt":observed,"contextId":context_id,"presentation":raw.get("_presentation").cloned().unwrap_or(Value::Null)}),
         Some(1800),
     )
 }
@@ -925,7 +925,7 @@ fn variants(raw: &Value, store: &mut Store, rid: &str, ev: &str) -> Result<Value
         Some(path) => Some(store.put_ref(
             rid,
             "product_cursor",
-            &json!({"path":path,"include":["variants"]}),
+            &json!({"path":path,"include":["variants"],"presentation":raw.get("_presentation").cloned().unwrap_or(Value::Null)}),
             Some(1800),
         )?),
         None => None,
@@ -953,7 +953,7 @@ fn offers(raw: &Value, store: &mut Store, rid: &str, ev: &str) -> Result<Value> 
         Some(path) => Some(store.put_ref(
             rid,
             "product_cursor",
-            &json!({"path":path,"include":["offers"]}),
+            &json!({"path":path,"include":["offers"],"presentation":raw.get("_presentation").cloned().unwrap_or(Value::Null)}),
             Some(1800),
         )?),
         None => None,
@@ -1355,10 +1355,10 @@ mod tests {
     #[test]
     fn search_creates_durable_refs() {
         let (_d, mut s, r, c) = test_store();
-        let n=normalize_search(&json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"x","price":1.5,"priceType":"unknown","currency":"RUB","url":"https://www.ozon.ru/product/1/"}],"hasNext":false}),&mut s,&r,"c",false,false).unwrap();
+        let mut n=normalize_search(&json!({"searchUrl":"https://www.ozon.ru/search/?text=x","items":[{"sku":"1","name":"x","price":1.5,"priceType":"unknown","currency":"RUB","url":"https://www.ozon.ru/product/1/"}],"hasNext":false}),&mut s,&r,"c",false,false).unwrap();
         let p = n.data["items"][0]["productRef"].as_str().unwrap();
         assert_eq!(s.get_ref(p, "product").unwrap().research_id, r);
-        s.record(&r, "search", "q", &n.product_refs, &n.evidence)
+        s.record_search(&r, "q", &n.product_refs, &n.evidence, &mut n.data["items"])
             .unwrap();
         let stored = s
             .read(&json!({"researchId":r,"section":"evidence"}))

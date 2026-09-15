@@ -2,53 +2,139 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ozon_search input",
   "type": "object",
-  "required": ["start"],
+  "required": [
+    "start"
+  ],
   "properties": {
     "start": {
       "oneOf": [
-        {"$ref": "#/$defs/queryStart"},
-        {"$ref": "#/$defs/referenceStart"},
-        {"$ref": "#/$defs/cursorStart"}
+        {
+          "$ref": "#/$defs/queryStart"
+        },
+        {
+          "$ref": "#/$defs/referenceStart"
+        },
+        {
+          "$ref": "#/$defs/cursorStart"
+        },
+        {
+          "$ref": "#/$defs/refinementsStart"
+        }
       ]
     },
-    "researchId": {"$ref": "#/$defs/opaque"},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 36, "default": 12},
-    "includeFacets": {"type": "boolean", "default": true}
+    "researchId": {
+      "$ref": "#/$defs/opaque"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 36,
+      "default": 12
+    },
+    "includeFacets": {
+      "type": "boolean",
+      "description": "Default false for compact/comparison; true for a fresh full search, false on its continuation. Request true when selecting filters."
+    },
+    "view": {
+      "enum": [
+        "compact",
+        "comparison",
+        "full"
+      ],
+      "default": "compact",
+      "description": "Response presentation. Continuations inherit their captured view; a different explicit view is rejected."
+    },
+    "repeatMode": {
+      "enum": [
+        "full",
+        "delta"
+      ],
+      "default": "full",
+      "description": "Delta returns changed fields with a retrievable immutable baseline; never removes result rows."
+    },
+    "refinementLimit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "default": 12
+    }
   },
   "additionalProperties": false,
   "$defs": {
-    "opaque": {"type": "string", "minLength": 1, "maxLength": 2048},
+    "opaque": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
     "priceRange": {
       "type": "object",
       "properties": {
-        "minMinor": {"type": "integer", "minimum": 0},
-        "maxMinor": {"type": "integer", "minimum": 0}
+        "minMinor": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxMinor": {
+          "type": "integer",
+          "minimum": 0
+        }
       },
       "additionalProperties": false,
       "minProperties": 1
     },
     "queryStart": {
       "type": "object",
-      "required": ["query"],
+      "required": [
+        "query"
+      ],
       "properties": {
-        "query": {"type": "string", "minLength": 1, "maxLength": 500},
-        "priceRange": {"$ref": "#/$defs/priceRange"}
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "priceRange": {
+          "$ref": "#/$defs/priceRange"
+        }
       },
       "additionalProperties": false
     },
     "referenceStart": {
       "type": "object",
-      "required": ["searchRef"],
+      "required": [
+        "searchRef"
+      ],
       "properties": {
-        "searchRef": {"$ref": "#/$defs/opaque"},
-        "priceRange": {"$ref": "#/$defs/priceRange"}
+        "searchRef": {
+          "$ref": "#/$defs/opaque"
+        },
+        "priceRange": {
+          "$ref": "#/$defs/priceRange"
+        }
       },
       "additionalProperties": false
     },
     "cursorStart": {
       "type": "object",
-      "required": ["cursor"],
-      "properties": {"cursor": {"$ref": "#/$defs/opaque"}},
+      "required": [
+        "cursor"
+      ],
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    },
+    "refinementsStart": {
+      "type": "object",
+      "required": [
+        "refinementsCursor"
+      ],
+      "properties": {
+        "refinementsCursor": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
       "additionalProperties": false
     }
   }

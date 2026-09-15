@@ -2,7 +2,7 @@
 
 [Русский обзор](../README.md) · [English overview](../README.en.md) · [Contracts](../contracts/README.md)
 
-This describes development version 1.0.0, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
+This describes version 2.0.0, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
 
 ## Process and configuration
 
@@ -16,6 +16,7 @@ Each MCP client starts a stdio frontend. Frontends connect through private local
 | `OZON_AGENT_BROWSER_BIN` | `agent-browser` from `PATH` | Driver executable, exactly version 0.36.0. |
 | `OZON_BROWSER_EXECUTABLE` | Unset | Optional existing Chrome executable. |
 | `OZON_HEADLESS` | `true` | Only `false` requests a visible browser. |
+| `OZON_MCP_TEXT_MODE` | `compact` | Successful calls put the complete result in `structuredContent` and a short pointer in text. Set `json` only for legacy text-only clients that require the complete JSON duplicated in text. Any other value fails startup. |
 
 The broker and IPC support macOS and Linux. Windows is unsupported. The server never automatically signs in or changes region. To configure either, set `OZON_HEADLESS=false` before broker startup and request context from an MCP client, then make the change manually in the visible window. A running broker retains its launch configuration; stop it gracefully before changing mode.
 
@@ -32,6 +33,20 @@ The verified basis is the observed city of the selected saved address; it is not
 Opaque `researchId`, `productRef`, `imageRef`, and `evidenceRef` values are authority only within private IPC. References bind to their research and context. Navigation and section cursors also bind filters and projection and expire after 30 minutes. Context changes invalidate navigation rather than mixing observations.
 
 Search, product, review, and image calls only read Ozon and write bounded local journal records. Results preserve observation time, context, source association, and evidence paths. Unknown fields stay unknown; a missing or malformed source section is not a confirmed empty list.
+
+## Response views and repeated searches
+
+`ozon_search`, `ozon_get_products`, and `ozon_get_reviews` accept `view: compact | comparison | full`; `compact` is the default. Every view retains requested sections, statuses, unknown values, context, observation time, warnings, and row-level `evidenceRefs`. `compact` and `comparison` set `evidenceDetail: journal` and omit inline evidence metadata; resolve selected references locally with `ozon_get_research` using `section: evidence` and up to 20 `evidenceRefs`. `full` sets `evidenceDetail: inline` and is the compatibility view for consumers that expect all inline fields. A field omitted by a presentation view was not requested in that representation; it must not be interpreted as an observed `unknown` value.
+
+Compact search rows omit URL, seller, delivery, and image metadata, except when a delta row must carry one of those fields because it changed. Comparison search rows retain URL, seller, and delivery metadata. Product calls default to `include: ["characteristics"]` in compact and comparison views, and to characteristics plus offers in full view. An explicit `include` list is honored in every view, including unsupported section statuses. Compact review presentation removes only redundant identity and empty optional metadata; review text is not shortened.
+
+Search also accepts `repeatMode: full | delta`, defaulting to `full`. Both modes preserve every source row. Each row carries `novelty.status` (`new`, `unchanged`, or `changed`), `previousProductRef`, and `changedFields`. In delta mode, a previously observed row uses `representation: delta` and `baselineProductRef`; it always retains identity, prices, availability, range-match assessment, provenance, and every changed field. Retrieve the immutable earlier candidate locally with `ozon_get_research`, `section: candidates`, and one to 20 `productRefs`. Candidate snapshots retain their captured Context and observation time, so a baseline is historical evidence rather than current catalog state.
+
+Search refinements are excluded by default in compact and comparison views. A fresh full search includes them by default; a continuation does not. `includeFacets` explicitly overrides those defaults. Refinements are returned in cached pages controlled by `refinementLimit` (default 12, maximum 100), each capped at 8,000 UTF-16 units. Follow `start.refinementsCursor` to read another cached page without an Ozon or browser request. Source truncation is reported separately from local refinement paging. Item cursors bind `view` and `repeatMode`; refinement cursors additionally bind `refinementLimit`, and incompatible overrides are rejected.
+
+Review facets are opt-in through `includeFacets`; a fresh full-view request defaults them on. Continuations inherit the captured setting; an incompatible explicit override is rejected.
+
+Successful MCP responses always carry the complete result once in `structuredContent`. In the default `OZON_MCP_TEXT_MODE=compact`, text contains only a short pointer to that structured result. `json` preserves compatibility with text-only clients by duplicating the complete JSON in text. Typed error responses are unchanged by this setting. Image calls keep text at content index 0 and append image content after it.
 
 Prices use integer minor units. `ozon_card` is a distinct observed payment condition and is never replaced with `regular`. A visible price does not prove account eligibility. Delivery labels remain as displayed and are not guarantees; an unknown delivery fee is not zero.
 
@@ -63,7 +78,7 @@ At most eight whole calls are admitted. Each call receives 44 seconds for browse
 
 ## Verification boundary
 
-Schema, Rust, browser-script, and client tests establish different properties. They do not prove live catalog access, account identity, seller-offer coverage, or recommendation quality. A disposable real-Chrome lifecycle run recorded seven passing tests in 8.45 seconds: cancellation followed by restart, strict profile contention, persistent poison state after cleanup failure, confirmed-close recovery, and private profile paths without fallback. It was compiled before the final source/tools changes and did not test abnormal broker termination. Version 1.0.0 remains in development until the remaining live broker, catalog, target-client, reconnect, and agent-task gates have recorded evidence.
+Schema, Rust, browser-script, and client tests establish different properties. They do not prove live catalog access, account identity, seller-offer coverage, or recommendation quality. A disposable real-Chrome lifecycle run recorded seven passing tests in 8.45 seconds: cancellation followed by restart, strict profile contention, persistent poison state after cleanup failure, confirmed-close recovery, and private profile paths without fallback. It was compiled before the final source/tools changes and did not test abnormal broker termination. Release publication does not establish the remaining live broker, catalog, target-client, reconnect, and agent-task acceptance; those require separately recorded evidence.
 
 ```sh
 UV_CACHE_DIR=/tmp/ozon-contracts-uv uv run --offline --no-project --with 'jsonschema[format]==4.25.1' python scripts/validate-contracts.py
