@@ -23,6 +23,7 @@ use url::Url;
 use uuid::Uuid;
 
 const DEADLINE: Duration = Duration::from_secs(55);
+const PRODUCT_BATCH_CONFIRMATION_RESERVE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct Service {
@@ -46,6 +47,7 @@ enum FakeAction {
 #[cfg(test)]
 struct FakeGateway {
     contexts: std::collections::VecDeque<Value>,
+    context_delay: Duration,
     searches: std::collections::VecDeque<FakeAction>,
     products: std::collections::VecDeque<FakeAction>,
     reviews: std::collections::VecDeque<FakeAction>,
@@ -55,7 +57,13 @@ struct FakeGateway {
 
 #[cfg(test)]
 impl FakeGateway {
-    async fn context(&mut self, _cancel: &CancellationToken) -> Result<Value> {
+    async fn context(&mut self, cancel: &CancellationToken) -> Result<Value> {
+        if !self.context_delay.is_zero() {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(anyhow!("CANCELLED: fake context cancelled")),
+                _ = tokio::time::sleep(self.context_delay) => {}
+            }
+        }
         let mut context = self
             .contexts
             .pop_front()
@@ -509,18 +517,18 @@ async fn products(
     let mut all_evidence = vec![];
     let mut product_refs = vec![];
     let mut warnings = vec![];
-    for (selector, resolved) in selectors.iter().zip(resolved) {
+    let confirmation_reserve = PRODUCT_BATCH_CONFIRMATION_RESERVE
+        .min(deadline.saturating_duration_since(Instant::now()) / 2);
+    let product_deadline = deadline - confirmation_reserve;
+    let mut fetched = Vec::with_capacity(selectors.len());
+    for resolved in resolved {
         if cancel.is_cancelled() {
             break;
         }
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
-                results.push(item_error(
-                    selector,
-                    error_code(&error),
-                    &safe_message(&error),
-                ));
+                fetched.push(Err(error));
                 continue;
             }
         };
@@ -531,47 +539,76 @@ async fn products(
         let raw_result = match cached {
             Some(raw) => Ok(raw),
             None => {
-                gateway_call(inner, cancel, deadline, move |gateway, token| {
+                gateway_call(inner, cancel, product_deadline, move |gateway, token| {
                     Box::pin(async move { gateway.product(&target, token).await })
                 })
                 .await
             }
         };
-        match raw_result {
-            Ok(raw) => match if fetched_live {
-                confirm_context(inner, cancel, deadline, &context_id).await
-            } else {
-                Ok(())
-            } {
-                Ok(()) => {
-                    let normalization = {
-                        let mut store = locked_store(inner)?;
-                        marketplace::normalize_product(
-                            &raw,
-                            selector,
-                            &mut store,
-                            &research_id,
-                            &context_id,
-                            &item_include,
-                        )
-                    };
-                    match normalization {
-                        Ok(normalized) => {
-                            results.push(normalized.result);
-                            all_evidence.extend(normalized.evidence);
-                            product_refs.extend(normalized.product_refs);
-                            warnings.extend(normalized.warnings)
-                        }
-                        Err(e) => {
-                            results.push(item_error(selector, error_code(&e), &safe_message(&e)))
-                        }
-                    }
-                }
-                Err(e) => results.push(item_error(selector, error_code(&e), &safe_message(&e))),
-            },
-            Err(e) => results.push(item_error(selector, error_code(&e), &safe_message(&e))),
-        }
+        fetched.push(raw_result.map(|mut raw| {
+            if fetched_live {
+                raw["_continuationObservedAt"] = json!(evidence::now());
+            }
+            (raw, item_include, fetched_live)
+        }));
         tokio::task::yield_now().await;
+    }
+    let needs_confirmation = fetched.iter().any(|item| matches!(item, Ok((_, _, true))));
+    let confirmation_error = if needs_confirmation {
+        if Instant::now() < deadline {
+            confirm_context(inner, cancel, deadline, &context_id)
+                .await
+                .err()
+                .map(|error| (error_code(&error).to_owned(), safe_message(&error)))
+        } else {
+            Some((
+                "UPSTREAM_TIMEOUT".to_owned(),
+                "The product batch exhausted its context confirmation budget.".to_owned(),
+            ))
+        }
+    } else {
+        None
+    };
+    for (selector, fetched) in selectors.iter().zip(fetched) {
+        let (raw, item_include, fetched_live) = match fetched {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                results.push(item_error(
+                    selector,
+                    error_code(&error),
+                    &safe_message(&error),
+                ));
+                continue;
+            }
+        };
+        if fetched_live && let Some((code, message)) = &confirmation_error {
+            results.push(item_error(selector, code, message));
+            continue;
+        }
+        let normalization = {
+            let mut store = locked_store(inner)?;
+            marketplace::normalize_product(
+                &raw,
+                selector,
+                &mut store,
+                &research_id,
+                &context_id,
+                &item_include,
+            )
+        };
+        match normalization {
+            Ok(normalized) => {
+                results.push(normalized.result);
+                all_evidence.extend(normalized.evidence);
+                product_refs.extend(normalized.product_refs);
+                warnings.extend(normalized.warnings)
+            }
+            Err(error) => results.push(item_error(
+                selector,
+                error_code(&error),
+                &safe_message(&error),
+            )),
+        }
     }
     let n = Normalized {
         data: json!({"results":results}),
@@ -1092,13 +1129,26 @@ async fn gateway_call<F>(
 where
     F: for<'a> FnOnce(&'a mut GatewayBackend, &'a CancellationToken) -> GatewayFuture<'a>,
 {
+    if cancel.is_cancelled() {
+        return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    if Instant::now() >= deadline {
+        return Err(anyhow!(
+            "UPSTREAM_TIMEOUT: browser queue budget expired before the operation started"
+        ));
+    }
     let mut gateway_guard = tokio::select! {
         guard = inner.gateway.lock() => guard,
         _ = cancel.cancelled() => return Err(anyhow!("CANCELLED: request cancelled")),
-        _ = tokio::time::sleep_until(deadline) => return Err(anyhow!("UPSTREAM_TIMEOUT: browser queue deadline expired")),
+        _ = tokio::time::sleep_until(deadline) => return Err(anyhow!("UPSTREAM_TIMEOUT: browser queue budget expired before the operation started")),
     };
     if cancel.is_cancelled() {
         return Err(anyhow!("CANCELLED: request cancelled"));
+    }
+    if Instant::now() >= deadline {
+        return Err(anyhow!(
+            "UPSTREAM_TIMEOUT: browser queue budget expired before the operation started"
+        ));
     }
     if gateway_guard.is_none() {
         *gateway_guard = Some(GatewayBackend::Real(Gateway::from_env().await?));
@@ -1121,7 +1171,7 @@ where
             _ = tokio::time::sleep_until(deadline) => {
                 operation_cancel.cancel();
                 let _ = operation.await;
-                Err(anyhow!("UPSTREAM_TIMEOUT: operation deadline expired"))
+                Err(anyhow!("UPSTREAM_TIMEOUT: active browser operation deadline expired"))
             }
         }
     };
@@ -1515,6 +1565,7 @@ mod tests {
             .unwrap();
         *service.inner.gateway.lock().await = Some(GatewayBackend::Fake(FakeGateway {
             contexts: contexts.into(),
+            context_delay: Duration::ZERO,
             searches: searches.into(),
             products: products.into(),
             reviews: std::collections::VecDeque::new(),
@@ -1813,7 +1864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_preserves_completed_item_when_later_cleanup_crosses_deadline() {
+    async fn batch_fails_live_items_when_cleanup_exhausts_confirmation_budget() {
         let context = fake_context("same");
         let (_temp, service) = scripted_service(
             vec![context.clone(), context],
@@ -1836,10 +1887,99 @@ mod tests {
         .await;
         assert!(!reply.error, "{}", reply.text.unwrap_or_default());
         let value = reply.structured.unwrap();
-        assert_eq!(value["data"]["results"][0]["status"], "ok");
+        assert_eq!(
+            value["data"]["results"][0]["error"]["code"],
+            "UPSTREAM_TIMEOUT"
+        );
         assert_eq!(
             value["data"]["results"][1]["error"]["code"],
             "UPSTREAM_TIMEOUT"
+        );
+        contracts::validate_output("ozon_get_products", &value).unwrap();
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn product_batch_uses_one_post_fetch_context_confirmation() {
+        let context = fake_context("same");
+        let products = (1..=8)
+            .map(|sku| FakeAction::Value(product_fixture(&sku.to_string())))
+            .collect();
+        let (_temp, service) =
+            scripted_service(vec![context.clone(), context], vec![], products).await;
+        match service.inner.gateway.lock().await.as_mut().unwrap() {
+            GatewayBackend::Fake(gateway) => gateway.context_delay = Duration::from_millis(10),
+            GatewayBackend::Real(_) => unreachable!(),
+        }
+        let reply = execute(
+            service.inner.clone(),
+            "ozon_get_products",
+            json!({"products": (1..=8).map(|sku| json!({"sku":sku.to_string()})).collect::<Vec<_>>() }),
+            CancellationToken::new(),
+            Instant::now() + Duration::from_millis(65),
+        )
+        .await;
+        assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+        let value = reply.structured.unwrap();
+        assert_eq!(
+            value["data"]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|result| result["status"] == "ok")
+                .count(),
+            8,
+            "{value}"
+        );
+        contracts::validate_output("ozon_get_products", &value).unwrap();
+        service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn product_batch_context_mismatch_fails_live_items_but_keeps_cached_items() {
+        let context = fake_context("before");
+        let (_temp, service) = scripted_service(
+            vec![context.clone(), fake_context("after")],
+            vec![],
+            vec![FakeAction::Value(product_fixture("2"))],
+        )
+        .await;
+        let bound_context = bind_context(&service.inner, &context).unwrap();
+        let (research_id, cursor) = {
+            let mut store = locked_store(&service.inner).unwrap();
+            let research_id = store
+                .create_research("cached and live products", &bound_context)
+                .unwrap();
+            let cursor = store
+                .put_ref(
+                    &research_id,
+                    "product_cursor",
+                    &json!({
+                        "path":"/product/item-1/",
+                        "include":["characteristics"],
+                        "cachedRaw":product_fixture("1")
+                    }),
+                    Some(1800),
+                )
+                .unwrap();
+            (research_id, cursor)
+        };
+        let reply = service
+            .call(
+                "ozon_get_products",
+                json!({
+                    "researchId":research_id,
+                    "products":[{"cursor":cursor},{"sku":"2"}]
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!reply.error, "{}", reply.text.unwrap_or_default());
+        let value = reply.structured.unwrap();
+        assert_eq!(value["data"]["results"][0]["status"], "ok");
+        assert_eq!(
+            value["data"]["results"][1]["error"]["code"],
+            "CONTEXT_CHANGED"
         );
         contracts::validate_output("ozon_get_products", &value).unwrap();
         service.shutdown().await.unwrap();

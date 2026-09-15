@@ -1,0 +1,78 @@
+{
+  "schema": "schemas/ozon_get_products.output.schema.json",
+  "baseExample": "examples/positive/ozon_get_products.json",
+  "target": "output",
+  "mutation": {
+    "path": "data.results.0.product",
+    "value": {
+      "productRef": "product-123",
+      "sku": "123",
+      "title": "Наушники",
+      "url": "https://www.ozon.ru/product/123/",
+      "availability": "unknown",
+      "prices": [
+        {
+          "amountMinor": 62700,
+          "currency": "RUB",
+          "type": "unknown",
+          "condition": null,
+          "evidenceRefs": [
+            "ev-product"
+          ]
+        }
+      ],
+      "seller": null,
+      "rating": null,
+      "reviewCount": null,
+      "characteristics": {
+        "status": "partial",
+        "items": [
+          {
+            "name": "Цвет",
+            "value": "черный",
+            "evidenceRefs": [
+              "ev-product"
+            ]
+          }
+        ],
+        "truncated": true,
+        "nextCursor": "cursor-char-2",
+        "hasNext": true
+      },
+      "offers": {
+        "status": "unsupported",
+        "items": [],
+        "truncated": false,
+        "nextCursor": null,
+        "hasNext": null
+      },
+      "images": {
+        "status": "available",
+        "items": [
+          {
+            "imageRef": "image-123-1",
+            "altText": null,
+            "evidenceRefs": [
+              "ev-product"
+            ]
+          }
+        ],
+        "truncated": false,
+        "nextCursor": null,
+        "hasNext": false
+      },
+      "fieldEvidence": [
+        {
+          "fieldPath": "/title",
+          "evidenceRefs": [
+            "ev-product"
+          ]
+        }
+      ],
+      "evidenceRefs": [
+        "ev-product"
+      ]
+    }
+  },
+  "expectedInvalidAt": "schema"
+}

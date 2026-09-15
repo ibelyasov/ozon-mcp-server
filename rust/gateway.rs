@@ -125,7 +125,7 @@ impl Gateway {
         ensure_not_cancelled(cancel)?;
         let base = self.pages.fetch_json(&path, cancel).await?;
         ensure_not_cancelled(cancel)?;
-        let needs_secondary = !parse::parse_description(&base).has_text();
+        let needs_secondary = needs_product_supplement(&base);
         let mut secondary = None;
         let mut secondary_failed = false;
         if needs_secondary {
@@ -144,7 +144,7 @@ impl Gateway {
         }
         ensure_not_cancelled(cancel)?;
         let mut details = parse::parse_details(&base, secondary.as_ref());
-        if secondary_failed {
+        if secondary_failed && !parse::parse_description(&base).has_text() {
             push_warning(&mut details.warnings, Warning::DescriptionFetchFailed);
         }
         if !details.description.has_text() {
@@ -344,9 +344,30 @@ fn push_warning(warnings: &mut Vec<Warning>, warning: Warning) {
     }
 }
 
+fn needs_product_supplement(base: &Value) -> bool {
+    !parse::parse_description(base).has_text() || parse::parse_duty(base).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_description_does_not_skip_customs_supplement() {
+        let mut base = json!({"widgetStates":{"webDescription-0":{"richAnnotation":"<p>Real product description</p>"}}});
+        assert!(needs_product_supplement(&base));
+        let secondary = json!({"widgetStates":{"webIconWithText-duty":{"title":"Таможенная пошлина", "text":"1 737 ₽ при получении"}}});
+        assert_eq!(
+            parse::parse_details(&base, Some(&secondary))
+                .duty
+                .unwrap()
+                .amount,
+            1737.0
+        );
+        base["widgetStates"]["webIconWithText-duty"] =
+            secondary["widgetStates"]["webIconWithText-duty"].clone();
+        assert!(!needs_product_supplement(&base));
+    }
 
     #[test]
     fn product_and_review_navigation_stays_on_public_product_routes() {

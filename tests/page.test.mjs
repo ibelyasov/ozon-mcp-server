@@ -381,6 +381,11 @@ test("fetch retains only public widgets and safe metadata", async () => {
     widgetStates: {
       "webPrice-1": { price: "100" },
       "webDescription-2": "public",
+      "webShortCharacteristics-3": { characteristics: [{ title: "CPU" }] },
+      "webIconWithText-customs-duty": {
+        title: "Таможенная пошлина",
+        text: "1 737 ₽ при получении",
+      },
       "accountWidget-1": { email: "private@example.test" },
     },
     seo: {
@@ -411,6 +416,11 @@ test("fetch retains only public widgets and safe metadata", async () => {
       widgetStates: {
         "webPrice-1": { price: "100" },
         "webDescription-2": "public",
+        "webShortCharacteristics-3": { characteristics: [{ title: "CPU" }] },
+        "webIconWithText-customs-duty": {
+          title: "Таможенная пошлина",
+          text: "1 737 ₽ при получении",
+        },
       },
       seo: { title: "Product", link: [{ href: "/product/1" }] },
       layoutTrackingInfo: { sku: "12345" },

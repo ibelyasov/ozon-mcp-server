@@ -245,6 +245,9 @@ pub struct ProductDetails {
     pub delivery_label: Option<String>,
     pub images: Vec<String>,
     pub characteristics: BTreeMap<String, String>,
+    /// `webShortCharacteristics` is a summary widget and carries no proof that
+    /// the full product specification was returned.
+    pub characteristics_complete: bool,
     pub description: Description,
     pub variants: ProductVariants,
     pub offers: ProductOffers,

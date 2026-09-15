@@ -14,6 +14,7 @@
   "deliveryLabel": null,
   "images": [],
   "characteristics": {},
+  "characteristicsComplete": false,
   "description": { "text": "Useful text", "images": ["https://www.ozon.ru/one.jpg"] },
   "variants": { "status": "unknown", "items": [], "hasNext": null, "nextPath": null },
   "offers": { "status": "unsupported", "items": [], "hasNext": null, "nextPath": null }

@@ -704,7 +704,12 @@ fn walk_description(value: &Value, texts: &mut Vec<String>, images: &mut Vec<Str
             .and_then(|value| value.get("content"))
             .and_then(Value::as_array)
         {
-            texts.extend(content.iter().filter_map(text));
+            texts.extend(
+                content
+                    .iter()
+                    .filter_map(text)
+                    .filter(|value| key != "title" || value.trim().to_lowercase() != "заголовок"),
+            );
         }
     }
     let image = image_url(record.get("img").and_then(|value| value.get("src")))
@@ -759,32 +764,29 @@ pub fn parse_description(page: &Value) -> Description {
     }
 }
 
-fn parse_duty(page: &Value) -> Option<(f64, &'static str)> {
+pub(crate) fn parse_duty(page: &Value) -> Option<(f64, String)> {
     let amount_re =
         Regex::new(r"(?iu)([+-]?\d(?:[\d\s\u{00a0}\u{202f}.,]*\d)?)\s*(?:₽|руб(?:\.|л[а-яё]*)?)")
             .unwrap();
     let marker = Regex::new(r"(?iu)customs-duty|пошлин").unwrap();
     for state in WidgetSet::new(page).all_valid("webIconWithText") {
-        let mut strings = Vec::new();
-        collect_strings(&state, &mut strings);
-        if !strings.iter().any(|s| marker.is_match(s)) {
+        let mut labels = ["title", "text", "subtitle", "description"]
+            .into_iter()
+            .filter_map(|key| text_from(state.get(key)))
+            .collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        labels.retain(|label| seen.insert(label.clone()));
+        let label = labels.join(" ");
+        if label.chars().count() > 500 || !marker.is_match(&label) {
             continue;
         }
-        let joined = strings.join(" ");
-        for source in strings
-            .iter()
-            .filter(|s| marker.is_match(s))
-            .map(String::as_str)
-            .chain(std::iter::once(joined.as_str()))
+        if let Some(amount) = amount_re
+            .captures(&label)
+            .and_then(|c| c.get(1))
+            .and_then(|m| parse_localized_number(m.as_str()))
+            .filter(|amount| *amount >= 0.0)
         {
-            if let Some(amount) = amount_re
-                .captures(source)
-                .and_then(|c| c.get(1))
-                .and_then(|m| parse_localized_number(m.as_str()))
-                .filter(|amount| *amount >= 0.0)
-            {
-                return Some((amount, "пошлина не входит в цену"));
-            }
+            return Some((amount, label));
         }
     }
     None
@@ -847,11 +849,13 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails
     let explicit_card_price = price_to_number(price.as_ref().and_then(|v| v.get("cardPrice")));
     let card_price = explicit_card_price
         .or_else(|| price_to_number(price.as_ref().and_then(|v| v.get("price"))));
-    let duty = parse_duty(base_page).map(|(amount, note)| Duty {
-        amount,
-        total: card_price.map(|price| price + amount),
-        note: note.to_owned(),
-    });
+    let duty = parse_duty(base_page)
+        .or_else(|| page2.and_then(parse_duty))
+        .map(|(amount, note)| Duty {
+            amount,
+            total: card_price.map(|price| price + amount),
+            note,
+        });
     let name = text_from(heading.as_ref().and_then(|v| v.get("title")))
         .or_else(|| base_page.pointer("/seo/title").and_then(text));
     let final_url = url.or_else(|| {
@@ -892,6 +896,7 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails
             .and_then(text),
         images,
         characteristics: parse_short_characteristics(base_page),
+        characteristics_complete: false,
         description,
         variants: parse_variants(base_page),
         offers: ProductOffers {

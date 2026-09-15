@@ -283,6 +283,9 @@ pub fn normalize_product(
         json!({"fieldPath":"/rating","value":raw.get("rating").cloned().unwrap_or(Value::Null)}),
         json!({"fieldPath":"/reviewCount","value":raw.get("reviews").cloned().unwrap_or(Value::Null)}),
     ];
+    facts.push(
+        json!({"fieldPath":"/customsDuty/amountMinor","value":money(raw.pointer("/duty/amount"))}),
+    );
     let characteristic_offset = if continuation_section == Some("characteristics") {
         continuation_offset
     } else {
@@ -296,7 +299,10 @@ pub fn normalize_product(
         }
     }
     if include.iter().any(|section| section == "description")
-        && let Some(value) = raw.pointer("/description/text").and_then(Value::as_str)
+        && let Some(value) = raw
+            .pointer("/description/text")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty() && v.trim().to_lowercase() != "заголовок")
     {
         let offset = if continuation_section == Some("description") {
             continuation_offset
@@ -340,6 +346,7 @@ pub fn normalize_product(
     let mut field_paths = vec![
         "/title",
         "/prices",
+        "/customsDuty",
         "/availability",
         "/rating",
         "/reviewCount",
@@ -376,6 +383,13 @@ pub fn normalize_product(
         json!(availability(raw.get("available"))),
     );
     product.insert("prices".into(), json!(product_prices(raw, &ev_id)));
+    let duty_amount = money(raw.pointer("/duty/amount"));
+    product.insert("customsDuty".into(), json!({
+        "status": if duty_amount.is_some() { "available" } else { "unknown" },
+        "amountMinor": duty_amount, "currency": "RUB",
+        "label": raw.pointer("/duty/note").and_then(Value::as_str).map(|v| v.chars().take(2000).collect::<String>()),
+        "evidenceRefs": [ev_id]
+    }));
     product.insert("seller".into(), seller(raw.get("seller"), &ev_id));
     product.insert(
         "rating".into(),
@@ -414,11 +428,20 @@ pub fn normalize_product(
         };
         product.insert(section.clone(), value);
     }
+    let mut warnings = source_warnings(raw);
+    if duty_amount.is_none() {
+        warnings.push(warning("CUSTOMS_DUTY_UNKNOWN", "Customs duty was not observed; missing duty is not zero and displayed prices do not confirm the total payable cost.", &[&ev_id]));
+    }
+    if include.iter().any(|s| s == "characteristics")
+        && raw.get("characteristicsComplete").and_then(Value::as_bool) != Some(true)
+    {
+        warnings.push(warning("CHARACTERISTICS_INCOMPLETE", "Only observed characteristics are returned; the full product specification is not confirmed.", &[&ev_id]));
+    }
     Ok(ProductNormalized {
         result: json!({"status":"ok","requested":requested,"product":Value::Object(product)}),
         evidence: vec![ev],
         product_refs: vec![product_ref],
-        warnings: source_warnings(raw),
+        warnings,
     })
 }
 
@@ -775,15 +798,25 @@ fn characteristics(
         None
     };
     let mut m = section_base(
-        if pairs.is_some() {
-            if more { "partial" } else { "available" }
+        if count > 0 {
+            if more || raw.get("characteristicsComplete").and_then(Value::as_bool) != Some(true) {
+                "partial"
+            } else {
+                "available"
+            }
         } else {
             "unknown"
         },
         remaining,
         50,
         next,
-        Value::Bool(more),
+        if more {
+            json!(true)
+        } else if raw.get("characteristicsComplete").and_then(Value::as_bool) == Some(true) {
+            json!(false)
+        } else {
+            Value::Null
+        },
     );
     m.insert(
         "items".into(),
@@ -810,7 +843,7 @@ fn description(
     let text = raw
         .pointer("/description/text")
         .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty());
+        .filter(|value| !value.trim().is_empty() && value.trim().to_lowercase() != "заголовок");
     let offset = raw
         .pointer("/_continuation/offset")
         .and_then(Value::as_u64)
@@ -1216,6 +1249,70 @@ mod tests {
             current = node.value["parent"].as_str().map(str::to_owned);
         }
         keys.into_iter().collect()
+    }
+
+    #[test]
+    fn product_preserves_customs_and_marks_summary_characteristics_partial() {
+        let (_d, mut store, rid, context) = test_store();
+        let raw = json!({"sku":"123","name":"x","url":"https://www.ozon.ru/product/x-123/","duty":{"amount":1234.56,"total":9999.0,"note":"пошлина не входит в цену"},"characteristics":{"Цвет":"черный"},"description":{"text":"Заголовок"}});
+        let n = normalize_product(
+            &raw,
+            &json!({"sku":"123"}),
+            &mut store,
+            &rid,
+            "c",
+            &["characteristics".into(), "description".into()],
+        )
+        .unwrap();
+        let p = &n.result["product"];
+        assert_eq!(p["customsDuty"]["amountMinor"], 123456);
+        assert_eq!(p["customsDuty"]["status"], "available");
+        assert_eq!(p["characteristics"]["status"], "partial");
+        assert_eq!(p["characteristics"]["hasNext"], Value::Null);
+        assert_eq!(p["characteristics"]["truncated"], false);
+        assert_eq!(p["description"]["status"], "unknown");
+        let observed = n.evidence[0]["observedAt"].as_str().unwrap().to_owned();
+        let out = evidence::envelope(
+            Some(&rid),
+            json!({"results":[n.result]}),
+            &context,
+            n.evidence,
+            n.warnings,
+            &observed,
+        );
+        contracts::validate_output("ozon_get_products", &out).unwrap();
+    }
+
+    #[test]
+    fn missing_duty_and_characteristics_do_not_mean_zero_or_complete() {
+        let (_d, mut store, rid, _context) = test_store();
+        for duty in [Value::Null, json!({"amount":-1}), json!({"amount":"123"})] {
+            let raw = json!({"sku":"123","name":"x","url":"https://www.ozon.ru/product/x-123/","duty":duty,"characteristics":{}});
+            let n = normalize_product(
+                &raw,
+                &json!({"sku":"123"}),
+                &mut store,
+                &rid,
+                "c",
+                &["characteristics".into()],
+            )
+            .unwrap();
+            assert_eq!(n.result["product"]["customsDuty"]["status"], "unknown");
+            assert_eq!(
+                n.result["product"]["customsDuty"]["amountMinor"],
+                Value::Null
+            );
+            assert_eq!(n.result["product"]["characteristics"]["status"], "unknown");
+            assert_eq!(
+                n.result["product"]["characteristics"]["hasNext"],
+                Value::Null
+            );
+            assert!(
+                n.warnings
+                    .iter()
+                    .any(|v| v["code"] == "CUSTOMS_DUTY_UNKNOWN")
+            );
+        }
     }
 
     #[test]

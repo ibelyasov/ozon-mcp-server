@@ -261,6 +261,54 @@ fn description_extracts_observed_rich_title_and_text_content_arrays() {
 }
 
 #[test]
+fn description_rejects_standalone_editor_placeholder_title() {
+    let page = json!({"widgetStates": {"webDescription-0": {
+        "richAnnotationJson": {"content": [{"blocks": [{
+            "title": {"content": ["Заголовок"]}
+        }]}]}
+    }}});
+
+    assert_eq!(parse_description(&page), json!({"text": "", "images": []}));
+}
+
+#[test]
+fn short_characteristics_never_claim_complete_source_coverage() {
+    let page = json!({"widgetStates": {"webShortCharacteristics-0": {
+        "characteristics": [{
+            "title": {"text": "Тип памяти"},
+            "values": [{"text": "DDR4"}]
+        }]
+    }}});
+
+    let parsed = parse_details(&page, None);
+    assert_eq!(parsed["characteristics"]["Тип памяти"], "DDR4");
+    assert_eq!(parsed["characteristicsComplete"], false);
+}
+
+#[test]
+fn customs_duty_can_be_observed_in_a_secondary_product_fragment() {
+    let base = json!({"widgetStates": {
+        "webPrice-0": {"cardPrice": "50 000 ₽"}
+    }});
+    let secondary = json!({"widgetStates": {
+        "webIconWithText-customs-duty": {
+            "title": "Таможенная пошлина",
+            "text": "1 737 ₽ при получении",
+            "trackingInfo": {"unrelatedPrice": "9 999 ₽", "private": "discard"}
+        }
+    }});
+
+    assert_eq!(
+        parse_details(&base, Some(&secondary))["duty"],
+        json!({
+            "amount": 1737.0,
+            "total": 51737.0,
+            "note": "Таможенная пошлина 1 737 ₽ при получении"
+        })
+    );
+}
+
+#[test]
 fn search_preserves_missing_prices_and_all_grid_source_order() {
     let page = json!({"widgetStates": {
         "tileGridDesktop-z": {"items": [{"sku": "2"}, {"sku": "1", "mainState": [
