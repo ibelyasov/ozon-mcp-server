@@ -431,7 +431,14 @@ fn is_requested_page(requested: &str, actual: &str) -> bool {
             target.path() == final_url.path()
         };
         let mut requested_query = semantic_query(&target);
-        let actual_query = semantic_query(&final_url);
+        let mut actual_query = semantic_query(&final_url);
+        if !normalize_observed_brand_prediction(
+            &mut requested_query,
+            &mut actual_query,
+            target.path() == "/search/",
+        ) {
+            return false;
+        }
         if allowed_path && requested_query == actual_query {
             return true;
         }
@@ -497,6 +504,57 @@ fn category_path_has_brand(path: &str, brand: &str) -> bool {
                     .strip_suffix(brand)
                     .is_some_and(|prefix| prefix.ends_with('-'))
         })
+}
+
+fn normalize_observed_brand_prediction(
+    requested: &mut std::collections::BTreeMap<(String, String), usize>,
+    actual: &mut std::collections::BTreeMap<(String, String), usize>,
+    allow_inferred_brand: bool,
+) -> bool {
+    let Some(_) = remove_valid_brand_prediction_marker(requested) else {
+        return false;
+    };
+    let Some(actual_prediction) = remove_valid_brand_prediction_marker(actual) else {
+        return false;
+    };
+
+    if !actual_prediction
+        || !allow_inferred_brand
+        || requested.keys().any(|(key, _)| key == "brand")
+    {
+        return true;
+    }
+    let brands = actual
+        .iter()
+        .filter(|((key, _), _)| key == "brand")
+        .map(|((_, value), count)| (value.clone(), *count))
+        .collect::<Vec<_>>();
+    match brands.as_slice() {
+        [] => true,
+        [(brand, 1)] if !brand.is_empty() && brand.bytes().all(|byte| byte.is_ascii_digit()) => {
+            actual.remove(&("brand".to_owned(), brand.clone()));
+            true
+        }
+        _ => false,
+    }
+}
+
+fn remove_valid_brand_prediction_marker(
+    query: &mut std::collections::BTreeMap<(String, String), usize>,
+) -> Option<bool> {
+    let marker = ("brand_was_predicted".to_owned(), "true".to_owned());
+    let marker_entries = query
+        .iter()
+        .filter(|((key, _), _)| key == "brand_was_predicted")
+        .collect::<Vec<_>>();
+    if marker_entries.is_empty() {
+        return Some(false);
+    }
+    if marker_entries.len() != 1 || query.get(&marker) != Some(&1) {
+        return None;
+    }
+    query.remove(&marker);
+    Some(true)
 }
 
 fn semantic_query(url: &url::Url) -> std::collections::BTreeMap<(String, String), usize> {
@@ -724,6 +782,61 @@ mod tests {
             "https://www.ozon.ru/search/?text=mouse&brand=26303256",
             "https://www.ozon.ru/category/mice-15871/other-42/?text=mouse&category_was_predicted=true"
         ));
+    }
+
+    #[test]
+    fn search_brand_prediction_marker_is_final_only_navigation_metadata() {
+        let requested = "https://www.ozon.ru/search/?text=GMKtec+M6+Ultra";
+        let observed = "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&category_was_predicted=true&deny_category_prediction=true&from_global=true&text=GMKtec+M6+Ultra";
+        assert!(is_requested_page(requested, observed));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=GMKtec+M6+32",
+            "https://www.ozon.ru/search/?brand=100888485&brand_was_predicted=true&deny_category_prediction=true&from_global=true&text=GMKtec+M6+32"
+        ));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=GMKtec+M6+32&brand=100888485&brand_was_predicted=true&page=2",
+            "https://www.ozon.ru/search/?page=2&brand_was_predicted=true&brand=100888485&text=GMKtec+M6+32&__rr=1"
+        ));
+
+        for actual in [
+            "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=false&category_was_predicted=true&text=GMKtec+M6+Ultra",
+            "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&brand_was_predicted=true&category_was_predicted=true&text=GMKtec+M6+Ultra",
+            "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&category_was_predicted=true&text=GMKtec+M6",
+            "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&category_was_predicted=true&text=GMKtec+M6+Ultra&color=black",
+            "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&category_was_predicted=true&text=GMKtec+M6+Ultra&sorting=price",
+            "https://evil.example/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&category_was_predicted=true&text=GMKtec+M6+Ultra",
+            "https://www.ozon.ru/search/?brand=100888485&text=GMKtec+M6+Ultra",
+            "https://www.ozon.ru/search/?brand=not-numeric&brand_was_predicted=true&text=GMKtec+M6+Ultra",
+            "https://www.ozon.ru/search/?brand=100888485&brand=42&brand_was_predicted=true&text=GMKtec+M6+Ultra",
+        ] {
+            assert!(!is_requested_page(requested, actual), "accepted {actual}");
+        }
+
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=GMKtec+M6+Ultra&brand=42",
+            "https://www.ozon.ru/category/mini-pk-15705/gmktec-100888485/?brand_was_predicted=true&category_was_predicted=true&text=GMKtec+M6+Ultra"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/search/?text=GMKtec+M6+Ultra&brand=42",
+            "https://www.ozon.ru/search/?text=GMKtec+M6+Ultra&brand=43&brand_was_predicted=true"
+        ));
+        assert!(is_requested_page(
+            "https://www.ozon.ru/search/?text=GMKtec+M6+Ultra&brand=42",
+            "https://www.ozon.ru/search/?text=GMKtec+M6+Ultra&brand=42&brand_was_predicted=true"
+        ));
+        assert!(!is_requested_page(
+            "https://www.ozon.ru/category/mini-pk-15705/?text=GMKtec+M6+32",
+            "https://www.ozon.ru/category/mini-pk-15705/?text=GMKtec+M6+32&brand=100888485&brand_was_predicted=true"
+        ));
+        for requested in [
+            "https://www.ozon.ru/search/?text=GMKtec+M6+32&brand=100888485&brand_was_predicted=false",
+            "https://www.ozon.ru/search/?text=GMKtec+M6+32&brand=100888485&brand_was_predicted=true&brand_was_predicted=true",
+        ] {
+            assert!(!is_requested_page(
+                requested,
+                "https://www.ozon.ru/search/?text=GMKtec+M6+32&brand=100888485&brand_was_predicted=true"
+            ));
+        }
     }
 
     #[test]
