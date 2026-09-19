@@ -300,9 +300,52 @@ impl OzonPages {
         options: Value,
         cancel: &CancellationToken,
     ) -> Result<PageOutcome> {
+        let can_recover_origin = matches!(
+            options.get("mode").and_then(Value::as_str),
+            Some("context" | "fetch")
+        );
         let script = page_script(&options);
-        let response = self.session.evaluate(&script, cancel).await?;
-        self.last_used = Instant::now();
+        let first = self.evaluate_script(&script, cancel).await?;
+        if !matches!(
+            first,
+            PageOutcome::Error(ref failure) if failure.error == PageError::InvalidOrigin
+        ) {
+            if matches!(first, PageOutcome::Page(_)) {
+                self.last_used = Instant::now();
+            }
+            return Ok(first);
+        }
+
+        // A surviving driver can attach to a replacement browser whose active
+        // target is a new-tab page. Recover that warm session once through the
+        // fixed trusted home URL; never follow the unexpected page's URL or
+        // replay an evaluation bound to a product, modal, or navigation page.
+        self.ready = false;
+        if !can_recover_origin {
+            return Err(BrowserError::InvalidOrigin.into());
+        }
+        self.session.run(&["open", HOME], cancel).await?;
+        self.session.run(&["wait", "2000"], cancel).await?;
+        let recovered = self.evaluate_script(&script, cancel).await?;
+        match recovered {
+            PageOutcome::Page(_) => {
+                self.ready = true;
+                self.last_used = Instant::now();
+                Ok(recovered)
+            }
+            PageOutcome::Error(ref failure) if failure.error == PageError::InvalidOrigin => {
+                Err(BrowserError::InvalidOrigin.into())
+            }
+            _ => Ok(recovered),
+        }
+    }
+
+    async fn evaluate_script(
+        &mut self,
+        script: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PageOutcome> {
+        let response = self.session.evaluate(script, cancel).await?;
         serde_json::from_value(response).map_err(|_| BrowserError::InvalidBridgeResponse.into())
     }
 
@@ -583,6 +626,202 @@ fn is_navigation_metadata(key: &str) -> bool {
 mod tests {
     use super::*;
     use crate::page_outcome::{ContextObservation, FilteredPage, RegionProbe};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn scripted_pages(responses: &[Value]) -> (tempfile::TempDir, OzonPages) {
+        let root = tempfile::tempdir().unwrap();
+        let queue = root.path().join("responses");
+        let log = root.path().join("commands");
+        let script = root.path().join("fake-agent-browser");
+        std::fs::write(
+            &queue,
+            responses
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case " $* " in
+  *" eval --stdin "*)
+    IFS= read -r response < '{queue}'
+    tail -n +2 '{queue}' > '{queue}.next'
+    mv '{queue}.next' '{queue}'
+    printf '{{"success":true,"data":{{"result":%s}}}}\n' "$response"
+    ;;
+  *) printf '{{"success":true,"data":{{}}}}\n' ;;
+esac
+"#,
+                log = log.display(),
+                queue = queue.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let session = BrowserSession::test_running(script, root.path());
+        (
+            root,
+            OzonPages {
+                session,
+                ready: true,
+                last_used: Instant::now(),
+            },
+        )
+    }
+
+    fn valid_context_outcome() -> Value {
+        json!({
+            "page": {
+                "widgetStates": {},
+                "contextObservation": {
+                    "regionLabel": null,
+                    "regionVerified": false,
+                    "accountState": "anonymous",
+                    "accessState": "available",
+                    "signature": "stable"
+                },
+                "regionProbe": {
+                    "addressBookModalAvailable": false,
+                    "selectedRegionLabel": null
+                }
+            }
+        })
+    }
+
+    fn command_log(root: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(root.path().join("commands")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn warm_context_revisits_home_once_after_unexpected_origin() {
+        let (root, mut pages) =
+            scripted_pages(&[json!({"error":"INVALID_ORIGIN"}), valid_context_outcome()]);
+
+        let context = pages.context_json(&CancellationToken::new()).await.unwrap();
+
+        assert_eq!(context["contextObservation"]["accountState"], "anonymous");
+        assert_eq!(
+            command_log(&root)
+                .lines()
+                .filter(|line| line.contains("open https://www.ozon.ru/"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_unexpected_origin_is_typed_and_bounded() {
+        let (root, mut pages) = scripted_pages(&[
+            json!({"error":"INVALID_ORIGIN"}),
+            json!({"error":"INVALID_ORIGIN"}),
+        ]);
+
+        let error = pages
+            .context_json(&CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<BrowserError>(),
+            Some(BrowserError::InvalidOrigin)
+        ));
+        assert!(!pages.ready);
+        let log = command_log(&root);
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains(" eval --stdin"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("open https://www.ozon.ru/"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn source_fetch_shares_unexpected_origin_recovery() {
+        let (root, mut pages) = scripted_pages(&[
+            json!({"error":"INVALID_ORIGIN"}),
+            json!({"page":{"widgetStates":{"source":"recovered"}}}),
+        ]);
+
+        let source = pages
+            .fetch_json(
+                "api/composer-api.bx/page/json/v2?url=/search/",
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(source["widgetStates"]["source"], "recovered");
+        assert_eq!(
+            command_log(&root)
+                .lines()
+                .filter(|line| line.contains("open https://www.ozon.ru/"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn page_bound_modes_never_replay_on_home_after_unexpected_origin() {
+        for mode in ["widgets", "contextModal", "navigation"] {
+            let (root, mut pages) = scripted_pages(&[
+                json!({"error":"INVALID_ORIGIN"}),
+                json!({"page":{"widgetStates":{}}}),
+            ]);
+
+            let error = pages
+                .evaluate_outcome(json!({"mode":mode}), &CancellationToken::new())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error.downcast_ref::<BrowserError>(),
+                Some(BrowserError::InvalidOrigin)
+            ));
+            assert!(!pages.ready);
+            let log = command_log(&root);
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.contains(" eval --stdin"))
+                    .count(),
+                1,
+                "mode {mode} was evaluated more than once"
+            );
+            assert!(
+                !log.contains("open https://www.ozon.ru/"),
+                "mode {mode} navigated away from its bound page"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn page_error_does_not_renew_warm_readiness() {
+        let (_root, mut pages) = scripted_pages(&[json!({"error":"CAPTCHA_OR_BLOCKED"})]);
+        let before = Instant::now() - Duration::from_secs(589);
+        pages.last_used = before;
+
+        let outcome = pages
+            .evaluate_outcome(json!({"mode":"context"}), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            PageOutcome::Error(failure) if failure.error == PageError::CaptchaOrBlocked
+        ));
+        assert_eq!(pages.last_used, before);
+    }
 
     fn context_page(account_state: &str, signature: &str) -> FilteredPage {
         FilteredPage {

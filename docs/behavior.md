@@ -2,7 +2,7 @@
 
 [Русский обзор](../README.md) · [English overview](../README.en.md) · [Contracts](../contracts/README.md)
 
-This describes version 2.0.1, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
+This describes version 2.0.2, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
 
 ## Process and configuration
 
@@ -107,3 +107,12 @@ The optimized local binary completed 30 schema-validated MCP calls across six se
 The quota controls retained live SQLite pages (512 MiB). WAL, checkpoint, and compaction bookkeeping may require additional transient filesystem space; a strict instantaneous database-plus-WAL filesystem cap is not promised. Admission, retention, leases, and caller changes are checked transactionally, so a failed quota admission rolls them back together.
 
 Remaining readiness limits: seller-offer listing is unsupported in the observed public source; changing between authenticated accounts in the same city may be unobservable; manually switching two real regions and the planned judged agent-evaluation pool have not been accepted. Existing Codex/Hermes client installations were not replaced by this repository implementation.
+
+
+### Recovering a lost Ozon page
+
+A warm driver can survive Chromium exit and recreate a browser on an empty or new-tab page. A cached readiness flag does not prove that the active page still belongs to Ozon. The page bridge reports `INVALID_ORIGIN` in this state; it is not evidence that a product disappeared or that Ozon presented a CAPTCHA.
+
+For an invalid-origin header-context or API-fetch outcome, the page layer performs at most one navigation to the fixed public Ozon home page and one repeat of that evaluation, within the request cancellation and time budget. A repeated invalid origin remains a typed origin failure. Page-bound widget, modal, and navigation evaluations fail with the typed origin error instead of substituting home-page data. Failed page outcomes do not renew the warm readiness lease. This recovery does not sign in, change the delivery region, or bypass an access challenge.
+
+Version 2.0.2 validation on 2026-09-19: 163 Rust tests passed (four opt-in/helper tests ignored), including warm-context recovery, shared fetch recovery, bounded repeated invalid origin, rejection of home-page substitution for page-bound modes, and failed-outcome lease behavior. Formatting and strict Clippy passed. A live acceptance run on the final candidate deliberately navigated the MCP-owned Ozon tab to `about:blank` and then fetched both previously failing products: both returned `ok`, preserving the authenticated verified Moscow context. One description remained `unknown`; this successful recovery does not imply complete product data or eliminate other marketplace failures.

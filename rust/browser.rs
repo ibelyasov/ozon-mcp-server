@@ -68,6 +68,36 @@ enum SessionState {
 }
 
 impl BrowserSession {
+    #[cfg(test)]
+    pub(crate) fn test_running(binary: PathBuf, root: &Path) -> Self {
+        let profile = root.join("profile");
+        std::fs::create_dir(&profile).unwrap();
+        let profile = std::fs::canonicalize(profile).unwrap();
+        let profile_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(profile.join(".ozon-mcp.lock"))
+            .unwrap();
+        let runtime = root.join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(runtime.join("config.json"), "{}").unwrap();
+        Self {
+            binary,
+            profile,
+            executable: None,
+            headed: false,
+            runtime,
+            _profile_lock: profile_lock,
+            user_agent: Some("test".to_owned()),
+            state: SessionState::Running {
+                cdp: "http://127.0.0.1:9222".to_owned(),
+            },
+        }
+    }
+
     pub async fn from_env() -> Result<Self> {
         let binary =
             std::env::var_os("OZON_AGENT_BROWSER_BIN").unwrap_or_else(|| "agent-browser".into());

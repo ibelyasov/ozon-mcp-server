@@ -61,7 +61,12 @@ impl fmt::Display for BrowserError {
                 formatter,
                 "CAPTCHA_OR_BLOCKED: Ozon did not provide public product data"
             ),
-            Self::InvalidOrigin => write!(formatter, "Invalid Ozon origin"),
+            Self::InvalidOrigin => {
+                write!(
+                    formatter,
+                    "SOURCE_CHANGED: Ozon page has an unexpected origin"
+                )
+            }
             Self::HttpStatus(status) => write!(formatter, "Ozon returned HTTP {status}"),
             Self::NavigationStatusUnavailable => {
                 write!(formatter, "Ozon navigation HTTP status is unavailable")
