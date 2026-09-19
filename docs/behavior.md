@@ -2,7 +2,7 @@
 
 [Русский обзор](../README.md) · [English overview](../README.en.md) · [Contracts](../contracts/README.md)
 
-This describes version 2.0.0, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
+This describes version 2.0.1, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
 
 ## Process and configuration
 
@@ -90,7 +90,15 @@ UV_CACHE_DIR=/tmp/ozon-contracts-uv uv run --offline --no-project --with 'jsonsc
 
 Image downloads accept only HTTPS `ir.ozone.ru` and pin validated public destination addresses. If every system DNS answer belongs to the synthetic `198.18.0.0/15` VPN range, a bounded fallback queries only this constant CDN hostname through [Google Public DNS over HTTPS](https://developers.google.com/speed/public-dns/docs/doh/json). The resolver TLS hostname is pinned to a public bootstrap address; product URLs, queries, account data and cookies are never sent to it, and EDNS client subnet is disabled. DNS questions, CNAME chains and final public addresses are validated before the original CDN TLS connection. Other private or mixed answers remain rejected. Set `OZON_IMAGE_DOH_FALLBACK=off` to disable the fallback; the default is `auto`. No operating-system DNS or VPN settings are changed.
 
-The broker owns idle cleanup. The driver's independent idle timer is disabled so it cannot terminate Chromium behind the broker while local journal calls keep the broker active. An abnormal broker exit leaves a private captured-CDP marker; the next owner must recover that exact browser or fail closed.
+The broker owns idle cleanup. The driver's independent idle timer is disabled so it cannot terminate Chromium behind the broker while local journal calls keep the broker active. An abnormal broker exit leaves a private ownership marker. Startup can be interrupted before its CDP endpoint is captured, so a null endpoint is an incomplete acquisition rather than proof that no browser exists.
+
+Recovery without a captured CDP endpoint must use the existing private driver connection, never a normal `agent-browser close` or `get cdp-url` command: the CLI can start a daemon, and CDP discovery can launch a browser. In pinned agent-browser 0.36.0, direct IPC `session_info` and `close` are explicitly exempt from browser launch. Recovery verifies the driver identity, requests closure, and retains ownership until shutdown is confirmed. Missing or inconsistent identity, an unresponsive driver, or an unconfirmed browser exit must preserve the marker and profile lock. Profile data, research history, and the driver's tab binding are not recovery debris and must not be deleted.
+
+New ownership markers bind recovery to the canonical profile and its filesystem identity. The closing phase is persisted atomically before sending the close command, so a broker restart can finish an interrupted cleanup after the driver has disappeared. Marker removal still requires verified process absence. An old marker without enough ownership evidence remains blocked rather than authorizing closure of an unidentified browser.
+
+Browser command timeouts use the existing `UPSTREAM_TIMEOUT` contract with `retryable: true` and `recovery: retry_later`; they do not imply that Ozon changed its page structure. A failed cleanup remains a separate failure and must not be disguised as a successfully recovered timeout.
+
+Browser recovery validation on 2026-09-19: 158 Rust tests passed (four opt-in/helper tests ignored), the 18 page tests and all schema fixtures passed, and formatting plus strict Clippy passed on Rust 1.95.0/macOS. The separate real-driver test passed with agent-browser 0.36.0 and a disposable Chromium profile: incomplete acquisition, launch-free recovery, relaunch, and confirmed shutdown, using only `about:blank`. Regression tests also cover cancellation, interrupted closing, a surviving driver after browser exit, and rejected recovery identities. This validates the local implementation; it does not update installed clients or prove live Ozon access with the new binary.
 
 ## Validation on 2026-09-13
 

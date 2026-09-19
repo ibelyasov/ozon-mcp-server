@@ -177,6 +177,7 @@ fn description(name: &str) -> &'static str {
 }
 pub fn failure(code: &str, message: &str, research: Option<&str>) -> ToolReply {
     let code = match code {
+        "BROWSER_TIMEOUT" => "UPSTREAM_TIMEOUT",
         "INVALID_ARGUMENT"
         | "INVALID_REFERENCE"
         | "CONTEXT_CHANGED"

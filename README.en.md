@@ -2,7 +2,7 @@
 
 [Русский](README.md)
 
-Ozon MCP is a local [Model Context Protocol](https://modelcontextprotocol.io/) server for researching products on Ozon.ru. Version 1.0.0 is written in Rust with `rmcp` 3.2 and native `agent-browser` 0.36.0. It does not modify carts, orders, accounts, or regions.
+Ozon MCP is a local [Model Context Protocol](https://modelcontextprotocol.io/) server for researching products on Ozon.ru. Version 2.0.1 is written in Rust with `rmcp` 3.2 and native `agent-browser` 0.36.0. It does not modify carts, orders, accounts, or regions.
 
 Status: **development**. The live source implements variants, review photos, and city observation from an exact first-cell field; verification returned Moscow. A public probe found no safe link for other seller offers, so offers remain `unsupported`. Full readiness still requires the remaining live gates and target MCP client acceptance.
 

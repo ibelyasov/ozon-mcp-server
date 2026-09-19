@@ -1,6 +1,6 @@
 # Ozon MCP contracts
 
-This directory is the canonical machine-readable contract for the eight version 1.0.0 tools.
+This directory is the canonical machine-readable contract for the eight MCP tools.
 
 - `schemas/` contains standalone Draft 2020-12 input and success-output schemas plus the whole-tool failure schema.
 - `examples/positive/` contains valid input/output pairs and a failure example.

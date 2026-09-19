@@ -1,3 +1,4 @@
+use crate::browser_error::BrowserError;
 use chrono::{SecondsFormat, Utc};
 use serde_json::{Value, json};
 use url::Url;
@@ -87,6 +88,13 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
     if error.chain().any(is_storage_full) {
         return "STORAGE_FULL";
     }
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<BrowserError>()
+            .is_some_and(|error| matches!(error, BrowserError::CommandTimeout))
+    }) {
+        return "UPSTREAM_TIMEOUT";
+    }
     let message = error.to_string();
     const KNOWN: &[&str] = &[
         "INVALID_ARGUMENT",
@@ -147,6 +155,7 @@ fn enum_value(raw: &Value, key: &str, allowed: &[&str], fallback: &str) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{browser_error::BrowserError, contracts};
 
     #[test]
     fn canonical_url_drops_private_navigation_state() {
@@ -178,5 +187,24 @@ mod tests {
         let io = std::io::Error::from_raw_os_error(28);
         let error = anyhow::Error::new(io).context("persist research");
         assert_eq!(error_code(&error), "STORAGE_FULL");
+    }
+
+    #[test]
+    fn browser_timeout_uses_retryable_upstream_timeout_contract() {
+        let errors = [
+            anyhow::Error::new(BrowserError::CommandTimeout),
+            anyhow::Error::new(BrowserError::CommandTimeout)
+                .context("BROWSER_TIMEOUT: browser acquisition timed out"),
+        ];
+
+        for error in errors {
+            let reply = contracts::failure(error_code(&error), &safe_message(&error), None);
+            let value: Value = serde_json::from_str(reply.text.as_ref().unwrap()).unwrap();
+
+            assert_eq!(value["error"]["code"], "UPSTREAM_TIMEOUT");
+            assert_eq!(value["error"]["retryable"], true);
+            assert_eq!(value["error"]["safeToRetry"], true);
+            assert_eq!(value["error"]["recovery"], "retry_later");
+        }
     }
 }

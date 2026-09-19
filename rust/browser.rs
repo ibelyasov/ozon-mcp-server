@@ -18,6 +18,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "browser_recovery.rs"]
+mod browser_recovery;
+
 const DRIVER_VERSION: &str = "agent-browser 0.36.0";
 const MAX_CLI_BYTES: usize = 12 * 1024 * 1024;
 const OWNERSHIP_MARKER: &str = "browser-owned";
@@ -27,6 +30,17 @@ struct OwnershipMarker {
     version: u32,
     pid: u32,
     cdp: Option<String>,
+    #[serde(default)]
+    profile: Option<ProfileIdentity>,
+    #[serde(default, rename = "closingDaemonPid")]
+    closing_daemon_pid: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ProfileIdentity {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 pub struct BrowserSession {
     binary: PathBuf,
@@ -103,14 +117,13 @@ impl BrowserSession {
                 && String::from_utf8_lossy(&output.stdout).trim() == DRIVER_VERSION,
             "Expected agent-browser 0.36.0; set OZON_AGENT_BROWSER_BIN to the pinned binary"
         );
-        if let Some(marker) = browser.read_marker()? {
+        if browser.read_marker()?.is_some() {
             // A marker can survive only when the previous owner did not confirm
             // Chromium shutdown. Reuse the same driver rendezvous and recover it
             // before this process is allowed to launch against the profile.
             browser.state = SessionState::Poisoned;
-            let cdp = marker.cdp.ok_or(BrowserError::SessionPoisoned)?;
             browser
-                .confirm_close(Some(&cdp))
+                .recover_poisoned()
                 .await
                 .map_err(|_| BrowserError::SessionPoisoned)?;
         }
@@ -389,14 +402,26 @@ impl BrowserSession {
                 &acquiring,
                 Duration::from_secs(15),
             )
-            .await?;
-            self.read_cdp(&acquiring).await
+            .await
+            .context(
+                "BROWSER_DRIVER_FAILED: browser acquisition failed while opening the initial page",
+            )?;
+            self.read_cdp(&acquiring)
+                .await
+                .context(
+                    "BROWSER_DRIVER_FAILED: browser acquisition failed while discovering the browser control endpoint",
+                )
         }
         .await;
         let cdp = match acquisition {
             Ok(cdp) => cdp,
             Err(error) => {
-                let _ = self.confirm_close(None).await;
+                if matches!(
+                    self.state,
+                    SessionState::Acquiring | SessionState::Running { .. }
+                ) {
+                    self.confirm_close(None).await?;
+                }
                 return Err(error);
             }
         };
@@ -415,7 +440,7 @@ impl BrowserSession {
 
     pub(crate) async fn ensure_running(&mut self, cancel: &CancellationToken) -> Result<()> {
         if matches!(self.state, SessionState::Poisoned) {
-            return Err(BrowserError::SessionPoisoned.into());
+            self.recover_poisoned().await?;
         }
         if matches!(self.state, SessionState::Running { .. }) {
             return Ok(());
@@ -441,27 +466,113 @@ impl BrowserSession {
             SessionState::Idle => return Ok(()),
             SessionState::Running { cdp } => Some(cdp.clone()),
             SessionState::Acquiring => None,
-            SessionState::Poisoned => None,
+            SessionState::Poisoned => return Err(BrowserError::SessionPoisoned.into()),
         };
         self.confirm_close(cdp.as_deref()).await
     }
 
+    async fn recover_poisoned(&mut self) -> Result<()> {
+        let result =
+            tokio::time::timeout(Duration::from_secs(11), self.recover_poisoned_inner()).await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                self.state = SessionState::Poisoned;
+                Err(BrowserError::CleanupFailed.into())
+            }
+        }
+    }
+
+    async fn recover_poisoned_inner(&mut self) -> Result<()> {
+        let marker = self.read_marker()?.ok_or(BrowserError::SessionPoisoned)?;
+        if let Some(pid) = marker.closing_daemon_pid {
+            let recovered =
+                browser_recovery::confirm_driver_absent(&self.runtime, &self.profile, pid).await
+                    || browser_recovery::close_recorded_driver(&self.runtime, &self.profile, pid)
+                        .await;
+            if recovered {
+                self.remove_marker()?;
+                self.state = SessionState::Idle;
+                return Ok(());
+            }
+        }
+        self.confirm_close(marker.cdp.as_deref()).await
+    }
+
     async fn confirm_close(&mut self, cdp: Option<&str>) -> Result<()> {
-        // Never use an agent-browser command for recovery: its CLI starts the
-        // daemon with launch configuration before dispatching `close`. The
-        // captured browser CDP identity is the only safe process handle.
-        let Some(endpoint) = cdp else {
-            self.state = SessionState::Poisoned;
-            return Err(BrowserError::CleanupFailed.into());
-        };
-        validate_cdp_endpoint(endpoint)?;
-        if !close_and_confirm_cdp_exit(endpoint).await {
+        let result = tokio::time::timeout(Duration::from_secs(11), self.confirm_close_inner(cdp))
+            .await
+            .unwrap_or(false);
+        if !result {
             self.state = SessionState::Poisoned;
             return Err(BrowserError::CleanupFailed.into());
         }
         self.remove_marker()?;
         self.state = SessionState::Idle;
         Ok(())
+    }
+
+    async fn confirm_close_inner(&self, cdp: Option<&str>) -> bool {
+        // Never use an agent-browser command for recovery: its CLI starts the
+        // daemon with launch configuration before dispatching `close`. The
+        // captured browser CDP identity is the only safe process handle.
+        let ipc_bound = self
+            .read_marker()
+            .ok()
+            .flatten()
+            .is_some_and(|marker| marker.version == 2 && marker.profile.is_some());
+        let mut prepared_daemon = None;
+        let cdp_closed = if let Some(endpoint) = cdp {
+            if validate_cdp_endpoint(endpoint).is_err() {
+                return false;
+            }
+            if ipc_bound {
+                let Some(daemon_pid) =
+                    browser_recovery::prepare_cdp_close(&self.runtime, &self.profile).await
+                else {
+                    return false;
+                };
+                if self.mark_closing(daemon_pid).is_err() {
+                    return false;
+                }
+                prepared_daemon = Some(daemon_pid);
+            }
+            close_and_confirm_cdp_exit(endpoint).await
+        } else {
+            false
+        };
+        if cdp_closed {
+            let Some(daemon_pid) = prepared_daemon else {
+                return true;
+            };
+            if browser_recovery::confirm_driver_absent(&self.runtime, &self.profile, daemon_pid)
+                .await
+            {
+                return true;
+            }
+        }
+        if !cdp_closed
+            && (!ipc_bound
+                || !browser_recovery::close_matching_driver(
+                    &self.runtime,
+                    &self.profile,
+                    |daemon_pid| self.mark_closing(daemon_pid).is_ok(),
+                )
+                .await)
+        {
+            return false;
+        }
+        if cdp_closed {
+            let Some(daemon_pid) = prepared_daemon else {
+                return false;
+            };
+            if !browser_recovery::close_recorded_driver(&self.runtime, &self.profile, daemon_pid)
+                .await
+            {
+                return false;
+            }
+        }
+        true
     }
 
     fn marker_path(&self) -> PathBuf {
@@ -501,9 +612,15 @@ impl BrowserSession {
                 let marker: OwnershipMarker = serde_json::from_slice(&bytes)
                     .context("BROWSER_CLEANUP_FAILED: invalid browser ownership marker")?;
                 ensure!(
-                    marker.version == 1,
+                    marker.version == 1 || marker.version == 2,
                     "BROWSER_CLEANUP_FAILED: unsupported browser ownership marker"
                 );
+                if marker.version == 2 {
+                    ensure!(
+                        marker.profile.as_ref() == Some(&profile_identity(&self.profile)?),
+                        "BROWSER_CLEANUP_FAILED: browser profile identity changed"
+                    );
+                }
                 if let Some(endpoint) = &marker.cdp {
                     validate_cdp_endpoint(endpoint)?;
                 }
@@ -515,19 +632,10 @@ impl BrowserSession {
     }
 
     fn mark_owned(&self) -> Result<()> {
-        let path = self.marker_path();
         if self.read_marker()?.is_some() {
             return Ok(());
         }
-        let marker = std::fs::OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .context("BROWSER_CLEANUP_FAILED: cannot persist browser ownership")?;
-        write_marker(&marker, None)?;
+        write_marker_atomic(&self.runtime, &self.profile, None, None)?;
         ensure!(
             self.read_marker()?.is_some(),
             "BROWSER_CLEANUP_FAILED: browser ownership marker vanished"
@@ -536,54 +644,107 @@ impl BrowserSession {
     }
 
     fn update_marker(&self, cdp: Option<&str>) -> Result<()> {
-        let path = self.marker_path();
-        let marker = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .context("BROWSER_CLEANUP_FAILED: cannot update browser ownership")?;
-        let metadata = marker.metadata()?;
-        let path_metadata = std::fs::symlink_metadata(&path)?;
+        ensure!(self.read_marker()?.is_some(), BrowserError::CleanupFailed);
+        write_marker_atomic(&self.runtime, &self.profile, cdp, None)
+    }
+
+    fn mark_closing(&self, daemon_pid: u32) -> Result<()> {
         ensure!(
-            metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.dev() == path_metadata.dev()
-                && metadata.ino() == path_metadata.ino()
-                && metadata.permissions().mode() & 0o777 == 0o600,
-            "BROWSER_CLEANUP_FAILED: browser ownership marker changed"
+            daemon_pid > 1,
+            "BROWSER_CLEANUP_FAILED: invalid browser daemon identity"
         );
-        write_marker(&marker, cdp)
+        let marker = self.read_marker()?.ok_or(BrowserError::CleanupFailed)?;
+        ensure!(marker.version == 2, BrowserError::CleanupFailed);
+        write_marker_atomic(
+            &self.runtime,
+            &self.profile,
+            marker.cdp.as_deref(),
+            Some(daemon_pid),
+        )
     }
 
     fn remove_marker(&self) -> Result<()> {
         if self.read_marker()?.is_some() {
             std::fs::remove_file(self.marker_path())
                 .context("BROWSER_CLEANUP_FAILED: cannot release browser ownership")?;
+            let directory = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&self.runtime)?;
+            directory.sync_all()?;
         }
         Ok(())
     }
 }
 
-fn write_marker(mut file: &File, cdp: Option<&str>) -> Result<()> {
-    use std::io::{Seek, Write};
+fn write_marker_atomic(
+    runtime: &Path,
+    profile: &Path,
+    cdp: Option<&str>,
+    closing_daemon_pid: Option<u32>,
+) -> Result<()> {
+    use std::io::Write;
     if let Some(endpoint) = cdp {
         validate_cdp_endpoint(endpoint)?;
     }
     let marker = OwnershipMarker {
-        version: 1,
+        version: 2,
         pid: std::process::id(),
         cdp: cdp.map(str::to_owned),
+        profile: Some(profile_identity(profile)?),
+        closing_daemon_pid,
     };
     let bytes = serde_json::to_vec(&marker)?;
     ensure!(
         bytes.len() <= 2048,
         "BROWSER_CLEANUP_FAILED: browser ownership marker is too large"
     );
-    file.seek(std::io::SeekFrom::Start(0))?;
-    file.set_len(0)?;
-    file.write_all(&bytes)?;
-    file.sync_data()?;
+    let target = runtime.join(OWNERSHIP_MARKER);
+    let mut temporary = tempfile::NamedTempFile::new_in(runtime)
+        .context("BROWSER_CLEANUP_FAILED: cannot stage browser ownership")?;
+    let metadata = temporary.as_file().metadata()?;
+    ensure!(
+        metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.permissions().mode() & 0o777 == 0o600,
+        "BROWSER_CLEANUP_FAILED: invalid staged browser ownership"
+    );
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&target)
+        .context("BROWSER_CLEANUP_FAILED: cannot commit browser ownership")?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(runtime)?;
+    directory.sync_all()?;
     Ok(())
+}
+
+fn profile_identity(profile: &Path) -> Result<ProfileIdentity> {
+    let path = std::fs::canonicalize(profile)
+        .context("BROWSER_CLEANUP_FAILED: cannot resolve browser profile")?;
+    ensure!(
+        path.to_str().is_some()
+            && !path
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .any(|byte| matches!(byte, b'\r' | b'\n')),
+        "BROWSER_CLEANUP_FAILED: invalid browser profile path"
+    );
+    let metadata = std::fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() },
+        "BROWSER_CLEANUP_FAILED: invalid browser profile identity"
+    );
+    Ok(ProfileIdentity {
+        path,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
 }
 
 fn validate_cdp_endpoint(endpoint: &str) -> Result<()> {
@@ -613,7 +774,7 @@ fn validate_cdp_endpoint(endpoint: &str) -> Result<()> {
 
 async fn close_and_confirm_cdp_exit(endpoint: &str) -> bool {
     let connection = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(1),
         tokio_tungstenite::connect_async(endpoint),
     )
     .await;
@@ -629,7 +790,7 @@ async fn close_and_confirm_cdp_exit(endpoint: &str) -> bool {
     {
         return false;
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let reachable = matches!(
             tokio::time::timeout(
@@ -792,7 +953,12 @@ fn try_lock_profile(profile: &Path) -> std::io::Result<Option<File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        process::{Command as StdCommand, Stdio as StdStdio},
+        time::Instant,
+    };
 
     // Process creation can temporarily inherit flock descriptors on macOS.
     // Serialize this fault-injection test with lease/release assertions only.
@@ -805,6 +971,7 @@ mod tests {
     fn test_session(root: &tempfile::TempDir, state: SessionState) -> BrowserSession {
         let profile = root.path().join("profile");
         std::fs::create_dir(&profile).unwrap();
+        let profile = std::fs::canonicalize(profile).unwrap();
         let profile_lock = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -814,6 +981,7 @@ mod tests {
             .unwrap();
         let runtime = root.path().join("runtime");
         std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(runtime.join("config.json"), "{}").unwrap();
         BrowserSession {
             binary: root.path().join("missing-agent-browser"),
@@ -824,6 +992,354 @@ mod tests {
             _profile_lock: profile_lock,
             user_agent: Some("test".to_owned()),
             state,
+        }
+    }
+
+    fn persist_legacy_cdp_marker(session: &BrowserSession, cdp: &str) {
+        let bytes = serde_json::to_vec(&json!({
+            "version": 1,
+            "pid": std::process::id(),
+            "cdp": cdp,
+        }))
+        .unwrap();
+        std::fs::write(session.marker_path(), bytes).unwrap();
+        std::fs::set_permissions(
+            session.marker_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn recovery_daemon_helper() {
+        let Some(runtime) = std::env::var_os("OZON_TEST_RECOVERY_RUNTIME") else {
+            return;
+        };
+        let runtime = PathBuf::from(runtime);
+        let mode = std::env::var("OZON_TEST_RECOVERY_MODE").unwrap_or_default();
+        let socket = runtime.join("ozon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(runtime.join("ozon.pid"), std::process::id().to_string()).unwrap();
+        std::fs::set_permissions(
+            runtime.join("ozon.pid"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(
+            runtime.join("ozon.version"),
+            if mode == "wrong-version" {
+                "0.35.0"
+            } else {
+                "0.36.0"
+            },
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            runtime.join("ozon.version"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(runtime.join("ready"), b"").unwrap();
+
+        for action in ["session_info", "close"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["action"], action);
+            if action == "session_info" && mode == "malformed" {
+                writeln!(stream, "{{invalid").unwrap();
+                return;
+            }
+            if action == "session_info" && mode == "oversized" {
+                stream.write_all(&vec![b'x'; 16 * 1024 + 1]).unwrap();
+                writeln!(stream).unwrap();
+                return;
+            }
+            let response = if action == "session_info" {
+                json!({
+                    "id": request["id"],
+                    "success": true,
+                    "data": {
+                        "backgroundPid": if mode == "wrong-pid" {
+                            std::process::id() + 1
+                        } else {
+                            std::process::id()
+                        },
+                        "browserLaunched": false,
+                        "pageCount": 0
+                    }
+                })
+            } else {
+                json!({"id": request["id"], "success": true, "data": {"closed": true}})
+            };
+            writeln!(stream, "{response}").unwrap();
+        }
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_file(runtime.join("ozon.pid")).unwrap();
+        std::fs::remove_file(runtime.join("ozon.version")).unwrap();
+    }
+
+    async fn spawn_recovery_daemon(root: &tempfile::TempDir, mode: &str) -> std::process::Child {
+        let runtime = root.path().join("runtime");
+        let child = StdCommand::new(std::env::current_exe().unwrap())
+            .args(["--exact", "browser::tests::recovery_daemon_helper"])
+            .env("OZON_TEST_RECOVERY_RUNTIME", &runtime)
+            .env("OZON_TEST_RECOVERY_MODE", mode)
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::null())
+            .stderr(StdStdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !runtime.join("ready").is_file() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "mock daemon did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        child
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn null_cdp_marker_recovers_through_launch_free_ipc() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Acquiring);
+        session.mark_owned().unwrap();
+        let mut daemon = spawn_recovery_daemon(&root, "").await;
+        let daemon_pid = daemon.id();
+        let waiter = tokio::task::spawn_blocking(move || daemon.wait());
+
+        let result = session.shutdown().await;
+        if result.is_err() && unsafe { libc::kill(daemon_pid as libc::pid_t, 0) } == 0 {
+            unsafe { libc::kill(daemon_pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = waiter.await;
+
+        assert!(result.is_ok());
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_acquisition_preserves_cancellation_after_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Acquiring);
+        let fake_cli = root.path().join("fake-agent-browser");
+        std::fs::write(&fake_cli, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&fake_cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        session.binary = fake_cli;
+        session.mark_owned().unwrap();
+        let mut daemon = spawn_recovery_daemon(&root, "").await;
+        let waiter = tokio::task::spawn_blocking(move || daemon.wait());
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let error = session
+            .raw(
+                &["open", "about:blank"],
+                None,
+                &cancel,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        waiter.await.unwrap().unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<BrowserError>(),
+            Some(BrowserError::Cancelled)
+        ));
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
+    }
+
+    async fn assert_mock_recovery_fails_closed(mode: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Acquiring);
+        session.mark_owned().unwrap();
+        let mut daemon = spawn_recovery_daemon(&root, mode).await;
+
+        assert!(session.shutdown().await.is_err());
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        assert!(matches!(session.state, SessionState::Poisoned));
+        assert!(session.marker_path().is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn untrusted_ipc_responses_never_clear_null_cdp_marker() {
+        for mode in ["wrong-pid", "malformed", "oversized", "wrong-version"] {
+            assert_mock_recovery_fails_closed(mode).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_closing_phase_recovers_after_close_response_crash_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Poisoned);
+        session.mark_owned().unwrap();
+        let mut daemon = spawn_recovery_daemon(&root, "").await;
+        let waiter = tokio::task::spawn_blocking(move || daemon.wait());
+
+        assert!(
+            browser_recovery::close_matching_driver(&session.runtime, &session.profile, |pid| {
+                session.mark_closing(pid).is_ok()
+            },)
+            .await
+        );
+        waiter.await.unwrap().unwrap();
+        let marker = session.read_marker().unwrap().unwrap();
+        let daemon_pid = marker.closing_daemon_pid.unwrap();
+        assert!(
+            browser_recovery::confirm_driver_absent(
+                &session.runtime,
+                &session.profile,
+                daemon_pid,
+            )
+            .await
+        );
+        assert!(session.marker_path().is_file());
+        session.recover_poisoned().await.unwrap();
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recorded_closing_phase_closes_stale_daemon_without_browser() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Poisoned);
+        session.mark_owned().unwrap();
+        let mut daemon = spawn_recovery_daemon(&root, "").await;
+        let daemon_pid = daemon.id();
+        session.mark_closing(daemon_pid).unwrap();
+        let waiter = tokio::task::spawn_blocking(move || daemon.wait());
+
+        session.recover_poisoned().await.unwrap();
+        waiter.await.unwrap().unwrap();
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unavailable_or_symlinked_recovery_files_never_clear_marker() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut unavailable = test_session(&root, SessionState::Acquiring);
+        unavailable.mark_owned().unwrap();
+        assert!(unavailable.shutdown().await.is_err());
+        assert!(unavailable.marker_path().is_file());
+
+        let root = tempfile::tempdir().unwrap();
+        let mut symlinked_pid = test_session(&root, SessionState::Acquiring);
+        symlinked_pid.mark_owned().unwrap();
+        std::fs::write(
+            root.path().join("pid-target"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        symlink(
+            root.path().join("pid-target"),
+            symlinked_pid.runtime.join("ozon.pid"),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(symlinked_pid.runtime.join("ozon.sock")).unwrap();
+        assert!(symlinked_pid.shutdown().await.is_err());
+        assert!(symlinked_pid.marker_path().is_file());
+        drop(listener);
+
+        let root = tempfile::tempdir().unwrap();
+        let mut symlinked_socket = test_session(&root, SessionState::Acquiring);
+        symlinked_socket.mark_owned().unwrap();
+        std::fs::write(
+            symlinked_socket.runtime.join("ozon.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        let target = root.path().join("socket-target");
+        let listener = UnixListener::bind(&target).unwrap();
+        symlink(&target, symlinked_socket.runtime.join("ozon.sock")).unwrap();
+        assert!(symlinked_socket.shutdown().await.is_err());
+        assert!(symlinked_socket.marker_path().is_file());
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn poisoned_session_can_retry_proven_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Poisoned);
+        session.mark_owned().unwrap();
+        let mut daemon = spawn_recovery_daemon(&root, "").await;
+        let waiter = tokio::task::spawn_blocking(move || daemon.wait());
+
+        session.recover_poisoned().await.unwrap();
+        waiter.await.unwrap().unwrap();
+        assert!(matches!(session.state, SessionState::Idle));
+        assert!(!session.marker_path().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires fixed OZON_TEST_AGENT_BROWSER_BIN and disposable local Chrome"]
+    async fn real_driver_null_marker_recovers_and_relaunches_on_disposable_profile() {
+        let binary = std::env::var_os("OZON_TEST_AGENT_BROWSER_BIN")
+            .expect("set OZON_TEST_AGENT_BROWSER_BIN to pinned agent-browser 0.36.0");
+        let binary = std::fs::canonicalize(binary).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut session = test_session(&root, SessionState::Idle);
+        session.binary = binary;
+        let cancel = CancellationToken::new();
+
+        session.mark_owned().unwrap();
+        session.state = SessionState::Acquiring;
+        let initial_launch = session
+            .raw(
+                &["open", "about:blank"],
+                None,
+                &cancel,
+                Duration::from_secs(15),
+            )
+            .await;
+        if initial_launch.is_err() {
+            let _ = session.confirm_close(None).await;
+            let retained = root.keep();
+            panic!(
+                "disposable real-driver launch failed; retained {} for inspection",
+                retained.display()
+            );
+        }
+        if session.shutdown().await.is_err() {
+            let retained = root.keep();
+            panic!(
+                "direct recovery failed; retained {} for inspection",
+                retained.display()
+            );
+        }
+        let relaunch = session.launch(&cancel).await;
+        let cleanup = session.shutdown().await;
+        if relaunch.is_err() || cleanup.is_err() {
+            let retained = root.keep();
+            panic!(
+                "relaunch lifecycle failed; retained {} for inspection",
+                retained.display()
+            );
         }
     }
 
@@ -877,7 +1393,7 @@ mod tests {
             },
         );
         session.mark_owned().unwrap();
-        session.update_marker(Some(&endpoint)).unwrap();
+        persist_legacy_cdp_marker(&session, &endpoint);
 
         session
             .run_if_running(&["open", "https://www.ozon.ru/"], Duration::from_secs(1))
@@ -931,12 +1447,12 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             ensure.downcast_ref::<BrowserError>(),
-            Some(BrowserError::SessionPoisoned)
+            Some(BrowserError::CleanupFailed)
         ));
         let shutdown = session.shutdown().await.unwrap_err();
         assert!(matches!(
             shutdown.downcast_ref::<BrowserError>(),
-            Some(BrowserError::CleanupFailed)
+            Some(BrowserError::SessionPoisoned)
         ));
         assert!(session.marker_path().is_file());
     }
@@ -987,7 +1503,7 @@ mod tests {
         };
 
         session.mark_owned().unwrap();
-        session.update_marker(Some(&endpoint)).unwrap();
+        persist_legacy_cdp_marker(&session, &endpoint);
         assert!(session.marker_path().is_file());
         session.shutdown().await.unwrap();
         server.await.unwrap();
