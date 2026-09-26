@@ -12,6 +12,8 @@ Validation checks schema syntax, local `$ref` resolution, formats, root objects,
 
 Search supports `repeatMode: full | delta`; delta retains every result row, decision-critical price, availability, and range-match fields, plus changed fields and a `baselineProductRef`. Refinement pages use `start.refinementsCursor`, default to 12 entries, allow at most 100, and are capped at 8,000 UTF-16 units per cached page. Item cursors bind view and repeat mode; refinement cursors also bind the refinement limit.
 
+`ozon_get_products` takes `products`, an array of 1-8 selector objects. Each selector has exactly one of `productRef`, `sku`, `url`, or `cursor`. For example, `{"researchId":"research-01","products":[{"productRef":"product-123"}],"include":["variants"]}`. A section continuation uses `{"products":[{"cursor":"..."}]}` and omits `include`; the cursor retains its section and view. `productRefs` and `start.productRefs` belong to neither input shape. The tool-list input schema presents the root fields directly for client compatibility; the canonical schema and server validation also enforce the cursor/`include` exclusion.
+
 The default `OZON_MCP_TEXT_MODE=compact` returns a short text pointer and the complete success object once in `structuredContent`. `json` duplicates that object in text for legacy text-only clients. Errors are independent of this transport compatibility setting.
 
 ```sh

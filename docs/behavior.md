@@ -2,7 +2,7 @@
 
 [Русский обзор](../README.md) · [English overview](../README.en.md) · [Contracts](../contracts/README.md)
 
-This describes version 2.0.2, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
+This describes version 2.0.3, built with Rust 1.95, `rmcp` 3.2, and native `agent-browser` 0.36.0.
 
 ## Process and configuration
 
@@ -116,3 +116,5 @@ A warm driver can survive Chromium exit and recreate a browser on an empty or ne
 For an invalid-origin header-context or API-fetch outcome, the page layer performs at most one navigation to the fixed public Ozon home page and one repeat of that evaluation, within the request cancellation and time budget. A repeated invalid origin remains a typed origin failure. Page-bound widget, modal, and navigation evaluations fail with the typed origin error instead of substituting home-page data. Failed page outcomes do not renew the warm readiness lease. This recovery does not sign in, change the delivery region, or bypass an access challenge.
 
 Version 2.0.2 validation on 2026-09-19: 163 Rust tests passed (four opt-in/helper tests ignored), including warm-context recovery, shared fetch recovery, bounded repeated invalid origin, rejection of home-page substitution for page-bound modes, and failed-outcome lease behavior. Formatting and strict Clippy passed. A live acceptance run on the final candidate deliberately navigated the MCP-owned Ozon tab to `about:blank` and then fetched both previously failing products: both returned `ok`, preserving the authenticated verified Moscow context. One description remained `unknown`; this successful recovery does not imply complete product data or eliminate other marketplace failures.
+
+Version 2.0.3 exposes the product input root fields directly in tool discovery while keeping canonical cursor/include validation. Product argument errors report paths and expected forms, and the tool description includes a productRef example. Validation: 165 Rust tests passed (four ignored), formatting, strict Clippy, contract fixtures, and stdio discovery/invalid-input checks passed. Correct product, variant, image, review, and section-cursor calls succeeded through the existing Codex MCP connection. Fresh Codex type generation after installing this release remains unverified; the separate browser cleanup failure is not fixed by this release.
