@@ -3,11 +3,27 @@
   "title": "ozon_list_research input",
   "type": "object",
   "properties": {
-    "query": {"type": "string", "minLength": 1, "maxLength": 200},
-    "cursor": {"$ref": "#/$defs/opaque"},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}
+    "query": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "cursor": {
+      "$ref": "common.schema.json#/$defs/opaque"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "default": 10
+    }
   },
   "additionalProperties": false,
-  "not": {"required": ["query", "cursor"]},
-  "$defs": {"opaque": {"type": "string", "minLength": 1, "maxLength": 2048}}
+  "not": {
+    "required": [
+      "query",
+      "cursor"
+    ]
+  },
+  "$defs": {}
 }

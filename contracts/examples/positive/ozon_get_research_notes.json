@@ -1,0 +1,49 @@
+{
+  "inputSchema": "schemas/ozon_get_research.input.schema.json",
+  "outputSchema": "schemas/ozon_get_research.output.schema.json",
+  "input": {
+    "researchId": "research-01",
+    "section": "notes",
+    "noteIds": [
+      "note-01"
+    ]
+  },
+  "output": {
+    "schemaVersion": "3",
+    "researchId": "research-01",
+    "data": {
+      "section": "notes",
+      "payload": [
+        {
+          "noteId": "note-01",
+          "operationId": "op-note-1",
+          "kind": "assessment",
+          "text": "Selected requirements need verification.",
+          "createdAt": "2026-09-13T09:02:00Z",
+          "author": "agent",
+          "evidenceRefs": [],
+          "productRefs": []
+        }
+      ],
+      "nextCursor": null
+    },
+    "context": {
+      "contextId": "ctx-current",
+      "regionLabel": "Москва",
+      "regionVerification": "verified",
+      "accountState": "anonymous",
+      "accessState": "available"
+    },
+    "observedAt": "2026-09-13T10:00:00Z",
+    "evidence": [],
+    "warnings": [
+      {
+        "code": "HISTORICAL_CONTEXT",
+        "message": "Evidence retains its original captured context.",
+        "evidenceRefs": [
+          "ev-search"
+        ]
+      }
+    ]
+  }
+}

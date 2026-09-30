@@ -1,7 +1,6 @@
 {
   "rating": 5.0,
   "totalReviews": 1,
-  "count": 1,
   "reviews": [
     {
       "reviewId": null,
@@ -11,15 +10,27 @@
       "pros": null,
       "cons": null,
       "date": "2024-01-01T00:00:00Z",
-      "useful": 0,
       "purchased": null,
-      "hasPhotos": false,
       "variantLabel": null,
-      "photos": []
+      "sourceIndex": 0,
+      "sourceLocator": "/widgetStates/webListReviews-a/reviews/0",
+      "photoOrigins": []
     }
   ],
   "nextPath": null,
   "hasNext": null,
   "refinements": [],
-  "aggregationScope": "unknown"
+  "aggregationScope": "unknown",
+  "acquisition": null,
+  "source": {
+    "present": true,
+    "rawRows": 1,
+    "parsedRows": 1,
+    "malformedRows": 0,
+    "sourceTruncated": false,
+    "localTruncated": false
+  },
+  "sourceUrl": null,
+  "observedAt": null,
+  "warnings": []
 }

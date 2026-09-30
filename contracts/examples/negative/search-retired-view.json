@@ -1,0 +1,10 @@
+{
+  "schema": "schemas/ozon_search.input.schema.json",
+  "instance": {
+    "start": {
+      "query": "x"
+    },
+    "view": "full"
+  },
+  "expectedInvalidAt": "schema"
+}

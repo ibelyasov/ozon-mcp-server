@@ -1,0 +1,14 @@
+{
+  "schema": "schemas/ozon_search.output.schema.json",
+  "baseExample": "examples/positive/ozon_search.json",
+  "target": "output",
+  "mutation": {
+    "path": "evidence",
+    "value": [
+      {
+        "evidenceRef": "ev-1"
+      }
+    ]
+  },
+  "expectedInvalidAt": "schema"
+}

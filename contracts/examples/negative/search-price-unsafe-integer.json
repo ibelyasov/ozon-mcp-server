@@ -1,0 +1,12 @@
+{
+  "schema": "schemas/ozon_search.input.schema.json",
+  "instance": {
+    "start": {
+      "query": "example",
+      "priceRange": {
+        "minMinor": 9007199254740992
+      }
+    }
+  },
+  "expectedInvalidAt": "schema"
+}

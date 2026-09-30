@@ -15,12 +15,12 @@
           "$ref": "#/$defs/referenceStart"
         },
         {
-          "$ref": "#/$defs/cursorStart"
+          "$ref": "common.schema.json#/$defs/cursorStart"
         }
       ]
     },
     "researchId": {
-      "$ref": "#/$defs/opaque"
+      "$ref": "common.schema.json#/$defs/opaque"
     },
     "limit": {
       "type": "integer",
@@ -28,27 +28,14 @@
       "maximum": 30,
       "default": 10
     },
-    "view": {
-      "enum": [
-        "compact",
-        "comparison",
-        "full"
-      ],
-      "default": "compact",
-      "description": "Response presentation. Continuations inherit their captured view; a different explicit view is rejected."
-    },
     "includeFacets": {
       "type": "boolean",
-      "description": "Default false for compact/comparison and true for a fresh full request. Continuations inherit the captured setting and reject incompatible overrides."
+      "description": "Request bounded review refinements explicitly.",
+      "default": false
     }
   },
   "additionalProperties": false,
   "$defs": {
-    "opaque": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 2048
-    },
     "productStart": {
       "type": "object",
       "required": [
@@ -56,7 +43,7 @@
       ],
       "properties": {
         "productRef": {
-          "$ref": "#/$defs/opaque"
+          "$ref": "common.schema.json#/$defs/opaque"
         }
       },
       "additionalProperties": false
@@ -68,19 +55,7 @@
       ],
       "properties": {
         "reviewSearchRef": {
-          "$ref": "#/$defs/opaque"
-        }
-      },
-      "additionalProperties": false
-    },
-    "cursorStart": {
-      "type": "object",
-      "required": [
-        "cursor"
-      ],
-      "properties": {
-        "cursor": {
-          "$ref": "#/$defs/opaque"
+          "$ref": "common.schema.json#/$defs/opaque"
         }
       },
       "additionalProperties": false

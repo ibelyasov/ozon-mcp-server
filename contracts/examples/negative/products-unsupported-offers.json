@@ -1,0 +1,14 @@
+{
+  "schema": "schemas/ozon_get_products.input.schema.json",
+  "instance": {
+    "products": [
+      {
+        "sku": "123"
+      }
+    ],
+    "include": [
+      "offers"
+    ]
+  },
+  "expectedInvalidAt": "schema"
+}

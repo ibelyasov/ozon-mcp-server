@@ -14,22 +14,22 @@
       "items": {
         "oneOf": [
           {
-            "$ref": "#/$defs/productRefSelector"
+            "$ref": "common.schema.json#/$defs/productRefSelector"
           },
           {
-            "$ref": "#/$defs/skuSelector"
+            "$ref": "common.schema.json#/$defs/skuSelector"
           },
           {
-            "$ref": "#/$defs/urlSelector"
+            "$ref": "common.schema.json#/$defs/urlSelector"
           },
           {
-            "$ref": "#/$defs/cursorSelector"
+            "$ref": "common.schema.json#/$defs/cursorSelector"
           }
         ]
       }
     },
     "researchId": {
-      "$ref": "#/$defs/opaque"
+      "$ref": "common.schema.json#/$defs/opaque"
     },
     "include": {
       "type": "array",
@@ -42,104 +42,32 @@
           "characteristics",
           "description",
           "variants",
-          "offers",
           "images"
         ]
       },
-      "description": "Compact/comparison default to characteristics. Full defaults to characteristics and offers. Explicit sections are never silently omitted."
-    },
-    "view": {
-      "enum": [
-        "compact",
-        "comparison",
-        "full"
-      ],
-      "default": "compact",
-      "description": "Response presentation. Continuations inherit their captured view; a different explicit view is rejected."
+      "description": "Default includes characteristics. Explicit sections are returned in full or with truthful bounded continuation."
     }
   },
   "additionalProperties": false,
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "products": {
-            "contains": {
-              "type": "object",
-              "required": [
-                "cursor"
-              ]
-            }
-          }
-        }
-      },
-      "then": {
-        "not": {
+  "$defs": {},
+  "if": {
+    "properties": {
+      "products": {
+        "contains": {
+          "type": "object",
           "required": [
-            "include"
+            "cursor"
           ]
         }
       }
-    }
-  ],
-  "$defs": {
-    "opaque": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 2048
     },
-    "productRefSelector": {
-      "type": "object",
-      "required": [
-        "productRef"
-      ],
-      "properties": {
-        "productRef": {
-          "$ref": "#/$defs/opaque"
-        }
-      },
-      "additionalProperties": false
-    },
-    "skuSelector": {
-      "type": "object",
-      "required": [
-        "sku"
-      ],
-      "properties": {
-        "sku": {
-          "type": "string",
-          "pattern": "^[0-9]+$",
-          "maxLength": 64
-        }
-      },
-      "additionalProperties": false
-    },
-    "urlSelector": {
-      "type": "object",
-      "required": [
-        "url"
-      ],
-      "properties": {
-        "url": {
-          "type": "string",
-          "format": "uri",
-          "pattern": "^https://(?:www\\.)?ozon\\.ru(?:/|$)",
-          "maxLength": 2048
-        }
-      },
-      "additionalProperties": false
-    },
-    "cursorSelector": {
-      "type": "object",
-      "required": [
-        "cursor"
-      ],
-      "properties": {
-        "cursor": {
-          "$ref": "#/$defs/opaque"
-        }
-      },
-      "additionalProperties": false
+    "required": [
+      "products"
+    ]
+  },
+  "then": {
+    "properties": {
+      "include": false
     }
   }
 }

@@ -1,52 +1,47 @@
 #!/usr/bin/env python3
-"""Disposable two-client live smoke for the vNext Ozon MCP broker."""
+"""Optional v3 live acceptance using an isolated broker and private Chromium profile.
 
+Never imported by the offline gate. Run manually with explicit executable paths.
+No existing profile is accepted; retained artifacts include only safe projections.
+"""
 from __future__ import annotations
 
 import argparse
 import base64
 import hashlib
-import ipaddress
+import importlib.util
+import io
 import json
 import os
+from pathlib import Path
 import queue
 import signal
 import socket
 import stat
-import struct
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlsplit
-from pathlib import Path
 from typing import Any
-
-try:
-    import jsonschema
-except ImportError:
-    jsonschema = None  # type: ignore[assignment]
-
 
 PROTOCOL_VERSION = "2025-11-25"
 EXPECTED_TOOLS = {
-    "ozon_get_context",
-    "ozon_search",
-    "ozon_get_products",
-    "ozon_get_reviews",
-    "ozon_get_images",
-    "ozon_list_research",
-    "ozon_get_research",
-    "ozon_append_research_note",
+    "ozon_get_context", "ozon_search", "ozon_get_products", "ozon_get_reviews",
+    "ozon_get_images", "ozon_list_research", "ozon_get_research", "ozon_append_research_note",
 }
-CALL_TIMEOUT = 90.0
+# Service deadline is 55 seconds; five seconds allow transport/cleanup delivery.
+CALL_TIMEOUT = 60.0
 START_TIMEOUT = 20.0
-
+OWNER_FILE = ".ozon-mcp-owner.json"
+LIVE_UNAVAILABLE = {"SOURCE_BLOCKED", "UPSTREAM_TIMEOUT", "CONTEXT_UNVERIFIED", "CONTEXT_CHANGED", "NOT_FOUND", "UNSUPPORTED_CAPABILITY"}
 
 class SmokeFailure(RuntimeError):
     pass
 
+class ObservationUnavailable(RuntimeError):
+    pass
 
 class McpClient:
     def __init__(
@@ -58,6 +53,7 @@ class McpClient:
         broker: subprocess.Popen[bytes],
     ):
         self.label = label
+        self.deadline = time.monotonic() + 600.0
         self._broker = broker
         self._stderr = stderr_path.open("wb")
         self.process = subprocess.Popen(
@@ -110,7 +106,7 @@ class McpClient:
         if params is not None:
             message["params"] = params
         self._send(message)
-        deadline = time.monotonic() + timeout
+        deadline = min(time.monotonic() + timeout, self.deadline)
         while True:
             if request_id in self._pending:
                 return self._pending.pop(request_id)
@@ -197,152 +193,69 @@ def failure_value(result: dict[str, Any]) -> dict[str, Any] | None:
     raise SmokeFailure("tool returned an unparseable error payload")
 
 
-def require_success(
-    result: dict[str, Any], name: str, schemas: Path, schema_errors: list[dict[str, Any]]
-) -> dict[str, Any]:
+class Contracts:
+    """Reuse the canonical publisher's composition and semantic checks."""
+    def __init__(self) -> None:
+        path = Path(__file__).with_name("validate-contracts.py")
+        spec = importlib.util.spec_from_file_location("ozon_contract_validation", path)
+        assert spec is not None and spec.loader is not None
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        self.schemas = {
+            path.name: self.module.standalone(self.module.load(path.relative_to(self.module.ROOT)))
+            for path in (self.module.ROOT / "schemas").glob("*.schema.json")
+            if path.name != "common.schema.json"
+        }
+
+    def validate(self, name: str, value: Any) -> None:
+        errors = self.module.schema_errors(self.schemas[name], value)
+        if not errors:
+            errors = self.module.semantic_errors(name, value)
+        if errors:
+            # Avoid including observed account data or URLs in failure messages.
+            raise SmokeFailure(f"{name}: {len(errors)} contract violation(s)")
+
+    def discovery(self, listed: dict[str, Any]) -> None:
+        tools = listed.get("tools", [])
+        if len(tools) != len(EXPECTED_TOOLS) or {tool.get("name") for tool in tools} != EXPECTED_TOOLS:
+            raise SmokeFailure("tools/list advertised an unexpected tool set")
+        for tool in tools:
+            for field, kind in (("inputSchema", "input"), ("outputSchema", "output")):
+                if tool.get(field) != self.schemas[f"{tool['name']}.{kind}.schema.json"]:
+                    raise SmokeFailure(f"{tool['name']} published a different {field}")
+
+
+def success(result: dict[str, Any], name: str, contracts: Contracts) -> dict[str, Any]:
     failure = failure_value(result)
     if failure is not None:
-        code = failure["error"].get("code", "UNKNOWN")
+        contracts.validate("tool_failure.schema.json", failure)
+        code = failure["error"]["code"]
+        if code in LIVE_UNAVAILABLE:
+            raise ObservationUnavailable(f"{name}: live observation unavailable ({code})")
         raise SmokeFailure(f"{name} failed with {code}")
     value = result.get("structuredContent")
-    if not isinstance(value, dict):
-        raise SmokeFailure(f"{name} omitted structuredContent")
-    schema_path = schemas / f"{name}.output.schema.json"
-    schema = json.loads(schema_path.read_text())
-    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
-    errors = sorted(validator.iter_errors(value), key=lambda item: list(item.absolute_path))
-    if errors:
-        rendered = [
-            {
-                "path": "/" + "/".join(map(str, item.absolute_path)),
-                "validator": item.validator,
-            }
-            for item in errors[:20]
-        ]
-        schema_errors.append({"tool": name, "errors": rendered})
-        raise SmokeFailure(f"{name} output failed schema validation")
+    contracts.validate(f"{name}.output.schema.json", value)
+    content = result.get("content", [])
+    text_blocks = [block for block in content if block.get("type") == "text"]
+    if len(text_blocks) != 1 or text_blocks[0].get("text") != "Complete result: use structuredContent.":
+        raise SmokeFailure(f"{name} duplicated or omitted the lean structured-result marker")
     return value
 
 
-def validate_failure(value: dict[str, Any], schemas: Path) -> None:
-    schema = json.loads((schemas / "tool_failure.schema.json").read_text())
-    jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker()).validate(value)
-
-
-def tool_call(
-    client: McpClient,
-    name: str,
-    arguments: dict[str, Any],
-    schemas: Path,
-    report: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    result, elapsed_ms = client.call(name, arguments)
-    report["timingsMs"].append({"client": client.label, "tool": name, "elapsed": elapsed_ms})
-    value = require_success(result, name, schemas, report["schemaErrors"])
-    report["calls"].append(project(name, value))
+def tool_call(client: McpClient, name: str, args: dict[str, Any], contracts: Contracts,
+              report: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    contracts.validate(f"{name}.input.schema.json", args)
+    result, elapsed = client.call(name, args)
+    report["timingsMs"].append({"client": client.label, "tool": name, "elapsed": elapsed})
+    value = success(result, name, contracts)
+    paired = contracts.module.pair_errors({"inputSchema": f"schemas/{name}.input.schema.json",
+                                           "input": args, "output": value})
+    if paired:
+        raise SmokeFailure(f"{name}: input/output pairing violated the contract")
+    report["calls"].append({"tool": name, "contextId": value["context"]["contextId"],
+                            "researchId": value["researchId"],
+                            "warningCodes": [warning["code"] for warning in value["warnings"]]})
     return result, value
-
-
-def project(name: str, value: dict[str, Any]) -> dict[str, Any]:
-    data = value.get("data", {})
-    projection: dict[str, Any] = {
-        "tool": name,
-        "researchId": value.get("researchId"),
-        "contextId": value.get("context", {}).get("contextId"),
-        "warningCodes": [warning.get("code") for warning in value.get("warnings", [])],
-        "evidenceCount": len(value.get("evidence", [])),
-    }
-    if name == "ozon_get_context":
-        projection.update(
-            {
-                "accessState": data.get("accessState"),
-                "accountState": data.get("accountState"),
-                "regionVerification": data.get("region", {}).get("verification"),
-                "capabilities": {
-                    item.get("name"): item.get("status") for item in data.get("capabilities", [])
-                },
-            }
-        )
-    elif name == "ozon_search":
-        items = data.get("items", [])
-        projection.update(
-            {
-                "count": len(items),
-                "skus": [item.get("sku") for item in items],
-                "prices": [
-                    [
-                        {"amountMinor": price.get("amountMinor"), "type": price.get("type")}
-                        for price in item.get("prices", [])
-                    ]
-                    for item in items
-                ],
-                "hasNext": data.get("hasNext"),
-                "nextCursorPresent": bool(data.get("nextCursor")),
-                "coverage": data.get("coverage"),
-            }
-        )
-    elif name == "ozon_get_products":
-        results = data.get("results", [])
-        projection["results"] = [project_product_result(item) for item in results]
-    elif name == "ozon_get_reviews":
-        reviews = data.get("reviews", [])
-        projection.update(
-            {
-                "subjectSku": data.get("subjectSku"),
-                "reviewCount": len(reviews),
-                "ratings": [review.get("rating") for review in reviews],
-                "imageRefCount": sum(len(review.get("imageRefs", [])) for review in reviews),
-                "hasNext": data.get("hasNext"),
-                "coverage": data.get("coverage"),
-            }
-        )
-    elif name == "ozon_get_images":
-        projection["results"] = [
-            {
-                "status": item.get("status"),
-                "mimeType": item.get("mimeType"),
-                "width": item.get("width"),
-                "height": item.get("height"),
-                "sha256": item.get("sha256"),
-                "contentIndex": item.get("contentIndex"),
-                "errorCode": item.get("error", {}).get("code"),
-            }
-            for item in data.get("results", [])
-        ]
-    elif name == "ozon_list_research":
-        projection["researchIds"] = [item.get("researchId") for item in data.get("researches", [])]
-    elif name == "ozon_get_research":
-        payload = data.get("payload")
-        projection.update(
-            {
-                "section": data.get("section"),
-                "payloadCount": len(payload) if isinstance(payload, list) else 1,
-                "nextCursorPresent": bool(data.get("nextCursor")),
-            }
-        )
-    elif name == "ozon_append_research_note":
-        projection["noteId"] = data.get("noteId")
-    return projection
-
-
-def project_product_result(item: dict[str, Any]) -> dict[str, Any]:
-    product = item.get("product", {})
-    sections = {}
-    for section in ("characteristics", "offers", "variants", "images", "description"):
-        if isinstance(product.get(section), dict):
-            value = product[section]
-            sections[section] = {
-                "status": value.get("status"),
-                "count": len(value.get("items", [])) if isinstance(value.get("items"), list) else None,
-                "truncated": value.get("truncated"),
-            }
-    return {
-        "status": item.get("status"),
-        "errorCode": item.get("error", {}).get("code"),
-        "sku": product.get("sku"),
-        "priceTypes": [price.get("type") for price in product.get("prices", [])],
-        "sections": sections,
-    }
 
 
 def collect_image_refs(value: Any) -> list[str]:
@@ -362,66 +275,42 @@ def collect_image_refs(value: Any) -> list[str]:
 
 
 def save_images(result: dict[str, Any], value: dict[str, Any], output: Path) -> list[dict[str, Any]]:
+    from PIL import Image
+    content = result["content"]
     saved = []
-    content = result.get("content", [])
-    for number, metadata in enumerate(value.get("data", {}).get("results", []), 1):
-        if metadata.get("status") != "ok":
+    used_indexes: set[int] = set()
+    for number, metadata in enumerate(value["data"]["results"], 1):
+        if metadata["status"] != "ok":
             continue
-        index = metadata.get("contentIndex")
-        if not isinstance(index, int) or index >= len(content):
-            raise SmokeFailure("image contentIndex does not identify a returned content block")
+        index = metadata["contentIndex"]
+        if type(index) is not int or index < 0 or index >= len(content) or index in used_indexes:
+            raise SmokeFailure("invalid or reused image contentIndex")
+        used_indexes.add(index)
         block = content[index]
-        if not isinstance(block, dict) or block.get("type") != "image":
-            raise SmokeFailure("image contentIndex does not point to an image block")
-        encoded = block.get("data")
-        if not isinstance(encoded, str):
-            raise SmokeFailure("image block omitted base64 data")
-        raw = base64.b64decode(encoded, validate=True)
+        if block.get("type") != "image" or block.get("mimeType") != metadata["mimeType"]:
+            raise SmokeFailure("image contentIndex/MIME disagrees with metadata")
+        raw = base64.b64decode(block["data"], validate=True)
+        if not raw or len(raw) > 1024 * 1024:
+            raise SmokeFailure("image payload exceeds the encoded byte budget")
         digest = hashlib.sha256(raw).hexdigest()
-        if digest != metadata.get("sha256"):
-            raise SmokeFailure("decoded image sha256 does not match metadata")
-        mime = metadata.get("mimeType")
-        if block.get("mimeType") != mime:
-            raise SmokeFailure("image block MIME does not match metadata")
-        width, height = image_dimensions(raw, mime)
-        if (width, height) != (metadata.get("width"), metadata.get("height")):
-            raise SmokeFailure("decoded image dimensions do not match metadata")
-        suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[mime]
+        if digest != metadata["sha256"]:
+            raise SmokeFailure("image SHA256 disagrees with metadata")
+        with Image.open(io.BytesIO(raw)) as image:
+            expected = {"image/jpeg": "JPEG", "image/png": "PNG", "image/webp": "WEBP"}[metadata["mimeType"]]
+            if image.format != expected or image.size != (metadata["width"], metadata["height"]):
+                raise SmokeFailure("decoded image format/dimensions disagree with metadata")
+            if not all(0 < edge <= 1536 for edge in image.size):
+                raise SmokeFailure("image dimensions exceed the output budget")
+            image.load()  # Decode all pixels, not just a potentially forged header.
+        suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[metadata["mimeType"]]
         path = output / f"image-{number}{suffix}"
-        path.write_bytes(raw)
-        saved.append({"file": path.name, "mimeType": mime, "width": width, "height": height, "sha256": digest})
+        with path.open("xb") as stream:
+            stream.write(raw)
+        saved.append({"file": path.name, "sourceKind": metadata["sourceKind"],
+                      "width": metadata["width"], "height": metadata["height"], "sha256": digest})
+    if used_indexes != {index for index, block in enumerate(content) if block.get("type") == "image"}:
+        raise SmokeFailure("MCP image block has no successful metadata result")
     return saved
-
-
-def image_dimensions(data: bytes, mime: str) -> tuple[int, int]:
-    if mime == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
-        return struct.unpack(">II", data[16:24])
-    if mime == "image/jpeg" and data.startswith(b"\xff\xd8"):
-        offset = 2
-        while offset + 9 <= len(data):
-            if data[offset] != 0xFF:
-                offset += 1
-                continue
-            marker = data[offset + 1]
-            offset += 2
-            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-                continue
-            if offset + 2 > len(data):
-                break
-            length = struct.unpack(">H", data[offset : offset + 2])[0]
-            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
-                return struct.unpack(">HH", data[offset + 3 : offset + 7])[::-1]
-            offset += length
-    if mime == "image/webp" and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        kind = data[12:16]
-        if kind == b"VP8X" and len(data) >= 30:
-            return (1 + int.from_bytes(data[24:27], "little"), 1 + int.from_bytes(data[27:30], "little"))
-        if kind == b"VP8L" and len(data) >= 25:
-            bits = int.from_bytes(data[21:25], "little")
-            return (1 + (bits & 0x3FFF), 1 + ((bits >> 14) & 0x3FFF))
-        if kind == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
-            return (int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF)
-    raise SmokeFailure(f"cannot parse dimensions for returned {mime} image")
 
 
 def stop_process(process: subprocess.Popen[bytes], timeout: float) -> None:
@@ -431,480 +320,404 @@ def stop_process(process: subprocess.Popen[bytes], timeout: float) -> None:
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
-        process.kill()
+        process.kill()  # Only the subprocess object created by this script.
         process.wait(timeout=timeout)
 
 
-def stop_broker(process: subprocess.Popen[bytes], timeout: float) -> None:
+def stop_broker(process: subprocess.Popen[bytes]) -> bool:
     if process.poll() is not None:
-        return
+        return process.returncode == 0
     process.send_signal(signal.SIGINT)
     try:
-        process.wait(timeout=timeout)
+        process.wait(timeout=15.0)
+        return process.returncode == 0
     except subprocess.TimeoutExpired:
-        process.terminate()
-        try:
-            process.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5.0)
-
-
-def read_private_cdp_marker(data_dir: Path) -> str:
-    path = data_dir / "r/browser-owned"
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise SmokeFailure("crashed broker left an invalid browser ownership marker")
-    if stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
-        raise SmokeFailure("crashed broker ownership marker is not private")
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        opened = os.fstat(descriptor)
-        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
-            raise SmokeFailure("crashed broker ownership marker changed during inspection")
-        raw = os.read(descriptor, 2049)
-    finally:
-        os.close(descriptor)
-    if len(raw) > 2048:
-        raise SmokeFailure("crashed broker ownership marker is oversized")
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SmokeFailure("crashed broker ownership marker is invalid") from error
-    endpoint = value.get("cdp") if isinstance(value, dict) else None
-    if not isinstance(endpoint, str):
-        raise SmokeFailure("crashed broker marker omitted the captured CDP identity")
-    parsed = urlsplit(endpoint)
-    try:
-        address = parsed.hostname and ipaddress.ip_address(parsed.hostname)
-    except ValueError as error:
-        raise SmokeFailure("captured CDP identity is not a literal IP address") from error
-    if (
-        parsed.scheme != "ws"
-        or address is None
-        or not address.is_loopback
-        or parsed.port is None
-        or not parsed.path.startswith("/devtools/browser/")
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise SmokeFailure("captured CDP identity is outside the private loopback boundary")
-    return endpoint
-
-
-def cdp_endpoint_accepts(endpoint: str) -> bool:
-    parsed = urlsplit(endpoint)
-    assert parsed.hostname is not None and parsed.port is not None
-    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
-    request = (
-        f"GET {parsed.path} HTTP/1.1\r\n"
-        f"Host: {host}:{parsed.port}\r\n"
-        "Connection: Upgrade\r\n"
-        "Upgrade: websocket\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
-    ).encode("ascii")
-    try:
-        with socket.create_connection((parsed.hostname, parsed.port), timeout=1.0) as connection:
-            connection.settimeout(1.0)
-            connection.sendall(request)
-            response = connection.recv(128)
-    except (OSError, TimeoutError):
+        stop_process(process, 5.0)
         return False
-    return response.startswith(b"HTTP/1.1 101")
 
 
 def wait_for_socket(path: Path, broker: subprocess.Popen[bytes]) -> None:
     deadline = time.monotonic() + START_TIMEOUT
     while time.monotonic() < deadline:
         if broker.poll() is not None:
-            raise SmokeFailure(f"explicit broker exited during startup with {broker.returncode}")
+            raise SmokeFailure(f"owned broker exited during startup ({broker.returncode})")
         try:
-            mode = path.lstat().st_mode
-        except FileNotFoundError:
-            time.sleep(0.05)
-            continue
-        if stat.S_ISSOCK(mode) and stat.S_IMODE(mode) == 0o600:
+            metadata = path.lstat()
+            if not stat.S_ISSOCK(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_uid != os.geteuid():
+                raise SmokeFailure("broker socket is not private and owner-held")
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.settimeout(0.1)
+                connection.connect(str(path))
             return
-        raise SmokeFailure("broker path exists but is not a private 0600 Unix socket")
-    raise SmokeFailure("explicit broker did not create its socket before the startup deadline")
+        except (FileNotFoundError, ConnectionRefusedError, socket.timeout):
+            time.sleep(0.05)
+    raise SmokeFailure("owned broker startup exceeded its deadline")
+
+
+def ownership_record(profile: Path, executable: Path) -> dict[str, Any] | None:
+    """Inspect the private record; Rust alone verifies native process identity."""
+    path = profile / OWNER_FILE
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise SmokeFailure("browser ownership record is not an owner-only regular file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SmokeFailure("browser ownership record changed during inspection")
+        raw = os.read(descriptor, 16385)
+    finally:
+        os.close(descriptor)
+    if len(raw) > 16384:
+        raise SmokeFailure("browser ownership record exceeds its byte budget")
+    record = json.loads(raw)
+    identity = profile.stat()
+    if record.get("version") != 3 or record.get("executable") != str(executable) or record.get("profile") != {
+        "path": str(profile), "dev": identity.st_dev, "ino": identity.st_ino,
+    }:
+        raise SmokeFailure("browser ownership record disagrees with the disposable launch")
+    return record
+
+
+def journal_pages(clients: list[McpClient], research_id: str, section: str,
+                  contracts: Contracts, report: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    cursor = None
+    seen: set[str] = set()
+    for number in range(64):
+        args: dict[str, Any] = {"researchId": research_id, "section": section, "limit": 2}
+        if cursor:
+            args["cursor"] = cursor
+        _, value = tool_call(clients[number % 2], "ozon_get_research", args, contracts, report)
+        rows.extend(value["data"]["payload"])
+        cursor = value["data"]["nextCursor"]
+        if cursor is None:
+            return rows
+        if cursor in seen:
+            raise SmokeFailure(f"journal {section} repeated a cursor")
+        seen.add(cursor)
+    raise SmokeFailure(f"journal {section} exceeds the 64-page smoke budget")
 
 
 def write_report(report: dict[str, Any], output: Path) -> None:
-    output.mkdir(mode=0o700, parents=True, exist_ok=True)
     (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-    lines = [
-        "# Ozon MCP vNext live smoke",
-        "",
-        f"Status: **{report['status']}**",
-        "",
-        "This is one disposable live run. It does not establish sustained marketplace reliability.",
-        "",
-        f"- Calls completed: {len(report['calls'])}",
-        f"- Schema errors: {len(report['schemaErrors'])}",
-        f"- Saved images: {len(report['images'])}",
-        f"- Profile fallback pool absent: {report.get('profilePoolAbsent')}",
-    ]
-    for item in report.get("partials", []):
-        lines.append(f"- Partial: {item}")
-    for item in report.get("failures", []):
-        lines.append(f"- Failure: {item}")
-    lines.extend(["", "## Timings", ""])
-    lines.extend(
-        f"- {item['client']} {item['tool']}: {item['elapsed']} ms" for item in report["timingsMs"]
-    )
+    lines = ["# Ozon MCP v3 optional live acceptance", "", f"Status: **{report['status']}**", "",
+             "One disposable run; static support does not establish live availability or catalog completeness.",
+             f"Calls completed: {len(report['calls'])}", f"Fully decoded images: {len(report['images'])}",
+             f"Whole run: {report['wallSeconds']} seconds", "", "## Coverage", ""]
+    lines += [f"- {name}: {'observed' if observed else 'unobserved'}" for name, observed in report["coverage"].items()]
+    lines += [f"- Partial: {item}" for item in report["partials"]]
+    lines += [f"- Failure: {item}" for item in report["failures"]]
+    lines += ["", "## Timings", ""]
+    lines += [f"- {item['client']} {item['tool']}: {item['elapsed']} ms" for item in report["timingsMs"]]
     (output / "report.md").write_text("\n".join(lines) + "\n")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--driver", type=Path, required=True)
-    parser.add_argument("--chrome", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument(
-        "--query",
-        action="append",
-        dest="queries",
-        help="repeat to smoke multiple generic marketplace queries",
-    )
-    parser.add_argument(
-        "--crash-restart",
-        action="store_true",
-        help="SIGKILL the owned broker once and verify captured-CDP recovery",
-    )
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, required=True, help="explicit compiled v3 MCP executable")
+    parser.add_argument("--browser-executable", type=Path, required=True, help="explicit Chromium executable")
+    parser.add_argument("--data-dir", type=Path, help="new private disposable root; default: fresh /tmp directory")
+    parser.add_argument("--output-dir", type=Path, required=True, help="new artifact directory; retained after cleanup")
+    parser.add_argument("--query", action="append", dest="queries", help="repeat generic marketplace queries")
+    parser.add_argument("--crash-restart", action="store_true", help="kill only the owned broker and test verified Chrome recovery")
+    parser.add_argument("--total-timeout", type=float, default=600.0, help="whole observation budget in seconds (default: 600)")
     return parser.parse_args()
+
+
+def executable(path: Path, label: str) -> Path:
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise SmokeFailure(f"{label} must be an executable file")
+    return resolved
+
+def run_observations(clients: list[McpClient], contracts: Contracts, report: dict[str, Any],
+                     queries: list[str], output: Path) -> tuple[str, str, str, dict[str, Any]]:
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        pending = [executor.submit(client.call, "ozon_get_context", {}) for client in clients]
+        replies = [future.result() for future in pending]
+    contexts = []
+    for client, (result, elapsed) in zip(clients, replies, strict=True):
+        report["timingsMs"].append({"client": client.label, "tool": "ozon_get_context", "elapsed": elapsed})
+        value = success(result, "ozon_get_context", contracts)
+        report["calls"].append({"tool": "ozon_get_context", "contextId": value["data"]["contextId"]})
+        contexts.append(value)
+    context_id = contexts[0]["data"]["contextId"]
+    if contexts[1]["data"]["contextId"] != context_id:
+        raise SmokeFailure("two frontends observed different shared contexts")
+    report["coverage"]["shared_context"] = True
+    for name in ("region_verification", "account_observation"):
+        report["coverage"][name] = all(
+            value["data"]["region"]["verification"] == "verified" if name == "region_verification"
+            else value["data"]["accountState"] != "unknown" for value in contexts
+        )
+    primary = None
+    for number, query in enumerate(queries):
+        _, page = tool_call(clients[number % 2], "ozon_search",
+                            {"start": {"query": query, "priceRange": {"maxMinor": 10000000}},
+                             "limit": 1, "includeFacets": True, "refinementLimit": 2}, contracts, report)
+        if not page["data"]["items"]:
+            report["partials"].append(f"query {number + 1}: no candidates observed")
+            continue
+        primary = primary or page
+        report["coverage"]["search"] = True
+        if page["data"]["refinementsTruncated"]:
+            report["partials"].append(f"query {number + 1}: bounded refinements were truncated")
+        cursor = page["data"]["nextCursor"]
+        if cursor:
+            args = {"start": {"cursor": cursor}, "researchId": page["researchId"], "limit": 1}
+            _, continuation = tool_call(clients[(number + 1) % 2], "ozon_search", args, contracts, report)
+            _, replay = tool_call(clients[number % 2], "ozon_search", args, contracts, report)
+            if replay["data"] != continuation["data"]:
+                raise SmokeFailure("captured search cursor replay changed its data")
+            if continuation["data"]["coverage"]["uniqueSeen"] < page["data"]["coverage"]["uniqueSeen"]:
+                raise SmokeFailure("search cumulative uniqueSeen decreased")
+            report["coverage"]["search_pagination_replay"] = True
+        refinements = page["data"]["refinements"]
+        if refinements:
+            tool_call(clients[1], "ozon_search", {"start": {"searchRef": refinements[0]["searchRef"]},
+                      "researchId": page["researchId"], "limit": 1}, contracts, report)
+            report["coverage"]["search_refinements"] = True
+    if primary is None:
+        raise ObservationUnavailable("no query produced a product candidate for downstream acceptance")
+    research_id = primary["researchId"]
+    first = primary["data"]["items"][0]
+    selectors = [{"sku": first["sku"]}, {"productRef": first["productRef"]}, {"url": first["url"]}]
+    _, products = tool_call(clients[0], "ozon_get_products", {"products": selectors,
+                           "researchId": research_id, "include": ["characteristics", "description", "variants", "images"]}, contracts, report)
+    good = [item["product"] for item in products["data"]["results"] if item["status"] == "ok"]
+    if len(good) != len(selectors):
+        report["partials"].append("one or more product selectors did not yield a product")
+    for product in good:
+        if product["sku"] != first["sku"]:
+            raise SmokeFailure("product selector resolved to the wrong SKU")
+        for section in ("characteristics", "description", "variants", "images"):
+            value = product[section]
+            report["coverage"][f"product_{section}"] |= value["status"] == "available"
+            if value["status"] != "available":
+                report["partials"].append(f"product section {section}: {value['status']}")
+            cursor = value["nextCursor"]
+            if cursor:
+                tool_call(clients[1], "ozon_get_products", {"products": [{"cursor": cursor}],
+                          "researchId": research_id}, contracts, report)
+                report["coverage"]["product_section_pagination"] = True
+    _, reviews = tool_call(clients[1], "ozon_get_reviews", {"start": {"productRef": first["productRef"]},
+                          "researchId": research_id, "limit": 1, "includeFacets": True}, contracts, report)
+    report["coverage"]["reviews"] = bool(reviews["data"]["reviews"])
+    cursor = reviews["data"]["nextCursor"]
+    if cursor:
+        args = {"start": {"cursor": cursor}, "researchId": research_id, "limit": 1}
+        _, page = tool_call(clients[0], "ozon_get_reviews", args, contracts, report)
+        _, replay = tool_call(clients[1], "ozon_get_reviews", args, contracts, report)
+        if page["data"] != replay["data"]:
+            raise SmokeFailure("captured review cursor replay changed its data")
+        if page["data"]["coverage"]["uniqueSeen"] < reviews["data"]["coverage"]["uniqueSeen"]:
+            raise SmokeFailure("review cumulative uniqueSeen decreased")
+        report["coverage"]["review_pagination_replay"] = True
+    if reviews["data"]["refinements"]:
+        tool_call(clients[0], "ozon_get_reviews", {"start": {"reviewSearchRef": reviews["data"]["refinements"][0]["reviewSearchRef"]},
+                  "researchId": research_id, "limit": 1}, contracts, report)
+        report["coverage"]["review_refinements"] = True
+    image_refs = list(dict.fromkeys(collect_image_refs(products)[:1] + collect_image_refs(reviews)[:1]))
+    if image_refs:
+        result, value = tool_call(clients[0], "ozon_get_images", {"imageRefs": image_refs,
+                                  "researchId": research_id}, contracts, report)
+        report["images"] = save_images(result, value, output)
+        for item in report["images"]:
+            report["coverage"][f"{item['sourceKind']}_image_content"] = True
+        if any(item["status"] == "error" for item in value["data"]["results"]):
+            report["partials"].append("one or more observed image references could not be downloaded")
+    _, listed = tool_call(clients[1], "ozon_list_research", {"limit": 50}, contracts, report)
+    if research_id not in {item["researchId"] for item in listed["data"]["researches"]}:
+        raise SmokeFailure("second frontend cannot see the first frontend research")
+    tool_call(clients[1], "ozon_get_research", {"researchId": research_id, "section": "candidates",
+              "productRefs": [first["productRef"]]}, contracts, report)
+    note = {"researchId": research_id, "operationId": f"live-smoke-{uuid.uuid4()}", "kind": "assessment",
+            "text": "Synthetic live-smoke assessment; not a product recommendation.", "productRefs": [first["productRef"]]}
+    _, appended = tool_call(clients[0], "ozon_append_research_note", note, contracts, report)
+    _, repeated = tool_call(clients[1], "ozon_append_research_note", note, contracts, report)
+    note_id = appended["data"]["noteId"]
+    if repeated["data"]["noteId"] != note_id:
+        raise SmokeFailure("idempotent note retry changed noteId")
+    changed = dict(note, text="Changed synthetic payload must conflict.")
+    result, elapsed = clients[1].call("ozon_append_research_note", changed)
+    report["timingsMs"].append({"client": clients[1].label, "tool": "note conflict", "elapsed": elapsed})
+    failure = failure_value(result)
+    contracts.validate("tool_failure.schema.json", failure)
+    if failure["error"]["code"] != "CONFLICT":
+        raise SmokeFailure("changed operationId payload did not return CONFLICT")
+    _, selected = tool_call(clients[1], "ozon_get_research", {"researchId": research_id, "section": "notes",
+                           "noteIds": [note_id]}, contracts, report)
+    if len(selected["data"]["payload"]) != 1 or selected["data"]["payload"][0]["noteId"] != note_id:
+        raise SmokeFailure("exact note selection did not preserve the requested note")
+    _, before = tool_call(clients[0], "ozon_get_research", {"researchId": research_id}, contracts, report)
+    report["coverage"]["cross_client_journal_notes"] = True
+    live_contexts = {call["contextId"] for call in report["calls"]}
+    if live_contexts != {context_id}:
+        raise SmokeFailure("successful calls crossed shared contexts before restart")
+    return research_id, note_id, note["operationId"], before["data"]["payload"]
 
 
 def main() -> int:
     args = parse_args()
-    if jsonschema is None:
-        raise SystemExit(
-            "jsonschema is required; run with `uv run --with 'jsonschema[format]==4.25.1' scripts/live-smoke.py ...`"
-        )
-    binary = args.binary.resolve(strict=True)
-    driver = args.driver.resolve(strict=True)
-    chrome = args.chrome.resolve(strict=True)
-    data_dir = args.data_dir.absolute()
-    output = args.output_dir.absolute()
+    try:
+        import PIL.Image  # Full raster decoding is required, including optional live images.
+        contracts = Contracts()
+    except ImportError as error:
+        raise SystemExit("Requires jsonschema[format]==4.25.1 and Pillow; use uv run --no-project --with 'jsonschema[format]==4.25.1' --with 'pillow==12.3.0' python scripts/live-smoke.py ...") from error
+    binary = executable(args.binary, "--binary")
+    chrome = executable(args.browser_executable, "--browser-executable")
     queries = args.queries or ["беспроводная мышь"]
     if any(not query.strip() or len(query) > 500 for query in queries):
         raise SystemExit("each --query must contain 1..500 non-whitespace characters")
-    if data_dir.exists() or data_dir.is_symlink():
-        raise SystemExit("--data-dir must be a new disposable path")
-    data_dir.mkdir(mode=0o700, parents=False)
-    if stat.S_IMODE(data_dir.stat().st_mode) != 0o700:
-        raise SystemExit("--data-dir was not created with mode 0700")
-    output.mkdir(mode=0o700, parents=True, exist_ok=True)
-    schemas = Path(__file__).resolve().parents[1] / "contracts/schemas"
-    env = os.environ.copy()
-    env.update(
-        {
-            "OZON_DATA_DIR": str(data_dir),
-            "OZON_USER_DATA_DIR": str(data_dir / "browser-profile"),
-            "OZON_BROKER_SOCKET": str(data_dir / "broker.sock"),
-            "OZON_AGENT_BROWSER_BIN": str(driver),
-            "OZON_BROWSER_EXECUTABLE": str(chrome),
-            "OZON_HEADLESS": "true",
-        }
-    )
-    report: dict[str, Any] = {
-        "status": "FAIL",
-        "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-        "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "calls": [],
-        "timingsMs": [],
-        "schemaErrors": [],
-        "partials": [],
-        "failures": [],
-        "images": [],
-    }
-    broker_stderr = (output / "broker.stderr.log").open("wb")
-    broker = subprocess.Popen(
-        [str(binary), "--broker"],
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=broker_stderr,
-    )
+    if not 60 <= args.total_timeout <= 3600:
+        raise SystemExit("--total-timeout must be between 60 and 3600 seconds")
+    output = args.output_dir.absolute()
+    if output.exists() or output.is_symlink():
+        raise SystemExit("--output-dir must be a new artifact directory")
+    # Umask applies to every log, image and disposable journal created below.
+    os.umask(0o077)
+    if args.data_dir is None:
+        root = Path(tempfile.mkdtemp(prefix="ozon-smoke-", dir="/tmp")).resolve()
+    else:
+        root = args.data_dir.absolute()
+        if root.exists() or root.is_symlink():
+            raise SystemExit("--data-dir must be a new disposable path")
+        root.mkdir(mode=0o700, parents=False)
+        root = root.resolve()
+    profile = root / "browser-profile"
+    output.mkdir(mode=0o700, parents=True)
+    env = {key: value for key, value in os.environ.items() if not key.startswith("OZON_")}
+    env.update(OZON_DATA_DIR=str(root), OZON_USER_DATA_DIR=str(profile),
+               OZON_BROWSER_EXECUTABLE=str(chrome), OZON_HEADLESS="true", OZON_IMAGE_DOH_FALLBACK="off")
+    started = time.monotonic()
+    deadline = started + args.total_timeout
+    coverage_names = ["shared_context", "region_verification", "account_observation", "search",
+                      "search_pagination_replay", "search_refinements", "product_characteristics", "product_description",
+                      "product_variants", "product_images", "product_section_pagination", "reviews",
+                      "review_pagination_replay", "review_refinements", "product_image_content", "review_image_content",
+                      "cross_client_journal_notes", "restart_continuity", "crash_browser_recovery"]
+    report: dict[str, Any] = {"status": "FAIL", "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "dataDir": str(root), "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "calls": [], "timingsMs": [], "partials": [], "failures": [], "images": [],
+        "coverage": {name: False for name in coverage_names}, "offers": "unsupported"}
     clients: list[McpClient] = []
+    broker = None
+    handles = []
+
+    def start_broker(label: str) -> subprocess.Popen[bytes]:
+        handle = (output / f"{label}.stderr.log").open("xb")
+        handles.append(handle)
+        process = subprocess.Popen([str(binary), "--broker"], env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=handle)
+        try:
+            wait_for_socket(root / "broker.sock", process)
+        except BaseException:
+            stop_broker(process)
+            raise
+        return process
+
     try:
-        wait_for_socket(data_dir / "broker.sock", broker)
-        clients = [
-            McpClient(binary, env, output / "client-1.stderr.log", "client-1", broker),
-            McpClient(binary, env, output / "client-2.stderr.log", "client-2", broker),
-        ]
-        for client in clients:
+        broker = start_broker("broker")
+        for number in range(2):
+            client = McpClient(binary, env, output / f"client-{number + 1}.stderr.log", f"client-{number + 1}", broker)
+            client.deadline = deadline
+            clients.append(client)
             client.initialize()
-            listed = require_rpc_result(client.request("tools/list", {}), f"{client.label} tools/list")
-            names = {tool.get("name") for tool in listed.get("tools", [])}
-            if names != EXPECTED_TOOLS:
-                raise SmokeFailure(f"{client.label} advertised an unexpected tool set")
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            context_futures = [
-                executor.submit(client.call, "ozon_get_context", {}) for client in clients
-            ]
-            context_results = [future.result() for future in context_futures]
-        contexts = []
-        for client, (result, elapsed_ms) in zip(clients, context_results, strict=True):
-            report["timingsMs"].append(
-                {"client": client.label, "tool": "ozon_get_context", "elapsed": elapsed_ms}
-            )
-            value = require_success(
-                result, "ozon_get_context", schemas, report["schemaErrors"]
-            )
-            report["calls"].append(project("ozon_get_context", value))
-            contexts.append(value)
-        context_one, context_two = contexts
-        context_id = context_one["data"]["contextId"]
-        if context_two["data"]["contextId"] != context_id:
-            raise SmokeFailure("two frontends observed different broker contexts")
-
-        primary_search: dict[str, Any] | None = None
-        for query_number, query in enumerate(queries):
-            _, search = tool_call(
-                clients[query_number % 2],
-                "ozon_search",
-                {"start": {"query": query}, "limit": 3, "includeFacets": True},
-                schemas,
-                report,
-            )
-            items = search["data"]["items"]
-            if not items:
-                raise SmokeFailure(f"search query {query_number + 1} returned no candidates")
-            if primary_search is None:
-                primary_search = search
-            cursor = search["data"].get("nextCursor")
-            if cursor:
-                tool_call(
-                    clients[(query_number + 1) % 2],
-                    "ozon_search",
-                    {
-                        "start": {"cursor": cursor},
-                        "researchId": search["researchId"],
-                        "limit": 2,
-                    },
-                    schemas,
-                    report,
-                )
-            else:
-                report["partials"].append(
-                    f"search query {query_number + 1} returned no continuation cursor"
-                )
-
-        assert primary_search is not None
-        search = primary_search
-        research_id = search["researchId"]
-        items = search["data"]["items"]
-
-        first = items[0]
-        sku = first["sku"]
-        product_ref = first["productRef"]
-        _, products = tool_call(
-            clients[0],
-            "ozon_get_products",
-            {
-                "products": [{"sku": sku}],
-                "researchId": research_id,
-                "include": ["characteristics", "offers", "variants", "images"],
-            },
-            schemas,
-            report,
-        )
-        _, reviews = tool_call(
-            clients[1],
-            "ozon_get_reviews",
-            {"start": {"productRef": product_ref}, "researchId": research_id, "limit": 3},
-            schemas,
-            report,
-        )
-
-        review_cursor = reviews["data"].get("nextCursor")
-        if review_cursor:
-            tool_call(clients[1], "ozon_get_reviews",
-                      {"start": {"cursor": review_cursor}, "researchId": research_id, "limit": 3},
-                      schemas, report)
-        product_images = collect_image_refs(products)
-        review_images = collect_image_refs(reviews)
-        image_refs = list(dict.fromkeys(product_images[:1] + review_images[:1]))
-        report["imageSourceCoverage"] = {"productRequested": bool(product_images), "reviewRequested": bool(review_images)}
-        if image_refs:
-            image_result, image_value = tool_call(
-                clients[0],
-                "ozon_get_images",
-                {"imageRefs": image_refs, "researchId": research_id},
-                schemas,
-                report,
-            )
-            report["images"] = save_images(image_result, image_value, output)
-            if not report["images"]:
-                report["partials"].append("image references were returned but no image content was available")
-        else:
-            report["partials"].append("product/review image references were unsupported or unavailable")
-
-        for section in ("summary", "events", "evidence"):
-            tool_call(
-                clients[0],
-                "ozon_get_research",
-                {"researchId": research_id, "section": section},
-                schemas,
-                report,
-            )
-        _, listed = tool_call(clients[1], "ozon_list_research", {"limit": 10}, schemas, report)
-        if research_id not in {item["researchId"] for item in listed["data"]["researches"]}:
-            raise SmokeFailure("second frontend did not see the first frontend research")
-
-        operation_id = f"live-smoke-{uuid.uuid4()}"
-        note = {
-            "researchId": research_id,
-            "operationId": operation_id,
-            "kind": "assessment",
-            "text": "Synthetic live-smoke assessment; not a product recommendation.",
-            "productRefs": [product_ref],
-        }
-        _, appended = tool_call(clients[0], "ozon_append_research_note", note, schemas, report)
-        _, repeated = tool_call(clients[1], "ozon_append_research_note", note, schemas, report)
-        if appended["data"]["noteId"] != repeated["data"]["noteId"]:
-            raise SmokeFailure("idempotent note retry returned a different noteId")
-        changed = dict(note)
-        changed["text"] = "Changed synthetic payload must conflict."
-        conflict_result, elapsed = clients[1].call("ozon_append_research_note", changed)
-        report["timingsMs"].append(
-            {"client": clients[1].label, "tool": "ozon_append_research_note conflict", "elapsed": elapsed}
-        )
-        conflict = failure_value(conflict_result)
-        if conflict is None:
-            raise SmokeFailure("changed operationId payload did not fail")
-        validate_failure(conflict, schemas)
-        if conflict["error"].get("code") != "CONFLICT":
-            raise SmokeFailure("changed operationId payload did not return CONFLICT")
-        report["calls"].append({"tool": "ozon_append_research_note", "expectedErrorCode": "CONFLICT"})
-        contexts = {entry.get("contextId") for entry in report["calls"] if entry.get("contextId")}
-        if contexts != {context_id}:
-            raise SmokeFailure("successful browser calls crossed broker contexts")
-
-        # Exercise a real frontend reconnect and broker restart while retaining
-        # the disposable data root. Journal reads are local and remain valid if
-        # a later browser observation would produce a new context generation.
-        old_cdp: str | None = None
+            contracts.discovery(require_rpc_result(client.request("tools/list", {}), "tools/list"))
+        research_id, note_id, operation_id, before = run_observations(clients, contracts, report, queries, output)
+        old_record = ownership_record(profile, chrome)
         if args.crash_restart:
-            broker.kill()
+            if old_record is None or old_record.get("browser_endpoint") is None:
+                raise ObservationUnavailable("crash acceptance could not observe a recorded owned browser endpoint")
+            broker.kill()  # This Popen is the explicitly started disposable broker only.
             broker.wait(timeout=5.0)
-            old_cdp = read_private_cdp_marker(data_dir)
-        else:
-            stop_broker(broker, 15.0)
-        broker_stderr.close()
-        if not args.crash_restart and (data_dir / "r/browser-owned").exists():
-            raise SmokeFailure("graceful broker shutdown left a browser ownership marker")
-        broker_stderr = (output / "broker-restart.stderr.log").open("wb")
-        broker = subprocess.Popen(
-            [str(binary), "--broker"],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=broker_stderr,
-        )
-        wait_for_socket(data_dir / "broker.sock", broker)
+        elif not stop_broker(broker) or ownership_record(profile, chrome) is not None:
+            raise SmokeFailure("graceful broker shutdown did not release its owned Chrome")
+        broker = start_broker("broker-restart")
         for client in clients:
             client.attach_broker(broker)
-            listed_tools = require_rpc_result(
-                client.request("tools/list", {}), f"{client.label} tools/list"
-            )
-            if {tool.get("name") for tool in listed_tools.get("tools", [])} != EXPECTED_TOOLS:
-                raise SmokeFailure(f"{client.label} advertised an unexpected tool set after restart")
-
-        recovered_context_id: str | None = None
+            contracts.discovery(require_rpc_result(client.request("tools/list", {}), "tools/list after restart"))
         if args.crash_restart:
-            _, recovered_context = tool_call(
-                clients[0], "ozon_get_context", {}, schemas, report
-            )
-            recovered_context_id = recovered_context["data"]["contextId"]
-            assert old_cdp is not None
-            new_cdp = read_private_cdp_marker(data_dir)
-            if new_cdp == old_cdp:
-                raise SmokeFailure("crash recovery retained the stale captured CDP identity")
-            if cdp_endpoint_accepts(old_cdp):
-                raise SmokeFailure("old captured CDP endpoint still accepts connections after recovery")
-
-        _, summary_value = tool_call(
-            clients[0],
-            "ozon_get_research",
-            {"researchId": research_id, "section": "summary"},
-            schemas,
-            report,
-        )
+            # BrowserSession::new does native identity verification and Browser.close.
+            # No Python CDP implementation, private driver IPC, or recovered PID signals.
+            try:
+                tool_call(clients[0], "ozon_get_context", {}, contracts, report)
+            except ObservationUnavailable as error:
+                report["partials"].append(str(error))
+            new_record = ownership_record(profile, chrome)
+            if new_record is not None and new_record.get("generation") == old_record["generation"]:
+                raise SmokeFailure("crash recovery retained the old browser ownership generation")
+            if new_record is not None and new_record.get("browser_endpoint") == old_record["browser_endpoint"]:
+                raise SmokeFailure("crash recovery retained the old browser endpoint")
+            report["coverage"]["crash_browser_recovery"] = True
+        _, summary_value = tool_call(clients[0], "ozon_get_research", {"researchId": research_id}, contracts, report)
         summary = summary_value["data"]["payload"]
-        durable_payloads: dict[str, list[dict[str, Any]]] = {}
-        for section_number, section in enumerate(("events", "evidence", "notes")):
-            payload: list[dict[str, Any]] = []
-            cursor: str | None = None
-            for page_number in range(100):
-                arguments = {"researchId": research_id, "section": section}
-                if cursor is not None:
-                    arguments["cursor"] = cursor
-                _, page = tool_call(
-                    clients[(section_number + page_number) % 2],
-                    "ozon_get_research",
-                    arguments,
-                    schemas,
-                    report,
-                )
-                payload.extend(page["data"]["payload"])
-                cursor = page["data"].get("nextCursor")
-                if cursor is None:
-                    break
-            else:
-                raise SmokeFailure(f"durable {section} pagination exceeded 100 pages")
-            durable_payloads[section] = payload
-        events = durable_payloads["events"]
-        evidence = durable_payloads["evidence"]
-        notes = durable_payloads["notes"]
-        matching_notes = [item for item in notes if item.get("operationId") == operation_id]
-        if len(matching_notes) != 1 or matching_notes[0].get("noteId") != appended["data"]["noteId"]:
-            raise SmokeFailure("durable journal did not preserve the idempotent noteId exactly once")
-        if sum(event.get("kind") == "note_appended" for event in events) != 1:
-            raise SmokeFailure("durable journal did not contain exactly one note_appended event")
-        if not evidence or summary.get("evidenceCount") != len(evidence):
-            raise SmokeFailure("durable journal evidence was absent or inconsistent after restart")
-        if summary.get("eventCount") != len(events) or summary.get("noteCount") != len(notes):
-            raise SmokeFailure("durable journal counts changed across broker restart")
-        report["restart"] = {
-            "mode": "crash" if args.crash_restart else "graceful",
-            "reconnectedExistingClients": 2,
-            "summaryEventCount": summary.get("eventCount"),
-            "summaryEvidenceCount": summary.get("evidenceCount"),
-            "noteIdStable": True,
-            "noteAppendedEventCount": 1,
-            "contextRotated": (
-                recovered_context_id != context_id if recovered_context_id is not None else None
-            ),
-        }
-
-        report["profilePoolAbsent"] = not (data_dir / "browser-profile/.ozon-mcp-profiles").exists()
-        if not report["profilePoolAbsent"]:
-            raise SmokeFailure("legacy fallback profile pool was created")
-        report["status"] = "PARTIAL" if report["partials"] else "PASS"
-    except BaseException as error:
-        report["failures"].append(str(error)[:1000])
-        report["status"] = "FAIL"
+        rows = {section: journal_pages(clients, research_id, section, contracts, report)
+                for section in ("events", "evidence", "notes")}
+        notes = [note for note in rows["notes"] if note["operationId"] == operation_id]
+        if len(notes) != 1 or notes[0]["noteId"] != note_id:
+            raise SmokeFailure("durable journal did not retain exactly one idempotent note")
+        if sum(event["kind"] == "note_appended" for event in rows["events"]) != 1:
+            raise SmokeFailure("durable journal did not retain exactly one note_appended event")
+        for field, section in (("eventCount", "events"), ("evidenceCount", "evidence"), ("noteCount", "notes")):
+            if summary[field] != len(rows[section]) or summary[field] != before[field]:
+                raise SmokeFailure(f"durable {section} count changed across restart")
+        if not rows["evidence"]:
+            raise SmokeFailure("durable journal evidence is absent after live observations")
+        _, selected = tool_call(clients[1], "ozon_get_research", {"researchId": research_id, "section": "notes", "noteIds": [note_id]}, contracts, report)
+        if [note["noteId"] for note in selected["data"]["payload"]] != [note_id]:
+            raise SmokeFailure("exact durable note selection changed after restart")
+        report["coverage"]["restart_continuity"] = True
+        report["restart"] = {"mode": "crash" if args.crash_restart else "graceful", "reconnectedClients": 2,
+                             "noteIdStable": True, "countsStable": True}
+    except ObservationUnavailable as error:
+        report["partials"].append(str(error))
+    except Exception as error:
+        report["failures"].append(str(error) if isinstance(error, SmokeFailure) else type(error).__name__)
     finally:
         for client in clients:
-            client.close()
-        stop_broker(broker, 15.0)
-        broker_stderr.close()
-        if (data_dir / "r/browser-owned").exists():
-            report["failures"].append("final graceful broker shutdown left a browser ownership marker")
-            report["status"] = "FAIL"
+            try:
+                client.close()
+            except Exception:
+                report["failures"].append("owned frontend cleanup failed")
+        try:
+            if broker is not None and not stop_broker(broker):
+                report["failures"].append("owned broker did not shut down gracefully")
+            if ownership_record(profile, chrome) is not None:
+                # Recovery delegates recorded-identity checking/Browser.close to Rust.
+                broker = start_broker("broker-cleanup")
+                cleanup = McpClient(binary, env, output / "cleanup-client.stderr.log", "cleanup", broker)
+                try:
+                    cleanup.initialize()
+                    result, _ = cleanup.call("ozon_get_context", {})
+                    try:
+                        success(result, "ozon_get_context", contracts)
+                    except ObservationUnavailable:
+                        pass
+                finally:
+                    cleanup.close()
+                    stop_broker(broker)
+                if ownership_record(profile, chrome) is not None:
+                    raise SmokeFailure("owned Chrome cleanup remains unknown; preserved private root for inspection")
+        except Exception as error:
+            report["failures"].append(str(error) if isinstance(error, SmokeFailure) else "owned Chrome cleanup failed")
+        for handle in handles:
+            handle.close()
+        optional = {"crash_browser_recovery"} if not args.crash_restart else set()
+        report["partials"].extend(f"{name}: not observed in this bounded run" for name, observed in report["coverage"].items()
+                                  if not observed and name not in optional)
+        report["partials"] = list(dict.fromkeys(report["partials"]))
+        observed_tools = {call["tool"] for call in report["calls"]}
+        report["toolsObserved"] = {name: name in observed_tools for name in sorted(EXPECTED_TOOLS)}
+        report["status"] = "FAIL" if report["failures"] else "PARTIAL" if report["partials"] else "PASS"
         report["finishedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        report.setdefault(
-            "profilePoolAbsent", not (data_dir / "browser-profile/.ozon-mcp-profiles").exists()
-        )
+        report["wallSeconds"] = round(time.monotonic() - started, 3)
         write_report(report, output)
-    return 0 if report["status"] == "PASS" else 2
+    return {"PASS": 0, "PARTIAL": 2, "FAIL": 1}[report["status"]]
 
 
 if __name__ == "__main__":

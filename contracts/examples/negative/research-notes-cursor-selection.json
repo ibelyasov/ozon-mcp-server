@@ -1,0 +1,12 @@
+{
+  "schema": "schemas/ozon_get_research.input.schema.json",
+  "instance": {
+    "researchId": "research-01",
+    "section": "notes",
+    "noteIds": [
+      "note-01"
+    ],
+    "cursor": "cursor-01"
+  },
+  "expectedInvalidAt": "schema"
+}

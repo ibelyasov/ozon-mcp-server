@@ -1,0 +1,277 @@
+{
+  "page": {
+    "widgetStates": {
+      "webListReviews-a": {
+        "requestedPath": "/product/901/reviews/",
+        "paging": {
+          "nextButton": ""
+        },
+        "reviews": [
+          null,
+          {
+            "uuid": "uuid_1",
+            "author": {
+              "title": {
+                "text": "Ada"
+              },
+              "guid": "PRIVATE_MARKER"
+            },
+            "content": {
+              "comment": "Works"
+            }
+          },
+          {
+            "reviewId": "review_2",
+            "author": {
+              "fio": "Public Name"
+            },
+            "content": {
+              "score": 5
+            }
+          },
+          {
+            "id": "id_3",
+            "variantLabel": "Синий",
+            "content": {
+              "photos": [
+                {
+                  "photoUrl": "https://ir.ozone.ru/c.jpg",
+                  "account": "PRIVATE_MARKER"
+                }
+              ]
+            }
+          }
+        ],
+        "tracking": "PRIVATE_MARKER"
+      },
+      "webPrice-a": {
+        "price": "1 234,50 ₽",
+        "account": "PRIVATE_MARKER"
+      },
+      "webGallery-a": {
+        "sku": "901",
+        "images": [
+          null,
+          "https://ir.ozone.ru/gallery-1.jpg",
+          "https://ir.ozone.ru/gallery-2.jpg",
+          "https://ir.ozone.ru/gallery-3.jpg",
+          "https://ir.ozone.ru/gallery-4.jpg",
+          "https://ir.ozone.ru/gallery-5.jpg",
+          "https://ir.ozone.ru/gallery-6.jpg",
+          "https://ir.ozone.ru/gallery-7.jpg",
+          "https://ir.ozone.ru/gallery-8.jpg",
+          "https://ir.ozone.ru/gallery-9.jpg",
+          "https://ir.ozone.ru/gallery-10.jpg",
+          "https://ir.ozone.ru/gallery-11.jpg",
+          "https://ir.ozone.ru/gallery-12.jpg",
+          "https://ir.ozone.ru/gallery-13.jpg",
+          "https://ir.ozone.ru/gallery-14.jpg"
+        ],
+        "tracking": "PRIVATE_MARKER"
+      }
+    }
+  },
+  "projected": {
+    "widgetStates": {
+      "webListReviews-a": {
+        "requestedPath": "/product/901/reviews/",
+        "paging": {
+          "nextButton": ""
+        },
+        "reviews": [
+          null,
+          {
+            "uuid": "uuid_1",
+            "author": {
+              "title": {
+                "text": "Ada"
+              }
+            },
+            "content": {
+              "comment": "Works"
+            }
+          },
+          {
+            "reviewId": "review_2",
+            "author": {
+              "fio": "Public Name"
+            },
+            "content": {
+              "score": 5
+            }
+          },
+          {
+            "id": "id_3",
+            "variantLabel": "Синий",
+            "content": {
+              "photos": [
+                {
+                  "photoUrl": "https://ir.ozone.ru/c.jpg"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "webPrice-a": {
+        "price": "1 234,50 ₽"
+      },
+      "webGallery-a": {
+        "sku": "901",
+        "images": [
+          null,
+          "https://ir.ozone.ru/gallery-1.jpg",
+          "https://ir.ozone.ru/gallery-2.jpg",
+          "https://ir.ozone.ru/gallery-3.jpg",
+          "https://ir.ozone.ru/gallery-4.jpg",
+          "https://ir.ozone.ru/gallery-5.jpg",
+          "https://ir.ozone.ru/gallery-6.jpg",
+          "https://ir.ozone.ru/gallery-7.jpg",
+          "https://ir.ozone.ru/gallery-8.jpg",
+          "https://ir.ozone.ru/gallery-9.jpg",
+          "https://ir.ozone.ru/gallery-10.jpg",
+          "https://ir.ozone.ru/gallery-11.jpg",
+          "https://ir.ozone.ru/gallery-12.jpg",
+          "https://ir.ozone.ru/gallery-13.jpg",
+          "https://ir.ozone.ru/gallery-14.jpg"
+        ]
+      }
+    }
+  },
+  "reviews": [
+    {
+      "reviewId": "uuid_1",
+      "author": "Ada",
+      "score": null,
+      "comment": "Works",
+      "pros": null,
+      "cons": null,
+      "date": null,
+      "purchased": null,
+      "variantLabel": null,
+      "sourceIndex": 1,
+      "sourceLocator": "/widgetStates/webListReviews-a/reviews/1",
+      "photoOrigins": []
+    },
+    {
+      "reviewId": "review_2",
+      "author": "Public Name",
+      "score": 5.0,
+      "comment": null,
+      "pros": null,
+      "cons": null,
+      "date": null,
+      "purchased": null,
+      "variantLabel": null,
+      "sourceIndex": 2,
+      "sourceLocator": "/widgetStates/webListReviews-a/reviews/2",
+      "photoOrigins": []
+    },
+    {
+      "reviewId": "id_3",
+      "author": null,
+      "score": null,
+      "comment": null,
+      "pros": null,
+      "cons": null,
+      "date": null,
+      "purchased": null,
+      "variantLabel": "Синий",
+      "sourceIndex": 3,
+      "sourceLocator": "/widgetStates/webListReviews-a/reviews/3",
+      "photoOrigins": [
+        {
+          "url": "https://ir.ozone.ru/c.jpg",
+          "section": "reviews/3/photos",
+          "index": 0,
+          "sourceLocator": "/widgetStates/webListReviews-a/reviews/3/content/photos/0"
+        }
+      ]
+    }
+  ],
+  "gallery": {
+    "imageOrigins": [
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/1",
+        "url": "https://ir.ozone.ru/gallery-1.jpg",
+        "section": "gallery/images",
+        "index": 1
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/2",
+        "url": "https://ir.ozone.ru/gallery-2.jpg",
+        "section": "gallery/images",
+        "index": 2
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/3",
+        "url": "https://ir.ozone.ru/gallery-3.jpg",
+        "section": "gallery/images",
+        "index": 3
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/4",
+        "url": "https://ir.ozone.ru/gallery-4.jpg",
+        "section": "gallery/images",
+        "index": 4
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/5",
+        "url": "https://ir.ozone.ru/gallery-5.jpg",
+        "section": "gallery/images",
+        "index": 5
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/6",
+        "url": "https://ir.ozone.ru/gallery-6.jpg",
+        "section": "gallery/images",
+        "index": 6
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/7",
+        "url": "https://ir.ozone.ru/gallery-7.jpg",
+        "section": "gallery/images",
+        "index": 7
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/8",
+        "url": "https://ir.ozone.ru/gallery-8.jpg",
+        "section": "gallery/images",
+        "index": 8
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/9",
+        "url": "https://ir.ozone.ru/gallery-9.jpg",
+        "section": "gallery/images",
+        "index": 9
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/10",
+        "url": "https://ir.ozone.ru/gallery-10.jpg",
+        "section": "gallery/images",
+        "index": 10
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/11",
+        "url": "https://ir.ozone.ru/gallery-11.jpg",
+        "section": "gallery/images",
+        "index": 11
+      },
+      {
+        "sourceLocator": "/widgetStates/webGallery-a/images/12",
+        "url": "https://ir.ozone.ru/gallery-12.jpg",
+        "section": "gallery/images",
+        "index": 12
+      }
+    ],
+    "source": {
+      "present": true,
+      "rawRows": 15,
+      "parsedRows": 14,
+      "malformedRows": 1,
+      "sourceTruncated": false,
+      "localTruncated": true
+    },
+    "displayedPriceMinor": 123450
+  }
+}

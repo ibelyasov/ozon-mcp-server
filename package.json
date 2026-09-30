@@ -1,12 +1,12 @@
 {
-  "name": "ozon-mcp-server-page",
+  "name": "ozon-mcp-server-browser",
   "private": true,
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "build:page": "node scripts/build-page.mjs",
-    "check:page": "node scripts/build-page.mjs --check",
+    "build:browser": "node scripts/build-browser.mjs",
+    "check:browser": "node scripts/build-browser.mjs --check",
     "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {

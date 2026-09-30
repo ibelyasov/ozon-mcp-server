@@ -2,20 +2,46 @@
   "sku": "901",
   "name": "Example",
   "url": "https://www.ozon.ru/product/example-901/",
-  "price": 10.5,
-  "cardPrice": 10.5,
-  "priceRegular": null,
-  "oldPrice": null,
   "duty": null,
   "available": false,
   "rating": 4.5,
   "reviews": 0,
   "seller": null,
   "deliveryLabel": null,
-  "images": [],
-  "characteristics": {},
+  "characteristics": [],
   "characteristicsComplete": false,
-  "description": { "text": "Useful text", "images": ["https://www.ozon.ru/one.jpg"] },
-  "variants": { "status": "unknown", "items": [], "hasNext": null, "nextPath": null },
-  "offers": { "status": "unsupported", "items": [], "hasNext": null, "nextPath": null }
+  "description": {
+    "text": "Useful text",
+    "source": {
+      "present": true,
+      "rawRows": 1,
+      "parsedRows": 1,
+      "malformedRows": 1,
+      "sourceTruncated": false,
+      "localTruncated": false
+    },
+    "imageOrigins": [],
+    "acquisition": null
+  },
+  "variants": {
+    "status": "unknown",
+    "items": [],
+    "hasNext": null,
+    "nextPath": null
+  },
+  "acquisition": null,
+  "displayedPriceMinor": 1050,
+  "cardPriceMinor": 1050,
+  "regularPriceMinor": null,
+  "imageOrigins": [],
+  "gallerySource": {
+    "present": false,
+    "rawRows": 0,
+    "parsedRows": 0,
+    "malformedRows": 0,
+    "sourceTruncated": false,
+    "localTruncated": false
+  },
+  "supplement": null,
+  "warnings": []
 }

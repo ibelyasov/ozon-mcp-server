@@ -1,14 +1,10 @@
 [package]
 name = "ozon-mcp-server"
-version = "2.0.3"
+version = "3.0.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Local Ozon research MCP with one shared browser context and a durable evidence journal"
 license = "MIT"
-
-[[bin]]
-name = "ozon-mcp-server"
-path = "rust/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -23,10 +19,8 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink"] }
-percent-encoding = "2"
 regex = "1"
 rmcp = { version = "3.2", features = ["server", "transport-io"] }
-schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
@@ -34,3 +28,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = "0.28"
 url = "2"
+
+[build-dependencies]
+sha2 = "0.10"

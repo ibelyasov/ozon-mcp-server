@@ -1,0 +1,50 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Install pinned check dependencies
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --component clippy
+          npm ci
+          python -m pip install 'jsonschema[format]==4.25.1'
+      - name: Cache Rust dependencies and build outputs
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}-
+      - run: python scripts/check.py --artifacts .work/ci
+      - name: Preserve check logs and timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: checks
+          path: |
+            .work/ci/*.log
+            .work/ci/results.json
+          include-hidden-files: true

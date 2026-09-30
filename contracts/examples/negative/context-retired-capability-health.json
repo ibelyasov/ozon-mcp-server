@@ -1,0 +1,10 @@
+{
+  "schema": "schemas/ozon_get_context.output.schema.json",
+  "baseExample": "examples/positive/ozon_get_context.json",
+  "target": "output",
+  "mutation": {
+    "path": "data.capabilities.0.status",
+    "value": "unverified"
+  },
+  "expectedInvalidAt": "schema"
+}

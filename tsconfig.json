@@ -3,7 +3,7 @@
     "target": "ES2022",
     "module": "ES2022",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "rootDir": "rust",
+    "rootDir": "browser",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -11,5 +11,5 @@
     "removeComments": true,
     "skipLibCheck": true
   },
-  "include": ["rust/page.ts"]
+  "include": ["browser/extract.ts"]
 }

@@ -1,0 +1,9 @@
+{
+  "schema": "schemas/ozon_search.input.schema.json",
+  "instance": {
+    "start": {
+      "query": "   "
+    }
+  },
+  "expectedInvalidAt": "semantic"
+}

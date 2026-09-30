@@ -1,0 +1,9 @@
+{
+  "schema": "schemas/ozon_get_research.input.schema.json",
+  "instance": {
+    "researchId": "research-01",
+    "section": "summary",
+    "limit": 1
+  },
+  "expectedInvalidAt": "schema"
+}

@@ -1,0 +1,23 @@
+{
+  "schema": "schemas/ozon_search.output.schema.json",
+  "baseExample": "examples/positive/ozon_search.json",
+  "target": "output",
+  "mutation": {
+    "path": "data.items.0.prices",
+    "value": [
+      {
+        "amountMinor": 1,
+        "currency": "RUB",
+        "type": "regular",
+        "condition": null
+      },
+      {
+        "amountMinor": 1,
+        "currency": "RUB",
+        "type": "regular",
+        "condition": null
+      }
+    ]
+  },
+  "expectedInvalidAt": "semantic"
+}

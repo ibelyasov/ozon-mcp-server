@@ -21,6 +21,34 @@ def load(relative: str | Path) -> Any:
         return json.load(handle)
 
 
+def standalone(schema: dict[str, Any]) -> dict[str, Any]:
+    """Publish only local refs; composing schemas never retrieves network resources."""
+    schema = copy.deepcopy(schema)
+    defs = schema.setdefault("$defs", {})
+    common = load("schemas/common.schema.json")["$defs"]
+    collisions = defs.keys() & common.keys()
+    if collisions:
+        raise ValueError(f"shared definition collision: {sorted(collisions)}")
+    defs.update(copy.deepcopy(common))
+
+    def localize(value: Any) -> None:
+        if isinstance(value, dict):
+            if "$ref" in value:
+                ref = value["$ref"]
+                if ref.startswith("common.schema.json#/$defs/"):
+                    value["$ref"] = ref.removeprefix("common.schema.json")
+                elif not ref.startswith("#/"):
+                    raise ValueError(f"unsupported external ref: {ref}")
+            for child in value.values():
+                localize(child)
+        elif isinstance(value, list):
+            for child in value:
+                localize(child)
+
+    localize(schema)
+    return schema
+
+
 def schema_errors(schema: dict[str, Any], instance: Any) -> list[str]:
     validator = Draft202012Validator(schema, format_checker=CHECKER)
     return [error.message for error in sorted(validator.iter_errors(instance), key=lambda item: list(item.absolute_path))]
@@ -43,7 +71,13 @@ def semantic_errors(schema_name: str, instance: Any) -> list[str]:
         names = [entry["name"] for entry in instance["data"]["capabilities"]]
         if len(names) != len(set(names)) or set(names) != expected:
             errors.append("capabilities must contain every canonical name exactly once")
+        for entry in instance["data"]["capabilities"]:
+            if entry["status"] != ("unsupported" if entry["name"] == "offers" else "supported"):
+                errors.append("capability status does not match static implementation support")
     if schema_name == "ozon_search.input.schema.json":
+        query = instance.get("start", {}).get("query")
+        if query is not None and not query.strip():
+            errors.append("query must not be blank")
         price_range = instance.get("start", {}).get("priceRange")
         if price_range and "minMinor" in price_range and "maxMinor" in price_range and price_range["minMinor"] > price_range["maxMinor"]:
             errors.append("priceRange.minMinor exceeds maxMinor")
@@ -56,6 +90,9 @@ def semantic_errors(schema_name: str, instance: Any) -> list[str]:
         errors.extend(cursor_errors(data, "data"))
         for index, item in enumerate(data["items"]):
             errors.extend(price_list_errors(item["prices"], f"items[{index}].prices"))
+    if schema_name == "ozon_get_research.output.schema.json" and instance["data"]["section"] == "candidates":
+        for index, item in enumerate(instance["data"]["payload"]):
+            errors.extend(price_list_errors(item["prices"], f"payload[{index}].prices"))
     if schema_name == "ozon_get_reviews.output.schema.json":
         data = instance["data"]
         if data["coverage"]["returned"] != len(data["reviews"]):
@@ -69,15 +106,12 @@ def semantic_errors(schema_name: str, instance: Any) -> list[str]:
                 continue
             product = result["product"]
             errors.extend(price_list_errors(product["prices"], f"results[{result_index}].product.prices"))
-            for name in ("characteristics", "description", "variants", "offers", "images"):
+            for name in ("characteristics", "description", "variants", "images"):
                 if name in product:
                     section = product[name]
                     errors.extend(cursor_errors(section, f"results[{result_index}].product.{name}"))
                     if section["truncated"] and section["hasNext"] is not True:
                         errors.append(f"results[{result_index}].product.{name}: truncated section lacks known continuation")
-                    if name == "offers":
-                        for offer_index, offer in enumerate(section["items"]):
-                            errors.extend(price_list_errors(offer["prices"], f"offers[{offer_index}].prices"))
     return errors
 
 
@@ -90,6 +124,21 @@ def cursor_errors(value: dict[str, Any], location: str) -> list[str]:
 
 
 def pair_errors(case: dict[str, Any]) -> list[str]:
+    if case["inputSchema"].endswith("ozon_get_research.input.schema.json"):
+        args = case["input"]
+        data = case["output"]["data"]
+        errors = []
+        if data["section"] != args.get("section", "summary"):
+            errors.append("journal result section differs from requested section")
+        for selector, identity in (("noteIds", "noteId"), ("evidenceRefs", "evidenceRef"), ("productRefs", "productRef")):
+            if selector in args:
+                if [row[identity] for row in data["payload"]] != args[selector]:
+                    errors.append(f"journal result does not preserve {selector} selection order")
+                if data["nextCursor"] is not None:
+                    errors.append("exact journal selection must not return a continuation")
+        if "limit" in args and len(data["payload"]) > args["limit"]:
+            errors.append("journal result exceeds requested limit")
+        return errors
     if not case["inputSchema"].endswith("ozon_get_products.input.schema.json"):
         return []
     inputs = case["input"]["products"]
@@ -98,9 +147,9 @@ def pair_errors(case: dict[str, Any]) -> list[str]:
     if len(inputs) != len(results):
         errors.append("product result count differs from selector count")
         return errors
-    default_sections = ["characteristics", "offers"] if case["input"].get("view", "compact") == "full" else ["characteristics"]
+    default_sections = ["characteristics"]
     requested = set(case["input"].get("include", default_sections))
-    section_names = {"characteristics", "description", "variants", "offers", "images"}
+    section_names = {"characteristics", "description", "variants", "images"}
     for index, (selector, result) in enumerate(zip(inputs, results)):
         if result["requested"] != selector:
             errors.append(f"product result {index} does not preserve its selector")
@@ -136,7 +185,8 @@ def main() -> int:
     schema_paths = sorted((ROOT / "schemas").glob("*.schema.json"))
     schemas: dict[str, dict[str, Any]] = {}
     for path in schema_paths:
-        schema = load(path.relative_to(ROOT))
+        source = load(path.relative_to(ROOT))
+        schema = source if path.name == "common.schema.json" else standalone(source)
         try:
             Draft202012Validator.check_schema(schema)
         except Exception as exc:
@@ -189,7 +239,7 @@ def main() -> int:
             print(f"- {failure}")
         return 1
     print(f"PASS: {len(schema_paths)} schemas; {positive_count} positive cases; {negative_count} negative cases")
-    print("PASS: schema syntax, resolved local refs, formats, root objects, and example-level contract checks")
+    print("PASS: schema syntax, standalone common composition, resolved local refs, formats, root objects, and example-level contract checks")
     return 0
 
 

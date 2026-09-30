@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Shared public contract definitions",
+  "type": "object",
+  "$defs": {
+    "opaque": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "maxItems": 100,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/opaque"
+      }
+    },
+    "price": {
+      "type": "object",
+      "required": [
+        "amountMinor",
+        "currency",
+        "type",
+        "condition"
+      ],
+      "properties": {
+        "amountMinor": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "currency": {
+          "const": "RUB"
+        },
+        "type": {
+          "enum": [
+            "ozon_card",
+            "regular",
+            "unknown"
+          ]
+        },
+        "condition": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        }
+      },
+      "additionalProperties": false
+    },
+    "seller": {
+      "type": "object",
+      "required": [
+        "name",
+        "rating",
+        "url"
+      ],
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        },
+        "rating": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 5
+        },
+        "url": {
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https://(?:www\\.)?ozon\\.ru/[^?#]*$",
+              "maxLength": 2048
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "contextId",
+        "regionLabel",
+        "regionVerification",
+        "accountState",
+        "accessState"
+      ],
+      "properties": {
+        "contextId": {
+          "$ref": "#/$defs/opaque"
+        },
+        "regionLabel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 500
+        },
+        "regionVerification": {
+          "enum": [
+            "verified",
+            "unverified"
+          ]
+        },
+        "accountState": {
+          "enum": [
+            "authenticated",
+            "anonymous",
+            "unknown"
+          ]
+        },
+        "accessState": {
+          "enum": [
+            "available",
+            "blocked",
+            "unknown"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "warning": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "evidenceRefs"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "maxLength": 128
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "evidenceRefs": {
+          "$ref": "#/$defs/evidenceRefs"
+        }
+      },
+      "additionalProperties": false
+    },
+    "productRefSelector": {
+      "type": "object",
+      "required": [
+        "productRef"
+      ],
+      "properties": {
+        "productRef": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    },
+    "skuSelector": {
+      "type": "object",
+      "required": [
+        "sku"
+      ],
+      "properties": {
+        "sku": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 64
+        }
+      },
+      "additionalProperties": false
+    },
+    "urlSelector": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://(?:www\\.)?ozon\\.ru(?:/|$)",
+          "maxLength": 2048
+        }
+      },
+      "additionalProperties": false
+    },
+    "cursorSelector": {
+      "type": "object",
+      "required": [
+        "cursor"
+      ],
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cursorStart": {
+      "type": "object",
+      "required": [
+        "cursor"
+      ],
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/opaque"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
