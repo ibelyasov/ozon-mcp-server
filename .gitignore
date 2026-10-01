@@ -8,6 +8,7 @@ node_modules
 *profile*/
 artifacts/
 target/
+.codegraph/
 
 .work/
 __pycache__/
