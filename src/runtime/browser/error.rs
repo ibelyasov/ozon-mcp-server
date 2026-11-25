@@ -24,6 +24,7 @@ impl BrowserError {
             Self::CommandTimeout => "UPSTREAM_TIMEOUT",
             Self::ResponseTooLarge => "RESULT_TOO_LARGE",
             Self::CaptchaOrBlocked => "SOURCE_BLOCKED",
+            Self::HttpStatus(403) => "SOURCE_BLOCKED",
             _ => "SOURCE_CHANGED",
         }
     }
@@ -109,5 +110,12 @@ mod tests {
         assert!(requires_reset(&anyhow::Error::new(cancelled)));
 
         assert!(!requires_reset(&anyhow::anyhow!("ordinary parse error")));
+    }
+
+    #[test]
+    fn forbidden_http_status_is_blocked_without_reclassifying_other_statuses() {
+        assert_eq!(BrowserError::HttpStatus(403).code(), "SOURCE_BLOCKED");
+        assert_eq!(BrowserError::HttpStatus(404).code(), "SOURCE_CHANGED");
+        assert_eq!(BrowserError::HttpStatus(503).code(), "SOURCE_CHANGED");
     }
 }

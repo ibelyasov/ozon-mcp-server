@@ -19,7 +19,7 @@ interface FilteredPage {
   widgetStates: JsonRecord;
   seo?: {
     title: string | null;
-    link: Array<{ href: string }>;
+    link: Array<{ href: string; rel?: string }>;
   };
   layoutTrackingInfo?: { sku: unknown };
   contextObservation?: {
@@ -405,9 +405,12 @@ function filterPage(page: unknown): PageResult {
         ? page.seo.link
             .filter(
               (entry): entry is JsonRecord & { href: string } =>
-                isRecord(entry) && typeof entry.href === "string",
+                isRecord(entry) && typeof entry.href === "string" &&
+                (!("rel" in entry) || typeof entry.rel === "string"),
             )
-            .map((entry) => ({ href: entry.href }))
+            .map((entry) => typeof entry.rel === "string"
+              ? { href: entry.href, rel: entry.rel }
+              : { href: entry.href })
         : [],
     };
   }

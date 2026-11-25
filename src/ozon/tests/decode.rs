@@ -645,3 +645,42 @@ fn review_vote_changes_do_not_change_captured_identity_payload() {
     assert_eq!(after.reviews[0].author.as_deref(), Some("Ada"));
     assert_eq!(after.reviews[0].source_index, 0);
 }
+
+#[test]
+fn seo_alternates_do_not_override_canonical_product_identity() {
+    let page = json!({
+        "widgetStates": {"webGallery-1": {"sku": "901"}},
+        "layoutTrackingInfo": {"sku": 901},
+        "seo": {"title": null, "link": [
+            {"rel": "alternate", "href": "https://ozon.kz/product/example-901/"},
+            {"rel": "canonical", "href": "/product/example-901/"},
+            {"rel": "alternate", "href": "/product/other-902/"}
+        ]}
+    });
+    let typed: crate::ozon::outcome::FilteredPage = serde_json::from_value(page.clone()).unwrap();
+    let page = typed.into_value();
+    assert!(super::validate_product_identity(&page, "901", true).unwrap());
+    assert_eq!(
+        super::seo_url(&page).as_deref(),
+        Some("https://www.ozon.ru/product/example-901/")
+    );
+    let mut conflicting = page.clone();
+    conflicting["widgetStates"]["webGallery-1"]["sku"] = json!("902");
+    assert!(super::validate_product_identity(&conflicting, "901", true).is_err());
+    conflicting = page.clone();
+    conflicting["layoutTrackingInfo"]["sku"] = json!(902);
+    assert!(super::validate_product_identity(&conflicting, "901", true).is_err());
+    conflicting = page.clone();
+    conflicting["seo"]["link"][1]["href"] = json!("/product/other-902/");
+    assert!(super::validate_product_identity(&conflicting, "901", true).is_err());
+    conflicting["seo"]["link"][1]["href"] = json!("https://example.test/product/example-901/");
+    assert!(super::validate_product_identity(&conflicting, "901", true).is_err());
+    let legacy = json!({"seo": {"link": [{"href": "/product/other-902/"}]}});
+    assert!(super::validate_product_identity(&legacy, "901", true).is_err());
+    let legacy = json!({"seo": {"link": [{"href": "/product/example-901/"}]}});
+    assert!(super::validate_product_identity(&legacy, "901", true).unwrap());
+    let alternate_only =
+        json!({"seo": {"link": [{"rel": "alternate", "href": "/product/example-901/"}]}});
+    assert!(!super::validate_product_identity(&alternate_only, "901", false).unwrap());
+    assert!(super::validate_product_identity(&alternate_only, "901", true).is_err());
+}

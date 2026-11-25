@@ -833,12 +833,21 @@ pub(crate) fn parse_duty(page: &Value) -> Option<(u64, String)> {
     None
 }
 
-fn seo_url(page: &Value) -> Option<String> {
+fn identity_seo_links(page: &Value) -> impl Iterator<Item = &Value> {
     page.pointer("/seo/link")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .find_map(|link| clean_url(link.get("href")))
+        .filter(|link| match link.get("rel") {
+            None => true, // Legacy projections contained href only.
+            Some(rel) => rel
+                .as_str()
+                .is_some_and(|rel| rel.eq_ignore_ascii_case("canonical")),
+        })
+}
+
+fn seo_url(page: &Value) -> Option<String> {
+    identity_seo_links(page).find_map(|link| clean_url(link.get("href")))
 }
 
 /// Every observed identity in a fragment must agree; missing identity is never merge authority.
@@ -858,12 +867,7 @@ pub(crate) fn validate_product_identity(
     {
         identities.push(normalize_sku(Some(value)));
     }
-    for link in page
-        .pointer("/seo/link")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for link in identity_seo_links(page) {
         if let Some(value) = link.get("href") {
             identities.push(sku_from_url(Some(value)));
         }

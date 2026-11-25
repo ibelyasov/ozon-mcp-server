@@ -110,8 +110,10 @@ def semantic_errors(schema_name: str, instance: Any) -> list[str]:
                 if name in product:
                     section = product[name]
                     errors.extend(cursor_errors(section, f"results[{result_index}].product.{name}"))
-                    if section["truncated"] and section["hasNext"] is not True:
-                        errors.append(f"results[{result_index}].product.{name}: truncated section lacks known continuation")
+                    if section["truncated"] and section["hasNext"] is False:
+                        errors.append(f"results[{result_index}].product.{name}: truncated section cannot have hasNext=false")
+                    if section["hasNext"] is None and section["nextCursor"] is not None:
+                        errors.append(f"results[{result_index}].product.{name}: hasNext=null with nextCursor")
     return errors
 
 

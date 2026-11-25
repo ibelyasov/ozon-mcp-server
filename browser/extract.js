@@ -410,8 +410,11 @@ function filterPage(page) {
             title: typeof page.seo.title === "string" ? page.seo.title : null,
             link: Array.isArray(page.seo.link)
                 ? page.seo.link
-                    .filter((entry) => isRecord(entry) && typeof entry.href === "string")
-                    .map((entry) => ({ href: entry.href }))
+                    .filter((entry) => isRecord(entry) && typeof entry.href === "string" &&
+                    (!("rel" in entry) || typeof entry.rel === "string"))
+                    .map((entry) => typeof entry.rel === "string"
+                    ? { href: entry.href, rel: entry.rel }
+                    : { href: entry.href })
                 : [],
         };
     }

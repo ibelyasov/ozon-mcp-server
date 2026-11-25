@@ -46,7 +46,8 @@ function validPageOutcome(value) {
        !(value.page.seo.title === null || typeof value.page.seo.title === "string") ||
        !Array.isArray(value.page.seo.link) ||
        !value.page.seo.link.every((link) =>
-         exactKeys(link, ["href"]) && typeof link.href === "string"))) return false;
+         (exactKeys(link, ["href"]) || (exactKeys(link, ["href", "rel"]) &&
+          typeof link.rel === "string")) && typeof link.href === "string"))) return false;
   if ("contextObservation" in value.page &&
       (!exactKeys(value.page.contextObservation,
         ["regionLabel", "regionVerified", "accountState", "accessState", "signature"]) ||
@@ -715,4 +716,20 @@ test("retired original price and vote counts leave the valid source widget shape
   assert.equal(result.page.widgetStates["webListReviews-a"].reviews[0].author.firstName,"Ada");
   assert.equal(result.page.widgetStates["webListReviews-a"].reviews[0].usefulness,undefined);
   assert.doesNotMatch(JSON.stringify(result),/UNUSED_ORIGINAL_PRICE|useful|unuseful/);
+});
+
+test("SEO projection preserves link relations without private metadata", async () => {
+  const body = JSON.stringify({ widgetStates: {}, seo: { title: null, link: [
+    { rel: "alternate", href: "https://ozon.kz/product/example-901/", hreflang: "kk" },
+    { rel: "canonical", href: "/product/example-901/", private: "discard" },
+    { href: "/product/legacy-901/" },
+  ] } });
+  const value = jsonValue(await evaluate({ mode: "fetch", path: "/product/901/" },
+    { fetch: async () => response(body) }));
+  assert.deepEqual(value.page.seo.link, [
+    { rel: "alternate", href: "https://ozon.kz/product/example-901/" },
+    { rel: "canonical", href: "/product/example-901/" },
+    { href: "/product/legacy-901/" },
+  ]);
+  assert.equal(validPageOutcome(value), true);
 });

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import importlib.util
 import io
@@ -42,6 +43,46 @@ class SmokeFailure(RuntimeError):
 
 class ObservationUnavailable(RuntimeError):
     pass
+
+
+def replay_data_matches(kind: str, expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+    """Compare captured replay data while allowing refreshed opaque references."""
+    if kind == "search":
+        rows_key = "items"
+        row_reference_fields = ("productRef", "evidenceRefs", "imageRefs")
+        refinement_reference_fields = ("searchRef",)
+    elif kind == "reviews":
+        rows_key = "reviews"
+        row_reference_fields = ("evidenceRefs", "imageRefs")
+        refinement_reference_fields = ("reviewSearchRef",)
+    else:
+        raise ValueError(f"unsupported replay data kind: {kind}")
+
+    def without_references(data: dict[str, Any]) -> dict[str, Any]:
+        comparable = copy.deepcopy(data)
+        for field in ("nextCursor", "refinementsNextCursor"):
+            if isinstance(comparable.get(field), str):
+                comparable[field] = "<opaque-reference>"
+        rows = comparable.get(rows_key)
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    for field in row_reference_fields:
+                        value = row.get(field)
+                        if isinstance(value, str):
+                            row[field] = "<opaque-reference>"
+                        elif isinstance(value, list):
+                            row[field] = ["<opaque-reference>" if isinstance(item, str) else item for item in value]
+        refinements = comparable.get("refinements")
+        if isinstance(refinements, list):
+            for refinement in refinements:
+                if isinstance(refinement, dict):
+                    for field in refinement_reference_fields:
+                        if isinstance(refinement.get(field), str):
+                            refinement[field] = "<opaque-reference>"
+        return comparable
+
+    return without_references(expected) == without_references(actual)
 
 class McpClient:
     def __init__(
@@ -471,7 +512,7 @@ def run_observations(clients: list[McpClient], contracts: Contracts, report: dic
             args = {"start": {"cursor": cursor}, "researchId": page["researchId"], "limit": 1}
             _, continuation = tool_call(clients[(number + 1) % 2], "ozon_search", args, contracts, report)
             _, replay = tool_call(clients[number % 2], "ozon_search", args, contracts, report)
-            if replay["data"] != continuation["data"]:
+            if not replay_data_matches("search", continuation["data"], replay["data"]):
                 raise SmokeFailure("captured search cursor replay changed its data")
             if continuation["data"]["coverage"]["uniqueSeen"] < page["data"]["coverage"]["uniqueSeen"]:
                 raise SmokeFailure("search cumulative uniqueSeen decreased")
@@ -512,7 +553,7 @@ def run_observations(clients: list[McpClient], contracts: Contracts, report: dic
         args = {"start": {"cursor": cursor}, "researchId": research_id, "limit": 1}
         _, page = tool_call(clients[0], "ozon_get_reviews", args, contracts, report)
         _, replay = tool_call(clients[1], "ozon_get_reviews", args, contracts, report)
-        if page["data"] != replay["data"]:
+        if not replay_data_matches("reviews", page["data"], replay["data"]):
             raise SmokeFailure("captured review cursor replay changed its data")
         if page["data"]["coverage"]["uniqueSeen"] < reviews["data"]["coverage"]["uniqueSeen"]:
             raise SmokeFailure("review cumulative uniqueSeen decreased")

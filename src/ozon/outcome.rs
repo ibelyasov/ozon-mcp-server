@@ -166,6 +166,8 @@ pub struct Seo {
 #[serde(deny_unknown_fields)]
 pub struct SeoLink {
     pub href: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
