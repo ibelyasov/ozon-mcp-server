@@ -248,6 +248,62 @@ impl Pages {
         result
     }
 
+    /// Fixed, read-only review comment lookup; caller cannot select an action or URL.
+    pub async fn seller_replies(
+        &mut self,
+        review_uuid: &str,
+        sku: &str,
+        root_sku: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let result = self
+            .seller_replies_once(review_uuid, sku, root_sku, cancel)
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(crate::runtime::browser::error::requires_reset)
+        {
+            self.shutdown().await?;
+        }
+        result
+    }
+
+    async fn seller_replies_once(
+        &mut self,
+        review_uuid: &str,
+        sku: &str,
+        root_sku: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let valid_sku =
+            |v: &str| !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit());
+        if review_uuid.is_empty()
+            || review_uuid.len() > 128
+            || !review_uuid
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            || !valid_sku(sku)
+            || !valid_sku(root_sku)
+        {
+            return Err(fail(Code::InvalidArgument, "Invalid review reply selector"));
+        }
+        self.ensure_ready(cancel).await?;
+        match self.evaluate_outcome(json!({"mode":"sellerReplies", "reviewUuid":review_uuid, "sku":sku, "rootSku":root_sku}), cancel).await? {
+            PageOutcome::Page(mut success) => {
+                success.page.acquisition = Some(Acquisition { source_url: "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid".into(), observed_at: chrono::Utc::now().to_rfc3339(), method: CaptureMethod::Composer });
+                Ok(success.page.into_value())
+            },
+            PageOutcome::Status(status) => Err(BrowserError::HttpStatus(status.status).into()),
+            PageOutcome::Error(error) => match error.error {
+                PageError::InvalidOrigin => Err(BrowserError::InvalidOrigin.into()),
+                PageError::FetchTimeout => Err(fail(Code::UpstreamTimeout, "Ozon reply lookup timed out")),
+                PageError::ResponseTooLarge => Err(BrowserError::ResponseTooLarge.into()),
+                PageError::CaptchaOrBlocked | PageError::FetchFailed => Err(BrowserError::CaptchaOrBlocked.into()),
+                _ => Err(BrowserError::InvalidBridgeResponse.into()),
+            },
+        }
+    }
+
     async fn fetch_once(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
         let home = url::Url::parse(HOME)?;
         let target = home.join(path)?;
@@ -490,6 +546,15 @@ fn cleanup_remaining(deadline: Instant) -> Result<Duration> {
 }
 
 impl PageSource for Pages {
+    async fn seller_replies(
+        &mut self,
+        review_uuid: &str,
+        sku: &str,
+        root_sku: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        Pages::seller_replies(self, review_uuid, sku, root_sku, cancel).await
+    }
     async fn fetch_json(&mut self, path: &str, cancel: &CancellationToken) -> Result<Value> {
         Pages::fetch_json(self, path, cancel).await
     }
@@ -552,6 +617,18 @@ pub(crate) fn is_requested_page(requested: &str, actual: &str) -> bool {
         return category_path_matches
             && category_path_has_brand(final_url.path(), &brand)
             && requested_query == actual_query;
+    }
+    if target.path().starts_with("/modal/") {
+        let requested_query = semantic_query(&target);
+        let actual_query = semantic_query(&final_url);
+        return target.path() == final_url.path()
+            && requested_query == actual_query
+            && requested_query.values().all(|count| *count == 1)
+            && actual_query.values().all(|count| *count == 1)
+            && !has_duplicate_query_key(&target, "product_id")
+            && !has_duplicate_query_key(&final_url, "product_id")
+            && !has_duplicate_query_key(&target, "from_sku")
+            && !has_duplicate_query_key(&final_url, "from_sku");
     }
     let re = regex::Regex::new(r"^/product/(?:[^/]*-)?([0-9]+)/(reviews/)?$").unwrap();
     match (re.captures(target.path()), re.captures(final_url.path())) {
@@ -1117,6 +1194,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn modal_navigation_preserves_exact_product_selection() {
+        let requested =
+            "https://www.ozon.ru/modal/otherOffersFromSellers?product_id=901&sort=price";
+        assert!(is_requested_page(
+            requested,
+            "https://www.ozon.ru/modal/otherOffersFromSellers?sort=price&product_id=901&__rr=1"
+        ));
+        assert!(!is_requested_page(
+            requested,
+            "https://www.ozon.ru/modal/otherOffersFromSellers?product_id=902&sort=price"
+        ));
+        assert!(!is_requested_page(
+            requested,
+            "https://www.ozon.ru/modal/otherOffersFromSellers?product_id=901&product_id=901&sort=price"
+        ));
+    }
     #[test]
     fn category_redirect_requires_exact_path_and_semantics() {
         assert!(is_requested_page(

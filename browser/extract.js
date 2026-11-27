@@ -10,7 +10,7 @@ const publicWidgetNames = new Set([
     "webIconWithText",
     "webProductHeading",
     "webPrice",
-    "webGallery",
+    "webGallery", "webCharacteristics", "webSellerList",
 ]);
 const searchWidgetNames = new Set([
     "filtersDesktop", "searchResultsSort", "searchResultsFiltersActive",
@@ -206,6 +206,8 @@ function projectSearchWidget(name, raw) {
                         item[key] = variant;
                     }
                 }
+                if (isRecord(review.usefulness))
+                    item.usefulness = scalars(review.usefulness, ["useful", "unuseful"]);
                 if (isRecord(review.status))
                     item.status = scalars(review.status, ["id", "name"]);
                 return item;
@@ -241,6 +243,8 @@ function widgetName(key) {
 function parseOptions(value) {
     if (!isRecord(value))
         return null;
+    if (value.mode === "sellerReplies" && typeof value.reviewUuid === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value.reviewUuid) && typeof value.sku === "string" && /^[0-9]{1,20}$/.test(value.sku) && typeof value.rootSku === "string" && /^[0-9]{1,20}$/.test(value.rootSku))
+        return { mode: "sellerReplies", reviewUuid: value.reviewUuid, sku: value.sku, rootSku: value.rootSku };
     if (value.mode === "widgets")
         return { mode: "widgets" };
     if (value.mode === "context")
@@ -296,6 +300,34 @@ function projectPublicWidget(name, raw) {
     if (!isRecord(value) || Array.isArray(value))
         return null;
     switch (name) {
+        case "webCharacteristics": return { characteristics: Array.isArray(value.characteristics) ? value.characteristics.map((group) => {
+                if (!isRecord(group))
+                    return null;
+                const out = {};
+                for (const section of ["short", "long"])
+                    if (Array.isArray(group[section]))
+                        out[section] = group[section].map((row) => {
+                            if (!isRecord(row))
+                                return null;
+                            return { ...scalars(row, ["name"]), ...(Array.isArray(row.values) ? { values: row.values.map((v) => isRecord(v) ? scalars(v, ["text"]) : null) } : {}) };
+                        });
+                return out;
+            }) : null };
+        case "webSellerList": return { sellers: Array.isArray(value.sellers) ? value.sellers.map((row) => {
+                if (!isRecord(row))
+                    return null;
+                const out = scalars(row, ["sku", "name", "productLink", "available"]);
+                if (isRecord(row.price)) {
+                    const price = {};
+                    for (const key of ["cardPrice", "price"])
+                        if (isRecord(row.price[key]))
+                            price[key] = scalars(row.price[key], ["price"]);
+                    out.price = price;
+                }
+                if (Array.isArray(row.advantages))
+                    out.advantages = records(row.advantages).filter((v) => v.key === "delivery").map((v) => ({ key: "delivery", contentRs: isRecord(v.contentRs) ? { headRs: displayField(v.contentRs.headRs) } : {} }));
+                return out;
+            }) : null, ...(isRecord(value.paging) ? { paging: scalars(value.paging, ["nextPage", "total"]) } : {}) };
         case "webPrice": return scalars(value, ["cardPrice", "price", "isAvailable", "deliveryLabel"]);
         case "webProductHeading": return { title: displayField(value.title) };
         case "webIconWithText": return { title: displayField(value.title), text: displayField(value.text) };
@@ -305,6 +337,8 @@ function projectPublicWidget(name, raw) {
         case "webSingleProductScore":
         case "webReviewProductScore": {
             const result = scalars(value, ["rating", "ratingValue", "text", "reviews", "reviewCount", "reviewsCount", "totalReviews"]);
+            if (Array.isArray(value.score))
+                result.score = records(value.score).map((v) => scalars(v, ["title", "value"]));
             if (isRecord(value.title))
                 result.title = scalars(value.title, ["text"]);
             return result;
@@ -589,11 +623,12 @@ async function ozonPage(rawOptions) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 35_000);
     try {
-        const response = await fetch("/api/composer-api.bx/page/json/v2?url=" +
-            encodeURIComponent(options.path), {
-            headers: { accept: "application/json" },
-            signal: controller.signal,
-        });
+        const replyLookup = options.mode === "sellerReplies";
+        const response = await fetch(replyLookup ? "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid" :
+            "/api/composer-api.bx/page/json/v2?url=" + encodeURIComponent(options.path), replyLookup ? { method: "POST", mode: "same-origin", redirect: "manual", headers: { accept: "application/json", "content-type": "application/json" }, body: JSON.stringify({ reviewUuid: options.reviewUuid, sku: options.sku, rootSku: options.rootSku, limit: 10, offset: 0 }), signal: controller.signal } :
+            { headers: { accept: "application/json" }, signal: controller.signal });
+        if (replyLookup && (response.url !== "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid" || response.redirected || response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)))
+            return { error: "INVALID_ORIGIN" };
         if (!response.ok)
             return { status: response.status };
         if (Number(response.headers.get("content-length")) > maxBytes) {
@@ -617,7 +652,18 @@ async function ozonPage(rawOptions) {
             text += decoder.decode(value, { stream: true });
         }
         try {
-            return filterPage(JSON.parse(text + decoder.decode()));
+            const data = JSON.parse(text + decoder.decode());
+            if (replyLookup) {
+                if (!isRecord(data) || !Array.isArray(data.comments))
+                    return { error: "INVALID_RESPONSE" };
+                const comments = data.comments.slice(0, 10).flatMap((row) => {
+                    if (!isRecord(row) || !isRecord(row.author) || !isRecord(row.author.clientOfficial) || typeof row.author.clientOfficial.brandName !== "string" || !row.author.clientOfficial.brandName || typeof row.comment !== "string")
+                        return [];
+                    return [{ ...scalars(row, ["comment", "publishedAt", "createdAt"]), authorLabel: row.author.clientOfficial.brandName }];
+                });
+                return { page: { widgetStates: { sellerReplies: { comments, sourceTruncated: data.comments.length >= 10 } } } };
+            }
+            return filterPage(data);
         }
         catch {
             return { error: "INVALID_RESPONSE" };

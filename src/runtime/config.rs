@@ -60,7 +60,7 @@ impl BrowserConfig {
 
 fn parse_headless(value: Option<&std::ffi::OsStr>) -> Result<bool> {
     match value.and_then(std::ffi::OsStr::to_str) {
-        None if value.is_none() => Ok(true),
+        None if value.is_none() => Ok(false),
         Some("true") => Ok(true),
         Some("false") => Ok(false),
         _ => Err(crate::error::RuntimeError::configuration(
@@ -139,7 +139,7 @@ impl Config {
             image_doh_fallback: false,
             browser: BrowserConfig {
                 executable: None,
-                headless: true,
+                headless: false,
             },
         })
     }
@@ -375,8 +375,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn headless_is_default_and_visible_mode_requires_exact_false() {
-        assert!(parse_headless(None).unwrap());
+    fn visible_mode_is_default_and_headless_requires_exact_true() {
+        assert!(!parse_headless(None).unwrap());
         assert!(parse_headless(Some(std::ffi::OsStr::new("true"))).unwrap());
         assert!(!parse_headless(Some(std::ffi::OsStr::new("false"))).unwrap());
         for invalid in ["False", " true", "", "0"] {
@@ -389,9 +389,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let config = Config::at(root.path().to_path_buf()).unwrap();
-        let mut visible = config.clone();
-        visible.browser.headless = false;
-        assert_ne!(config.fingerprint(), visible.fingerprint());
+        assert!(!config.browser.headless);
+        let mut headless = config.clone();
+        headless.browser.headless = true;
+        assert_ne!(config.fingerprint(), headless.fingerprint());
         let mut executable = config.clone();
         executable.browser.executable = Some(PathBuf::from("/test/chromium"));
         assert_ne!(config.fingerprint(), executable.fingerprint());

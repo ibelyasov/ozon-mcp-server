@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_compare_products input",
+  "type": "object",
+  "required": [
+    "researchId",
+    "productRefs"
+  ],
+  "properties": {
+    "researchId": {
+      "$ref": "common.schema.json#/$defs/opaque"
+    },
+    "productRefs": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "$ref": "common.schema.json#/$defs/opaque"
+      },
+      "minItems": 2,
+      "uniqueItems": true
+    },
+    "characteristicNames": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      },
+      "uniqueItems": true
+    },
+    "priceKind": {
+      "enum": [
+        "ozon_card",
+        "regular",
+        "displayed"
+      ],
+      "default": "ozon_card"
+    },
+    "sortBy": {
+      "enum": [
+        "input",
+        "price",
+        "rating",
+        "reviewCount"
+      ],
+      "default": "input"
+    },
+    "requirements": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "equals"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "equals": {
+            "type": "string",
+            "maxLength": 4000
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "quantities": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": [
+          "productRef",
+          "amount",
+          "unit",
+          "evidenceRefs",
+          "characteristicName"
+        ],
+        "properties": {
+          "productRef": {
+            "$ref": "common.schema.json#/$defs/opaque"
+          },
+          "amount": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "evidenceRefs": {
+            "$ref": "common.schema.json#/$defs/evidenceRefs"
+          },
+          "characteristicName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {}
+}

@@ -317,11 +317,12 @@ test("navigation validation returns only status and a bounded exact-route verdic
   )).page.navigationProbe), { routeValid: true, status: null });
 });
 
-function response(body, { status = 200, contentLength } = {}) {
+function response(body, { status = 200, contentLength, url = "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid", type = "basic" } = {}) {
   const chunks = Array.isArray(body) ? body : [encoder.encode(body)];
   let index = 0;
   return {
     ok: status >= 200 && status < 300,
+    url, type,
     status,
     headers: {
       get(name) {
@@ -707,15 +708,15 @@ test("search projection retains displayed price and rating labels without inacti
 });
 
 
-test("retired original price and vote counts leave the valid source widget shape intact", async () => {
+test("vote counts are retained while unrelated original price stays excluded", async () => {
   const result=jsonValue(await evaluate({mode:"fetch",path:"/product/901/"},{fetch:async()=>response(JSON.stringify({widgetStates:{
     "webPrice-a":{originalPrice:"UNUSED_ORIGINAL_PRICE"},
     "webListReviews-a":{reviews:[{author:{firstName:"Ada"},content:{comment:"Works"},usefulness:{useful:999,unuseful:2}}]}
   }}))}));
   assert.deepEqual(result.page.widgetStates["webPrice-a"],{});
   assert.equal(result.page.widgetStates["webListReviews-a"].reviews[0].author.firstName,"Ada");
-  assert.equal(result.page.widgetStates["webListReviews-a"].reviews[0].usefulness,undefined);
-  assert.doesNotMatch(JSON.stringify(result),/UNUSED_ORIGINAL_PRICE|useful|unuseful/);
+  assert.deepEqual(result.page.widgetStates["webListReviews-a"].reviews[0].usefulness,{useful:999,unuseful:2});
+  assert.doesNotMatch(JSON.stringify(result),/UNUSED_ORIGINAL_PRICE/);
 });
 
 test("SEO projection preserves link relations without private metadata", async () => {
@@ -732,4 +733,42 @@ test("SEO projection preserves link relations without private metadata", async (
     { href: "/product/legacy-901/" },
   ]);
   assert.equal(validPageOutcome(value), true);
+});
+
+test("research detail widgets retain only public fields", async () => {
+  const page = { widgetStates: {
+    "webCharacteristics-1": { characteristics: [{ short: [{ name: "Weight", values: [{ text: "1 kg", secret: "PRIVATE" }] }], long: [] }], secret: "PRIVATE" },
+    "webSellerList-1": { sellers: [{ sku: "901", name: "Shop", productLink: "/product/901/", price: { cardPrice: { price: 100, secret: "PRIVATE" } }, secret: "PRIVATE" }] },
+  } };
+  const value = jsonValue(await evaluate({ mode: "fetch", path: "/product/901/" }, { fetch: async () => response(JSON.stringify(page)) }));
+  assert.equal(value.page.widgetStates["webCharacteristics-1"].characteristics[0].short[0].values[0].text, "1 kg");
+  assert.equal(value.page.widgetStates["webSellerList-1"].sellers[0].name, "Shop");
+  assert.doesNotMatch(JSON.stringify(value), /PRIVATE|secret/);
+});
+
+test("seller reply lookup is fixed, bounded and excludes private comments", async () => {
+  let requested;
+  const value = jsonValue(await evaluate({ mode: "sellerReplies", reviewUuid: "abc-123", sku: "901", rootSku: "902" }, {
+    fetch: async (url, options) => { requested = { url, options }; return response(JSON.stringify({ comments: [
+      { comment: "Official", author: { clientOfficial: { brandName: "Brand", accountId: "PRIVATE" }, id: "PRIVATE" }, publishedAt: 1 },
+      { comment: "PRIVATE", author: { name: "PRIVATE" } },
+    ] })); },
+  }));
+  assert.equal(requested.url, "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid");
+  assert.equal(requested.options.mode, "same-origin");
+  assert.equal(requested.options.redirect, "manual");
+  assert.deepEqual(JSON.parse(requested.options.body), { reviewUuid: "abc-123", sku: "901", rootSku: "902", limit: 10, offset: 0 });
+  assert.equal(value.page.widgetStates.sellerReplies.comments[0].comment, "Official");
+  assert.doesNotMatch(JSON.stringify(value), /PRIVATE|accountId/);
+  assert.deepEqual(jsonValue(await evaluate({ mode: "sellerReplies", reviewUuid: "../x", sku: "901", rootSku: "902" })), { error: "INVALID_OPTIONS" });
+});
+
+
+test("seller reply response must stay on fixed origin and route", async () => {
+  const options = { mode: "sellerReplies", reviewUuid: "abc-123", sku: "901", rootSku: "901" };
+  assert.deepEqual(jsonValue(await evaluate(options, { fetch: async () => response('', { type: "opaqueredirect" }) })), { error: "INVALID_ORIGIN" });
+  assert.deepEqual(jsonValue(await evaluate(options, { fetch: async () => response('', { status: 302 }) })), { error: "INVALID_ORIGIN" });
+  for (const url of ["https://evil.example/api/composer-api.bx/_action/rpGetCommentsByReviewUuid", "https://www.ozon.ru/other"]) {
+    assert.deepEqual(jsonValue(await evaluate(options, { fetch: async () => response('{"comments":[]}', { url }) })), { error: "INVALID_ORIGIN" });
+  }
 });

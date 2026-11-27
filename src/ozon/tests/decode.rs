@@ -43,11 +43,21 @@ fn fixture(name: &str) -> Value {
 fn public_details_and_reviews_match_golden_contracts() {
     assert_eq!(
         parse_details(&fixture("details-page"), None),
-        fixture("details-response")
+        serde_json::to_value(
+            serde_json::from_value::<crate::ozon::model::ProductDetails>(fixture(
+                "details-response"
+            ))
+            .unwrap()
+        )
+        .unwrap()
     );
     assert_eq!(
         parse_reviews(&fixture("reviews-page"), 10),
-        fixture("reviews-response")
+        serde_json::to_value(
+            serde_json::from_value::<crate::ozon::model::ReviewPage>(fixture("reviews-response"))
+                .unwrap()
+        )
+        .unwrap()
     );
 }
 
@@ -526,7 +536,11 @@ fn browser_projection_and_rust_decoder_share_one_fixture() {
     let reviews = typed_reviews(&json, 30);
     assert_eq!(
         serde_json::to_value(&reviews.reviews).unwrap(),
-        fixture["reviews"]
+        serde_json::to_value(
+            serde_json::from_value::<Vec<crate::ozon::model::Review>>(fixture["reviews"].clone())
+                .unwrap()
+        )
+        .unwrap()
     );
     assert_eq!(
         reviews

@@ -148,6 +148,12 @@ pub struct ProductDetails {
     pub description: Description,
     pub variants: ProductVariants,
     pub warnings: Vec<Warning>,
+    #[serde(default)]
+    pub full_characteristics: Option<FullCharacteristics>,
+    #[serde(default)]
+    pub offers: Option<ProductOffers>,
+    #[serde(default)]
+    pub read_usage: ReadUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,6 +171,10 @@ pub struct ProductVariant {
     pub sku: String,
     pub title: Option<String>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub displayed_price_minor: Option<u64>,
+    #[serde(default)]
+    pub available: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +201,8 @@ pub struct Review {
     pub date: Option<String>,
     pub purchased: Option<bool>,
     pub variant_label: Option<String>,
+    #[serde(default)]
+    pub details: Option<ReviewDetails>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -225,6 +237,10 @@ pub struct ReviewPage {
     pub refinements: Vec<ReviewRefinement>,
     pub aggregation_scope: ReviewAggregationScope,
     pub warnings: Vec<Warning>,
+    #[serde(default)]
+    pub star_counts: Option<Vec<StarCount>>,
+    #[serde(default)]
+    pub read_usage: ReadUsage,
 }
 
 /// A valid empty array is observed emptiness; an absent or malformed array is unknown.
@@ -316,4 +332,82 @@ pub struct Acquisition {
 pub enum CaptureMethod {
     Composer,
     Dom,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProductReadOptions {
+    pub description: bool,
+    pub full_characteristics: bool,
+    pub offers: bool,
+    pub duty: bool,
+    pub max_source_reads: u32,
+}
+#[derive(Debug, Clone, Default)]
+pub struct ReviewReadOptions {
+    pub include_details: bool,
+    pub include_seller_replies: bool,
+    pub max_source_reads: u32,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadUsage {
+    pub source_reads: u32,
+    pub budget_exhausted: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FullCharacteristics {
+    pub items: Vec<Characteristic>,
+    pub source: SourceCoverage,
+    pub acquisition: Option<Acquisition>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProductOffers {
+    pub items: Vec<ProductOffer>,
+    pub source: SourceCoverage,
+    pub acquisition: Option<Acquisition>,
+    pub has_next: Option<bool>,
+    pub next_path: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProductOffer {
+    pub sku: String,
+    pub seller: Seller,
+    pub card_price_minor: Option<u64>,
+    pub regular_price_minor: Option<u64>,
+    pub available: Option<bool>,
+    pub delivery_label: Option<String>,
+    pub url: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReviewDetails {
+    pub helpful: Option<u64>,
+    pub unhelpful: Option<u64>,
+    pub item_sku: Option<String>,
+    pub seller_replies: Vec<SellerReply>,
+    #[serde(default)]
+    pub replies_acquisition: Option<Acquisition>,
+    pub replies_status: SourceSectionStatus,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SellerReply {
+    pub text: String,
+    pub published_at: Option<String>,
+    pub author_label: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StarCount {
+    pub stars: u8,
+    pub count: u64,
+}
+
+impl std::fmt::Display for ReadUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "logical source reads: {}", self.source_reads)
+    }
 }

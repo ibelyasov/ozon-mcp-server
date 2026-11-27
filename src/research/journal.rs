@@ -529,6 +529,51 @@ impl JournalTxn<'_> {
             &observed,
         )
     }
+    pub fn set_ref_snapshot(
+        &mut self,
+        rid: &str,
+        reference: &str,
+        kind: &str,
+        field: &str,
+        snapshot: &Value,
+    ) -> Result<()> {
+        let stored = self.get_ref(reference, kind)?;
+        if stored.research_id != rid || stored.context_id != research_context_id(&self.tx, rid)? {
+            return Err(fail(Code::InvalidReference, "foreign snapshot reference"));
+        }
+        if stored.value.get(field).is_some() {
+            return Err(fail(Code::InvalidReference, "snapshot is immutable"));
+        }
+        let mut value = stored.value;
+        value[field] = snapshot.clone();
+        self.tx.execute(
+            "UPDATE refs SET value_json=? WHERE id=?",
+            params![canonical(&value), reference],
+        )?;
+        Ok(())
+    }
+    pub fn selected_products(&self, rid: &str, refs: &[String]) -> Result<Vec<Value>> {
+        let context = research_context_id(&self.tx, rid)?;
+        refs.iter()
+            .map(|reference| {
+                let stored = self.get_ref(reference, "product")?;
+                if stored.research_id != rid || stored.context_id != context {
+                    return Err(fail(Code::InvalidReference, "foreign product reference"));
+                }
+                stored
+                    .value
+                    .get("productSnapshot")
+                    .or_else(|| stored.value.get("searchSnapshot"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        fail(Code::InvalidReference, "product reference has no snapshot")
+                    })
+            })
+            .collect()
+    }
+    pub fn validate_evidence_refs(&self, rid: &str, refs: &[String]) -> Result<()> {
+        validate_ids(&self.tx, "evidence", rid, refs)
+    }
     pub fn append_note(&mut self, args: &Value) -> Result<Value> {
         let rid = string_field(args, "researchId")?;
         let operation = string_field(args, "operationId")?;
@@ -662,6 +707,81 @@ impl JournalTxn<'_> {
             .unwrap_or("summary");
         if section == "summary" {
             return Ok(json!({"section":"summary","payload":self.summary(rid)?,"nextCursor":null}));
+        }
+        if section == "reviews" {
+            let refs = selection(args.get("reviewRefs"), 8, "reviewRefs")?;
+            let offset = args["textOffset"].as_u64().unwrap_or(0) as usize;
+            let limit = args["textLimit"].as_u64().unwrap_or(12000) as usize;
+            let mut values = Vec::new();
+            for reference in refs {
+                let stored = self.get_ref(&reference, "review")?;
+                if stored.research_id != rid
+                    || stored.context_id != research_context_id(&self.tx, rid)?
+                {
+                    return Err(fail(Code::InvalidReference, "foreign review reference"));
+                }
+                let snapshot = stored
+                    .value
+                    .get("reviewSnapshot")
+                    .ok_or_else(|| fail(Code::InvalidReference, "review has no stored text"))?;
+                let full = snapshot["text"].as_str();
+                let chars: Vec<char> = full.unwrap_or("").chars().collect();
+                if offset > chars.len() {
+                    return Err(fail(
+                        Code::InvalidArgument,
+                        "text offset exceeds review length",
+                    ));
+                }
+                let end = (offset + limit).min(chars.len());
+                let mut refs = snapshot["evidenceRefs"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for chunk in snapshot["textChunks"].as_array().into_iter().flatten() {
+                    if chunk["start"].as_u64().unwrap_or(u64::MAX) < end as u64
+                        && chunk["end"].as_u64().unwrap_or(0) > offset as u64
+                    {
+                        refs.push(chunk["ref"].clone());
+                    }
+                }
+                values.push(json!({"reviewRef":reference,"text":full.map(|_| chars[offset..end].iter().collect::<String>()),"textOffset":offset,"textLength":chars.len(),"textTruncated":end < chars.len(),"nextTextOffset":(end < chars.len()).then_some(end),"observedAt":snapshot["observedAt"],"contextId":snapshot["contextId"],"evidenceRefs":refs}));
+            }
+            return bounded_section(section, values, Value::Null, budget);
+        }
+        if section == "products" {
+            let refs = selection(args.get("productRefs"), 8, "productRefs")?;
+            let names = args.get("characteristicNames").and_then(Value::as_array);
+            let mut values = Vec::with_capacity(refs.len());
+            for reference in refs {
+                let stored = self.get_ref(&reference, "product")?;
+                if stored.research_id != rid
+                    || stored.context_id != research_context_id(&self.tx, rid)?
+                {
+                    return Err(fail(Code::InvalidReference, "foreign product reference"));
+                }
+                values.push(
+                    stored
+                        .value
+                        .get("productSnapshot")
+                        .cloned()
+                        .ok_or_else(|| {
+                            fail(
+                                Code::InvalidReference,
+                                "product reference has no product snapshot",
+                            )
+                        })?,
+                );
+            }
+            if let Some(names) = names {
+                for value in &mut values {
+                    for section in ["characteristics", "fullCharacteristics"] {
+                        if let Some(items) = value[section]["items"].as_array_mut() {
+                            items.retain(|item| names.iter().any(|name| *name == item["name"]));
+                        }
+                    }
+                }
+            }
+            return bounded_section(section, values, Value::Null, budget);
         }
         if section == "candidates" {
             let refs = selection(args.get("productRefs"), 20, "productRefs")?;

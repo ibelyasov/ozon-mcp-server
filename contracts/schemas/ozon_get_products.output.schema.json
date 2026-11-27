@@ -31,6 +31,32 @@
           "items": {
             "$ref": "#/$defs/result"
           }
+        },
+        "usage": {
+          "type": "object",
+          "required": [
+            "sourceReads",
+            "sourceReadLimit",
+            "budgetExhausted",
+            "unit"
+          ],
+          "properties": {
+            "sourceReads": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sourceReadLimit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "budgetExhausted": {
+              "type": "boolean"
+            },
+            "unit": {
+              "const": "logical_source_reads"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -208,6 +234,20 @@
         },
         "evidenceRefs": {
           "$ref": "common.schema.json#/$defs/evidenceRefs"
+        },
+        "prices": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "$ref": "common.schema.json#/$defs/price"
+          }
+        },
+        "availability": {
+          "enum": [
+            "available",
+            "unavailable",
+            "unknown"
+          ]
         }
       },
       "additionalProperties": false
@@ -447,6 +487,12 @@
             "null"
           ],
           "maxLength": 1000
+        },
+        "fullCharacteristics": {
+          "$ref": "#/$defs/characteristicsSection"
+        },
+        "offers": {
+          "$ref": "#/$defs/offersSection"
         }
       },
       "additionalProperties": false
@@ -533,6 +579,94 @@
           "$ref": "#/$defs/errorResult"
         }
       ]
+    },
+    "offer": {
+      "type": "object",
+      "required": [
+        "productRef",
+        "sku",
+        "seller",
+        "prices",
+        "availability",
+        "deliveryLabel",
+        "evidenceRefs",
+        "relation",
+        "configurationVerified"
+      ],
+      "properties": {
+        "productRef": {
+          "$ref": "common.schema.json#/$defs/opaque"
+        },
+        "sku": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "maxLength": 64
+        },
+        "seller": {
+          "oneOf": [
+            {
+              "$ref": "common.schema.json#/$defs/seller"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prices": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "$ref": "common.schema.json#/$defs/price"
+          }
+        },
+        "availability": {
+          "enum": [
+            "available",
+            "unavailable",
+            "unknown"
+          ]
+        },
+        "deliveryLabel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1000
+        },
+        "evidenceRefs": {
+          "$ref": "common.schema.json#/$defs/evidenceRefs"
+        },
+        "relation": {
+          "const": "ozon_related_offer"
+        },
+        "configurationVerified": {
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "offersSection": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/sectionBase"
+        },
+        {
+          "type": "object",
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "$ref": "#/$defs/offer"
+              }
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
     }
   }
 }

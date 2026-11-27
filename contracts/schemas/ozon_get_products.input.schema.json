@@ -42,10 +42,29 @@
           "characteristics",
           "description",
           "variants",
-          "images"
+          "images",
+          "fullCharacteristics",
+          "offers",
+          "customsDuty"
         ]
       },
       "description": "Default includes characteristics. Explicit sections are returned in full or with truthful bounded continuation."
+    },
+    "maxSourceReads": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 32
+    },
+    "characteristicNames": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 500
+      },
+      "minItems": 1,
+      "uniqueItems": true
     }
   },
   "additionalProperties": false,
@@ -67,7 +86,9 @@
   },
   "then": {
     "properties": {
-      "include": false
+      "include": false,
+      "maxSourceReads": false,
+      "characteristicNames": false
     }
   }
 }

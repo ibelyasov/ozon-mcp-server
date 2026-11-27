@@ -150,16 +150,8 @@ pub fn normalize_context(context: &Value, observed: &str) -> Normalized {
         .map(|name| {
             json!({
                 "name": name,
-                "status": if name=="offers" {
-                    "unsupported"
-                } else {
-                    "supported"
-                },
-                "reason": if name=="offers" {
-                    Some("Independent seller offers are unavailable from this public source.")
-                } else {
-                    None
-                },
+                "status": "supported",
+                "reason": null,
                 "evidenceRefs": [
 
                 ]
@@ -553,8 +545,19 @@ pub struct ProductContinuation {
     pub offset: usize,
     pub observed_at: String,
     pub source_url: String,
+    #[serde(default)]
+    pub characteristic_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub max_source_reads: Option<u32>,
+    #[serde(default)]
+    pub offers_path: Option<String>,
+    #[serde(default)]
+    pub offers_paths: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn normalize_product(
     raw: &ProductDetails,
     requested: &Value,
@@ -562,6 +565,9 @@ pub fn normalize_product(
     rid: &str,
     context_id: &str,
     include: &[String],
+    characteristic_names: Option<&[String]>,
+    original_include: &[String],
+    max_source_reads: Option<u32>,
     continuation: Option<&ProductContinuation>,
 ) -> Result<Normalized> {
     let sku = raw
@@ -691,31 +697,71 @@ pub fn normalize_product(
             .filter(|c| c.section == *section)
             .map_or(0, |c| c.offset);
         let (mut data, next_offset) = match section.as_str() {
-            "characteristics" => {
-                let end = (offset + 50).min(raw.characteristics.len());
+            "characteristics" | "fullCharacteristics" => {
+                let full = if section == "fullCharacteristics" {
+                    raw.full_characteristics.as_ref()
+                } else {
+                    None
+                };
+                let characteristics = if section == "fullCharacteristics" {
+                    full.map(|v| v.items.as_slice()).unwrap_or(&[])
+                } else {
+                    &raw.characteristics
+                };
+                let characteristics = characteristics
+                    .iter()
+                    .filter(|item| {
+                        characteristic_names.is_none_or(|names| names.contains(&item.label))
+                    })
+                    .collect::<Vec<_>>();
+                let (characteristic_url, characteristic_time) = full
+                    .map(|v| provenance(&v.acquisition, &source_url))
+                    .unwrap_or_else(|| (source_url.clone(), observed.clone()));
+                let complete = full
+                    .map(|v| v.source.complete())
+                    .unwrap_or(section == "characteristics" && raw.characteristics_complete);
+                let source_truncated =
+                    full.is_some_and(|v| v.source.source_truncated || v.source.local_truncated);
+                let mut end = offset.min(characteristics.len());
+                let mut units = 0usize;
+                while end < characteristics.len() && end - offset < 50 {
+                    let item = characteristics[end];
+                    let size = serde_json::to_string(&json!({"name":item.label,"value":item.value,"evidenceRefs":["evidence-00000000-0000-0000-0000-000000000000"]}))?.encode_utf16().count();
+                    if size > 30000 {
+                        return Err(fail(
+                            Code::ResultTooLarge,
+                            "One characteristic exceeds the response budget",
+                        ));
+                    }
+                    if end > offset && units + size > 10000 {
+                        break;
+                    }
+                    units += size;
+                    end += 1;
+                }
                 let mut items = vec![];
-                for item in raw.characteristics.iter().take(end).skip(offset) {
+                for item in characteristics.iter().take(end).skip(offset) {
                     let ev = observed_evidence(
-                        &source_url,
+                        &characteristic_url,
                         context_id,
                         Some(sku),
                         vec![
                             fact(format!("{}/title", item.source_locator), item.label.clone()),
                             fact(item.source_locator.clone(), item.value.clone()),
                         ],
-                        &observed,
+                        &characteristic_time,
                     )?;
                     let eid = evidence_ref(&ev).to_owned();
                     result.evidence.push(ev);
                     items.push(json!({"name":item.label,"value":item.value,"evidenceRefs":[eid]}));
                 }
-                let status = if !raw.characteristics_complete {
-                    if raw.characteristics.is_empty() {
+                let status = if !complete {
+                    if characteristics.is_empty() {
                         "unknown"
                     } else {
                         "partial"
                     }
-                } else if end < raw.characteristics.len() {
+                } else if end < characteristics.len() {
                     "partial"
                 } else {
                     "available"
@@ -724,23 +770,31 @@ pub fn normalize_product(
                     json!({
                         "status": status,
                         "items": items,
-                        "truncated": end<raw.characteristics.len(),
-                        "hasNext": if end<raw.characteristics.len(){
+                        "truncated": end<characteristics.len() || source_truncated,
+                        "hasNext": if end<characteristics.len(){
                             Some(true)
-                        }else if raw.characteristics_complete{
+                        }else if complete{
                             Some(false)
                         }else{
                             None
                         },
                         "nextCursor": null
                     }),
-                    (end < raw.characteristics.len()).then_some(end),
+                    (end < characteristics.len()).then_some(end),
                 )
             }
             "description" => {
                 let has_text = raw.description.has_text();
                 let chars = raw.description.text.chars().collect::<Vec<_>>();
-                let end = (offset + 12000).min(chars.len());
+                let mut end = (offset + 12000).min(chars.len());
+                while end > offset
+                    && serde_json::to_string(&chars[offset..end].iter().collect::<String>())?
+                        .encode_utf16()
+                        .count()
+                        > 12000
+                {
+                    end = offset + (end - offset) / 2;
+                }
                 let text = chars[offset.min(end)..end].iter().collect::<String>();
                 let (description_url, description_time) =
                     provenance(&raw.description.acquisition, &source_url);
@@ -786,7 +840,24 @@ pub fn normalize_product(
                 )
             }
             "variants" => {
-                let end = (offset + 20).min(raw.variants.items.len());
+                let mut end = offset.min(raw.variants.items.len());
+                let mut units = 0usize;
+                while end < raw.variants.items.len() && end - offset < 20 {
+                    let item = &raw.variants.items[end];
+                    let projected = json!({"productRef":"ref_00000000-0000-0000-0000-000000000000","sku":item.sku,"title":item.title,"prices":prices(None,None,item.displayed_price_minor,None),"availability":availability(item.available),"evidenceRefs":["evidence-00000000-0000-0000-0000-000000000000"]});
+                    let size = serde_json::to_string(&projected)?.encode_utf16().count() + 1;
+                    if size > 30000 {
+                        return Err(fail(
+                            Code::ResultTooLarge,
+                            "One variant exceeds the response budget",
+                        ));
+                    }
+                    if end > offset && units + size > 10000 {
+                        break;
+                    }
+                    units += size;
+                    end += 1;
+                }
                 let mut items = vec![];
                 for (index, item) in raw.variants.items.iter().enumerate().take(end).skip(offset) {
                     let reference=txn.put_ref(rid,"product",&json!({"sku":item.sku,"url":item.url.as_deref().and_then(evidence::canonical_source_url)}),None)?;
@@ -797,12 +868,20 @@ pub fn normalize_product(
                         vec![
                             fact(format!("/variants/items/{index}/sku"), item.sku.clone()),
                             fact(format!("/variants/items/{index}/title"), json!(item.title)),
+                            fact(
+                                format!("/variants/items/{index}/displayedPriceMinor"),
+                                json!(item.displayed_price_minor),
+                            ),
+                            fact(
+                                format!("/variants/items/{index}/available"),
+                                json!(item.available),
+                            ),
                         ],
                         &observed,
                     )?;
                     let eid = evidence_ref(&ev).to_owned();
                     result.evidence.push(ev);
-                    items.push(json!({"productRef":reference,"sku":item.sku,"title":item.title,"evidenceRefs":[eid]}));
+                    items.push(json!({"productRef":reference,"sku":item.sku,"title":item.title,"prices":prices(None,None,item.displayed_price_minor,None),"availability":availability(item.available),"evidenceRefs":[eid]}));
                 }
                 (
                     json!({
@@ -823,6 +902,88 @@ pub fn normalize_product(
                     (end < raw.variants.items.len()).then_some(end),
                 )
             }
+            "offers" => {
+                let offers = raw.offers.as_ref();
+                let items = offers.map(|o| o.items.as_slice()).unwrap_or(&[]);
+                let mut end = offset.min(items.len());
+                let mut units = 0usize;
+                while end < items.len() && end - offset < 20 {
+                    let item = &items[end];
+                    let projected = json!({"productRef":"ref_00000000-0000-0000-0000-000000000000","sku":item.sku,"seller":{"name":item.seller.name,"rating":item.seller.rating,"url":item.seller.url.as_deref().and_then(evidence::canonical_source_url)},"prices":prices(item.card_price_minor,item.regular_price_minor,None,None),"availability":availability(item.available),"deliveryLabel":item.delivery_label,"evidenceRefs":["evidence-00000000-0000-0000-0000-000000000000"],"relation":"ozon_related_offer","configurationVerified":false});
+                    let size = serde_json::to_string(&projected)?.encode_utf16().count() + 1;
+                    if size > 30000 {
+                        return Err(fail(
+                            Code::ResultTooLarge,
+                            "One offer exceeds the response budget",
+                        ));
+                    }
+                    if end > offset && units + size > 10000 {
+                        break;
+                    }
+                    units += size;
+                    end += 1;
+                }
+                let (url, time) = offers
+                    .map(|o| provenance(&o.acquisition, &source_url))
+                    .unwrap_or_else(|| (source_url.clone(), observed.clone()));
+                let mut rows = Vec::new();
+                for (index, item) in items.iter().enumerate().take(end).skip(offset) {
+                    let reference = txn.put_ref(rid, "product", &json!({"sku":item.sku,"url":item.url.as_deref().and_then(evidence::canonical_source_url)}), None)?;
+                    let ev = observed_evidence(
+                        &url,
+                        context_id,
+                        Some(sku),
+                        vec![
+                            fact(format!("/offers/{index}/sku"), item.sku.clone()),
+                            fact(
+                                format!("/offers/{index}/seller/name"),
+                                item.seller.name.clone(),
+                            ),
+                            fact(
+                                format!("/offers/{index}/seller/rating"),
+                                json!(item.seller.rating),
+                            ),
+                            fact(
+                                format!("/offers/{index}/seller/url"),
+                                json!(item.seller.url),
+                            ),
+                            fact(
+                                format!("/offers/{index}/cardPriceMinor"),
+                                json!(item.card_price_minor),
+                            ),
+                            fact(
+                                format!("/offers/{index}/regularPriceMinor"),
+                                json!(item.regular_price_minor),
+                            ),
+                            fact(format!("/offers/{index}/available"), json!(item.available)),
+                            fact(
+                                format!("/offers/{index}/deliveryLabel"),
+                                json!(item.delivery_label),
+                            ),
+                            fact(format!("/offers/{index}/url"), json!(item.url)),
+                        ],
+                        &time,
+                    )?;
+                    let eid = evidence_ref(&ev).to_owned();
+                    result.evidence.push(ev);
+                    rows.push(json!({"productRef":reference,"sku":item.sku,"seller":{"name":item.seller.name,"rating":item.seller.rating,"url":item.seller.url.as_deref().and_then(evidence::canonical_source_url)},"prices":prices(item.card_price_minor,item.regular_price_minor,None,None),"availability":availability(item.available),"deliveryLabel":item.delivery_label,"evidenceRefs":[eid],"relation":"ozon_related_offer","configurationVerified":false}));
+                }
+                let more = end < items.len();
+                if !more
+                    && offers.is_some_and(|o| o.has_next == Some(true) && o.next_path.is_none())
+                {
+                    result.warnings.push(warning(
+                        "OFFERS_CONTINUATION_UNAVAILABLE",
+                        "Ozon indicated more offers without an observed continuation path.",
+                        &[],
+                    ));
+                }
+                (
+                    json!({"status":if more {"partial"} else {offers.map(|o| status(o.source.status())).unwrap_or("unknown")},"items":rows,"truncated":more || offers.is_some_and(|o| !o.source.complete()),"hasNext":if more {Some(true)} else {offers.and_then(|o| o.has_next)},"nextCursor":null}),
+                    more.then_some(end),
+                )
+            }
+            "customsDuty" => continue,
             "images" => {
                 let origins = product_image_origins(raw);
                 let end = (offset + 12).min(origins.len());
@@ -908,6 +1069,48 @@ pub fn normalize_product(
                 offset,
                 observed_at: observed.clone(),
                 source_url: source_url.clone(),
+                characteristic_names: characteristic_names.map(<[String]>::to_vec),
+                include: original_include.to_vec(),
+                max_source_reads,
+                offers_path: None,
+                offers_paths: continuation
+                    .map(|c| c.offers_paths.clone())
+                    .unwrap_or_default(),
+            };
+            data["nextCursor"] = json!(txn.put_ref(
+                rid,
+                "product_cursor",
+                &serde_json::to_value(cursor)?,
+                Some(1800)
+            )?);
+        }
+        if section == "offers"
+            && next_offset.is_none()
+            && let Some(path) = raw.offers.as_ref().and_then(|o| o.next_path.as_ref())
+        {
+            if continuation.is_some_and(|c| c.offers_paths.contains(path)) {
+                result.warnings.push(warning(
+                    "CONTINUATION_STALLED",
+                    "The observed offers continuation repeats a previously read page.",
+                    &[],
+                ));
+                product[section] = data;
+                continue;
+            }
+            let cursor = ProductContinuation {
+                raw: raw.clone(),
+                product_ref: product_ref.clone(),
+                section: section.clone(),
+                offset: 0,
+                observed_at: observed.clone(),
+                source_url: source_url.clone(),
+                characteristic_names: characteristic_names.map(<[String]>::to_vec),
+                include: original_include.to_vec(),
+                max_source_reads,
+                offers_path: Some(path.clone()),
+                offers_paths: continuation
+                    .map(|c| c.offers_paths.clone())
+                    .unwrap_or_default(),
             };
             data["nextCursor"] = json!(txn.put_ref(
                 rid,
@@ -918,9 +1121,136 @@ pub fn normalize_product(
         }
         product[section] = data;
     }
+    if continuation.is_none() {
+        let mut snapshot = product.clone();
+        snapshot["observedAt"] = json!(observed);
+        snapshot["contextId"] = json!(context_id);
+        // Save every captured characteristic, even if the response requested a subset.
+        for (section, values, acquisition, complete) in [
+            (
+                "characteristics",
+                raw.characteristics.as_slice(),
+                None,
+                raw.characteristics_complete,
+            ),
+            (
+                "fullCharacteristics",
+                raw.full_characteristics
+                    .as_ref()
+                    .map(|v| v.items.as_slice())
+                    .unwrap_or(&[]),
+                raw.full_characteristics
+                    .as_ref()
+                    .and_then(|v| v.acquisition.as_ref()),
+                raw.full_characteristics
+                    .as_ref()
+                    .is_some_and(|v| v.source.complete()),
+            ),
+        ] {
+            let (url, time) = acquisition
+                .map(|a| (a.source_url.clone(), a.observed_at.clone()))
+                .unwrap_or_else(|| (source_url.clone(), observed.clone()));
+            let mut items = Vec::new();
+            for item in values {
+                let ev = observed_evidence(
+                    &url,
+                    context_id,
+                    Some(sku),
+                    vec![
+                        fact(format!("{}/title", item.source_locator), item.label.clone()),
+                        fact(item.source_locator.clone(), item.value.clone()),
+                    ],
+                    &time,
+                )?;
+                let eid = evidence_ref(&ev).to_owned();
+                result.evidence.push(ev);
+                items.push(json!({"name":item.label,"value":item.value,"evidenceRefs":[eid]}));
+            }
+            snapshot[section] = json!({"status":if complete {"available"} else if items.is_empty() {"unknown"} else {"partial"},"items":items,"truncated":section == "fullCharacteristics" && raw.full_characteristics.as_ref().is_some_and(|v| v.source.source_truncated || v.source.local_truncated),"hasNext":if complete {Some(false)} else {None},"nextCursor":null});
+        }
+        txn.set_ref_snapshot(rid, &product_ref, "product", "productSnapshot", &snapshot)?;
+    }
     result.data = json!({"status":"ok","requested":requested,"product":product});
     Ok(result)
 }
+/// Shrink a product row without losing selected sections: each omitted section
+/// receives a cursor bound to the same captured immutable product.
+#[allow(clippy::too_many_arguments)]
+pub fn compact_product_sections(
+    normalized: &mut Normalized,
+    raw: &ProductDetails,
+    txn: &mut JournalTxn<'_>,
+    rid: &str,
+    include: &[String],
+    names: Option<&[String]>,
+    original_include: &[String],
+    max_source_reads: Option<u32>,
+    continuation: Option<&ProductContinuation>,
+) -> Result<()> {
+    let product = &mut normalized.data["product"];
+    let reference = product["productRef"]
+        .as_str()
+        .ok_or_else(|| fail(Code::SourceChanged, "missing product reference"))?
+        .to_owned();
+    let (source_url, observed_at) = continuation
+        .map(|c| (c.source_url.clone(), c.observed_at.clone()))
+        .unwrap_or_else(|| {
+            provenance(
+                &raw.acquisition,
+                &raw.url.clone().unwrap_or_else(|| {
+                    format!(
+                        "https://www.ozon.ru/product/{}/",
+                        raw.sku.as_deref().unwrap_or("")
+                    )
+                }),
+            )
+        });
+    for section in include {
+        if section == "customsDuty" || product.get(section).is_none() {
+            continue;
+        }
+        let data = &mut product[section];
+        let has_content = data["items"].as_array().is_some_and(|v| !v.is_empty())
+            || data["text"].as_str().is_some_and(|s| !s.is_empty());
+        if !has_content {
+            continue;
+        }
+        let cursor = ProductContinuation {
+            raw: raw.clone(),
+            product_ref: reference.clone(),
+            section: section.clone(),
+            offset: continuation
+                .filter(|c| c.section == *section)
+                .map_or(0, |c| c.offset),
+            observed_at: observed_at.clone(),
+            source_url: source_url.clone(),
+            characteristic_names: names.map(<[String]>::to_vec),
+            include: original_include.to_vec(),
+            max_source_reads,
+            offers_path: None,
+            offers_paths: continuation
+                .map(|c| c.offers_paths.clone())
+                .unwrap_or_default(),
+        };
+        data["nextCursor"] = json!(txn.put_ref(
+            rid,
+            "product_cursor",
+            &serde_json::to_value(cursor)?,
+            Some(1800)
+        )?);
+        data["status"] = json!("partial");
+        data["truncated"] = json!(true);
+        data["hasNext"] = json!(true);
+        if data.get("items").is_some() {
+            data["items"] = json!([]);
+        }
+        if data.get("text").is_some() {
+            data["text"] = Value::Null;
+        }
+    }
+    Ok(())
+}
+
 fn product_image_origins(raw: &ProductDetails) -> Vec<SourceImage> {
     let mut seen = BTreeSet::new();
     raw.image_origins
@@ -1056,6 +1386,9 @@ pub struct ReviewBatch<'a> {
     pub chain_complete: bool,
     pub include_facets: bool,
     pub next_cursor: Option<&'a str>,
+    pub text_limit: Option<usize>,
+    pub include_details: bool,
+    pub include_seller_replies: bool,
 }
 
 pub fn normalize_reviews(
@@ -1074,6 +1407,9 @@ pub fn normalize_reviews(
         chain_complete,
         include_facets,
         next_cursor,
+        text_limit,
+        include_details,
+        include_seller_replies,
     } = batch;
     if raw.reviews.len() > 30 {
         return Err(fail(
@@ -1103,18 +1439,6 @@ pub fn normalize_reviews(
         let text = review_text(item);
         let mut facts = vec![
             fact(
-                format!("{}/content/comment", item.source_locator),
-                json!(item.comment),
-            ),
-            fact(
-                format!("{}/content/positive", item.source_locator),
-                json!(item.pros),
-            ),
-            fact(
-                format!("{}/content/negative", item.source_locator),
-                json!(item.cons),
-            ),
-            fact(
                 format!("{}/content/score", item.source_locator),
                 json!(item.score),
             ),
@@ -1125,6 +1449,22 @@ pub fn normalize_reviews(
                 json!(item.purchased),
             ),
         ];
+        if let Some(details) = item.details.as_ref()
+            && include_details
+        {
+            facts.push(fact(
+                format!("{}/helpful", item.source_locator),
+                json!(details.helpful),
+            ));
+            facts.push(fact(
+                format!("{}/unhelpful", item.source_locator),
+                json!(details.unhelpful),
+            ));
+            facts.push(fact(
+                format!("{}/itemSku", item.source_locator),
+                json!(details.item_sku),
+            ));
+        }
         for origin in &item.photo_origins {
             let path = origin.source_locator.clone().unwrap_or_else(|| {
                 format!("{}/content/photos/{}", item.source_locator, origin.index)
@@ -1133,6 +1473,101 @@ pub fn normalize_reviews(
         }
         let ev = observed_evidence(&source_url, context_id, Some(sku), facts, &observed)?;
         let eid = evidence_ref(&ev).to_owned();
+        let mut evidence_refs = vec![eid.clone()];
+        result.evidence.push(ev);
+        // Each raw source field is chunked with its original field path. The
+        // offsets map those facts into the displayed review text for local reads.
+        let mut text_chunks = Vec::new();
+        let mut text_position = 0usize;
+        let mut segments = 0usize;
+        for (field, value, prefix) in [
+            ("positive", &item.pros, "Достоинства: "),
+            ("negative", &item.cons, "Недостатки: "),
+            ("comment", &item.comment, ""),
+        ] {
+            if let Some(value) = value.as_ref().filter(|v| !v.is_empty()) {
+                if segments > 0 {
+                    text_position += 1;
+                }
+                text_position += prefix.chars().count();
+                segments += 1;
+                let chars: Vec<char> = value.chars().collect();
+                for (part, chunk) in chars.chunks(4000).enumerate() {
+                    let ev = observed_evidence(
+                        &source_url,
+                        context_id,
+                        Some(sku),
+                        vec![fact(
+                            format!("{}/content/{field}/{}", item.source_locator, part * 4000),
+                            chunk.iter().collect::<String>(),
+                        )],
+                        &observed,
+                    )?;
+                    let reference = evidence_ref(&ev).to_owned();
+                    let begin = text_position + part * 4000;
+                    text_chunks
+                        .push(json!({"start":begin,"end":begin+chunk.len(),"ref":reference}));
+                    result.evidence.push(ev);
+                }
+                text_position += chars.len();
+            }
+        }
+        if include_seller_replies
+            && let Some(details) = item.details.as_ref()
+            && let Some(acquisition) = &details.replies_acquisition
+        {
+            for (index, reply) in details.seller_replies.iter().enumerate() {
+                let chars: Vec<char> = reply.text.chars().collect();
+                for (part, chunk) in chars.chunks(4000).enumerate() {
+                    let ev = observed_evidence(
+                        &acquisition.source_url,
+                        context_id,
+                        Some(sku),
+                        vec![
+                            fact(
+                                format!("/sellerReplies/{index}/text/{}", part * 4000),
+                                chunk.iter().collect::<String>(),
+                            ),
+                            fact(
+                                format!("/sellerReplies/{index}/publishedAt"),
+                                json!(reply.published_at),
+                            ),
+                            fact(
+                                format!("/sellerReplies/{index}/authorLabel"),
+                                json!(reply.author_label),
+                            ),
+                        ],
+                        &acquisition.observed_at,
+                    )?;
+                    if evidence_refs.len() < 80 {
+                        evidence_refs.push(evidence_ref(&ev).to_owned());
+                    }
+                    result.evidence.push(ev);
+                }
+            }
+        }
+        txn.set_ref_snapshot(rid, &review_ref, "review", "reviewSnapshot", &json!({"text":text,"observedAt":observed,"contextId":context_id,"evidenceRefs":evidence_refs,"textChunks":text_chunks}))?;
+        let length = text.as_ref().map_or(0, |s| s.chars().count());
+        let mut effective_limit = text_limit.unwrap_or(12000).min(12000);
+        if let Some(text) = text.as_ref() {
+            while effective_limit > 0
+                && serde_json::to_string(&text.chars().take(effective_limit).collect::<String>())?
+                    .encode_utf16()
+                    .count()
+                    > 12000
+            {
+                effective_limit /= 2;
+            }
+        }
+        for chunk in &text_chunks {
+            if chunk["start"].as_u64().unwrap_or(u64::MAX) < effective_limit as u64 {
+                evidence_refs.push(chunk["ref"].as_str().unwrap_or_default().to_owned());
+            }
+        }
+        let shown = text
+            .as_ref()
+            .map(|s| s.chars().take(effective_limit).collect::<String>());
+        let truncated = length > effective_limit;
         let mut image_refs = vec![];
         for origin in item.photo_origins.iter().take(12) {
             let path = origin.source_locator.clone().unwrap_or_else(|| {
@@ -1151,19 +1586,73 @@ pub fn normalize_reviews(
                 &eid,
             )?);
         }
-        rows.push(json!({
+        let mut row = json!({
             "reviewRef": review_ref,
             "rating": item.score.filter(|n|n.fract()==0.0&&*n>=1.0&&*n<=5.0).map(|n|n as u64),
             "publishedAt": item.date.as_deref().and_then(normalize_timestamp),
-            "text": text,
+            "text": shown,
             "variantLabel": item.variant_label,
             "purchaseVerified": item.purchased,
             "imageRefs": image_refs,
-            "evidenceRefs": [
-                eid
-            ]
-        }));
-        result.evidence.push(ev);
+            "evidenceRefs": evidence_refs
+        });
+        if text_limit.is_some() || truncated {
+            row["textTruncated"] = json!(truncated);
+            row["textLength"] = json!(length);
+        }
+        if include_details {
+            row["helpfulVotes"] = json!(item.details.as_ref().and_then(|d| d.helpful));
+            row["unhelpfulVotes"] = json!(item.details.as_ref().and_then(|d| d.unhelpful));
+            row["subjectSku"] = json!(item.details.as_ref().and_then(|d| d.item_sku.as_deref()));
+        }
+        if include_seller_replies {
+            let replies = item.details.as_ref();
+            let mut rows = Vec::new();
+            let mut remaining = 4000usize;
+            let mut truncated = replies.is_some_and(|d| {
+                !matches!(d.replies_status, SourceSectionStatus::Available)
+                    || d.seller_replies.len() > 30
+            });
+            for reply in replies
+                .into_iter()
+                .flat_map(|d| d.seller_replies.iter())
+                .take(30)
+            {
+                if remaining == 0 {
+                    truncated = true;
+                    break;
+                }
+                let mut limit = reply.text.chars().count().min(remaining).min(12000);
+                let projected = loop {
+                    let shown: String = reply.text.chars().take(limit).collect();
+                    let candidate = json!({"text":shown,"publishedAt":reply.published_at,"authorLabel":reply.author_label});
+                    let size = serde_json::to_string(&candidate)?.encode_utf16().count() + 1;
+                    if size <= remaining {
+                        break Some((candidate, size));
+                    }
+                    if limit == 0 {
+                        break None;
+                    }
+                    limit /= 2;
+                };
+                let Some((projected, size)) = projected else {
+                    truncated = true;
+                    break;
+                };
+                truncated |= limit < reply.text.chars().count();
+                remaining -= size;
+                rows.push(projected);
+            }
+            let state = if truncated {
+                "partial"
+            } else {
+                replies
+                    .map(|d| status(d.replies_status.clone()))
+                    .unwrap_or("unknown")
+            };
+            row["sellerReplies"] = json!({"status":state,"items":rows,"truncated":truncated});
+        }
+        rows.push(row);
     }
     result.evidence.push(observed_evidence(
         &source_url,
@@ -1189,6 +1678,24 @@ pub fn normalize_reviews(
         ],
         &observed,
     )?);
+    if let Some(counts) = &raw.star_counts {
+        let facts = counts
+            .iter()
+            .map(|count| {
+                fact(
+                    format!("/aggregate/starCounts/{}", count.stars),
+                    json!(count.count),
+                )
+            })
+            .collect();
+        result.evidence.push(observed_evidence(
+            &source_url,
+            context_id,
+            Some(sku),
+            facts,
+            &observed,
+        )?);
+    }
     let mut refinements = vec![];
     if include_facets {
         for refinement in raw.refinements.iter().take(100) {
@@ -1240,6 +1747,9 @@ pub fn normalize_reviews(
             raw.has_next
         }
     });
+    if let Some(counts) = &raw.star_counts {
+        result.data["aggregate"]["starCounts"] = serde_json::to_value(counts)?;
+    }
     Ok(result)
 }
 fn review_text(review: &Review) -> Option<String> {

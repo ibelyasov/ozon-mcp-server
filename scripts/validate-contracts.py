@@ -29,7 +29,6 @@ def standalone(schema: dict[str, Any]) -> dict[str, Any]:
     collisions = defs.keys() & common.keys()
     if collisions:
         raise ValueError(f"shared definition collision: {sorted(collisions)}")
-    defs.update(copy.deepcopy(common))
 
     def localize(value: Any) -> None:
         if isinstance(value, dict):
@@ -46,6 +45,18 @@ def standalone(schema: dict[str, Any]) -> dict[str, Any]:
                 localize(child)
 
     localize(schema)
+    localize(common)
+    pending = {r.removeprefix("#/$defs/").split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+               for r in collect_refs(schema) if r.startswith("#/$defs/")} & common.keys()
+    included: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in included:
+            continue
+        included.add(name)
+        pending.update({r.removeprefix("#/$defs/").split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+                        for r in collect_refs(common[name]) if r.startswith("#/$defs/")} & common.keys() - included)
+    defs.update({name: copy.deepcopy(common[name]) for name in included})
     return schema
 
 
@@ -72,7 +83,7 @@ def semantic_errors(schema_name: str, instance: Any) -> list[str]:
         if len(names) != len(set(names)) or set(names) != expected:
             errors.append("capabilities must contain every canonical name exactly once")
         for entry in instance["data"]["capabilities"]:
-            if entry["status"] != ("unsupported" if entry["name"] == "offers" else "supported"):
+            if entry["status"] != "supported":
                 errors.append("capability status does not match static implementation support")
     if schema_name == "ozon_search.input.schema.json":
         query = instance.get("start", {}).get("query")
@@ -100,13 +111,20 @@ def semantic_errors(schema_name: str, instance: Any) -> list[str]:
         if data["coverage"]["uniqueSeen"] < data["coverage"]["returned"]:
             errors.append("coverage.uniqueSeen is less than returned")
         errors.extend(cursor_errors(data, "data"))
+        for index, row in enumerate(data["reviews"]):
+            if row.get("textTruncated") is True and "textLength" not in row:
+                errors.append(f"reviews[{index}]: truncated text requires textLength")
+            if "textLength" in row and row.get("text") is not None:
+                length = len(row["text"])
+                if row["textLength"] < length or (row.get("textTruncated") is True and row["textLength"] <= length):
+                    errors.append(f"reviews[{index}]: textLength contradicts text fragment")
     if schema_name == "ozon_get_products.output.schema.json":
         for result_index, result in enumerate(instance["data"]["results"]):
             if result["status"] != "ok":
                 continue
             product = result["product"]
             errors.extend(price_list_errors(product["prices"], f"results[{result_index}].product.prices"))
-            for name in ("characteristics", "description", "variants", "images"):
+            for name in ("characteristics", "fullCharacteristics", "description", "variants", "images", "offers"):
                 if name in product:
                     section = product[name]
                     errors.extend(cursor_errors(section, f"results[{result_index}].product.{name}"))
@@ -132,7 +150,7 @@ def pair_errors(case: dict[str, Any]) -> list[str]:
         errors = []
         if data["section"] != args.get("section", "summary"):
             errors.append("journal result section differs from requested section")
-        for selector, identity in (("noteIds", "noteId"), ("evidenceRefs", "evidenceRef"), ("productRefs", "productRef")):
+        for selector, identity in (("noteIds", "noteId"), ("evidenceRefs", "evidenceRef"), ("productRefs", "productRef"), ("reviewRefs", "reviewRef")):
             if selector in args:
                 if [row[identity] for row in data["payload"]] != args[selector]:
                     errors.append(f"journal result does not preserve {selector} selection order")
@@ -150,8 +168,8 @@ def pair_errors(case: dict[str, Any]) -> list[str]:
         errors.append("product result count differs from selector count")
         return errors
     default_sections = ["characteristics"]
-    requested = set(case["input"].get("include", default_sections))
-    section_names = {"characteristics", "description", "variants", "images"}
+    requested = set(case["input"].get("include", default_sections)) - {"customsDuty"}
+    section_names = {"characteristics", "fullCharacteristics", "description", "variants", "images", "offers"}
     for index, (selector, result) in enumerate(zip(inputs, results)):
         if result["requested"] != selector:
             errors.append(f"product result {index} does not preserve its selector")

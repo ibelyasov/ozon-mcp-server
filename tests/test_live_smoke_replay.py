@@ -64,7 +64,7 @@ class ReplayDataMatchesTests(unittest.TestCase):
     def test_reviews_preserve_text_dates_coverage_and_order(self) -> None:
         captured = {
             "reviews": [
-                {"text": "First review", "publishedAt": "2026-01-01", "rating": 5,
+                {"reviewRef": "review-old", "text": "First review", "publishedAt": "2026-01-01", "rating": 5,
                  "evidenceRefs": ["evidence-old"], "imageRefs": ["image-old"]},
                 {"text": "Second review", "publishedAt": "2026-01-02", "rating": 4,
                  "evidenceRefs": ["evidence-2-old"], "imageRefs": []},
@@ -75,7 +75,7 @@ class ReplayDataMatchesTests(unittest.TestCase):
             "coverage": {"returned": 2, "uniqueSeen": 7},
         }
         replay = copy.deepcopy(captured)
-        replay["reviews"][0].update(evidenceRefs=["evidence-new"], imageRefs=["image-new"])
+        replay["reviews"][0].update(reviewRef="review-new", evidenceRefs=["evidence-new"], imageRefs=["image-new"])
         replay["reviews"][1]["evidenceRefs"] = ["evidence-2-new"]
         replay["refinements"][0]["reviewSearchRef"] = "reviews-new"
         replay["nextCursor"] = "cursor-new"

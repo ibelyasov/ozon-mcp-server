@@ -7,7 +7,7 @@
       }
     ],
     "include": [
-      "offers"
+      "unknownSection"
     ]
   },
   "expectedInvalidAt": "schema"

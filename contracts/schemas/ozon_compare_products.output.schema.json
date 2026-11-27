@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ozon_compare_products success output",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "researchId",
+    "data",
+    "context",
+    "observedAt",
+    "evidence",
+    "warnings"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "3"
+    },
+    "researchId": {
+      "$ref": "common.schema.json#/$defs/opaque"
+    },
+    "data": {
+      "type": "object",
+      "required": [
+        "historical",
+        "rows",
+        "warnings"
+      ],
+      "properties": {
+        "historical": {
+          "const": true
+        },
+        "rows": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "required": [
+              "productRef",
+              "sku",
+              "title",
+              "observedAt",
+              "priceMinor",
+              "currency",
+              "priceKind",
+              "rating",
+              "reviewCount",
+              "characteristics",
+              "requirements",
+              "unitPrice",
+              "evidenceRefs"
+            ],
+            "properties": {
+              "productRef": {
+                "$ref": "common.schema.json#/$defs/opaque"
+              },
+              "sku": {
+                "type": "string",
+                "pattern": "^[0-9]+$",
+                "maxLength": 64
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 1000
+              },
+              "observedAt": {
+                "$ref": "common.schema.json#/$defs/timestamp"
+              },
+              "priceMinor": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "currency": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 16
+              },
+              "priceKind": {
+                "enum": [
+                  "ozon_card",
+                  "regular",
+                  "displayed"
+                ]
+              },
+              "rating": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 5
+              },
+              "reviewCount": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "characteristics": {
+                "type": "array",
+                "maxItems": 50,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "value"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 500
+                    },
+                    "value": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "maxLength": 4000
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "requirements": {
+                "type": "array",
+                "maxItems": 20,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "expected",
+                    "actual",
+                    "status"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 500
+                    },
+                    "expected": {
+                      "type": "string",
+                      "maxLength": 4000
+                    },
+                    "actual": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "maxLength": 4000
+                    },
+                    "status": {
+                      "enum": [
+                        "matches",
+                        "does_not_match",
+                        "unknown"
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "unitPrice": {
+                "type": "object",
+                "required": [
+                  "status",
+                  "amountMinor",
+                  "unit",
+                  "basis",
+                  "characteristicName"
+                ],
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "available",
+                      "unknown"
+                    ]
+                  },
+                  "amountMinor": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "minimum": 0
+                  },
+                  "unit": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 500
+                  },
+                  "basis": {
+                    "enum": [
+                      "observed_characteristic",
+                      "unverified"
+                    ]
+                  },
+                  "characteristicName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 500
+                  }
+                },
+                "additionalProperties": false
+              },
+              "evidenceRefs": {
+                "$ref": "common.schema.json#/$defs/evidenceRefs"
+              }
+            },
+            "additionalProperties": false
+          },
+          "minItems": 2
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": "object",
+            "required": [
+              "code",
+              "message",
+              "evidenceRefs"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "evidenceRefs": {
+                "$ref": "common.schema.json#/$defs/evidenceRefs"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "$ref": "common.schema.json#/$defs/context"
+    },
+    "observedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp"
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "warnings": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "$ref": "common.schema.json#/$defs/warning"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {}
+}

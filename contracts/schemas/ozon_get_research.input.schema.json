@@ -26,6 +26,12 @@
     },
     {
       "$ref": "#/$defs/selectedCandidates"
+    },
+    {
+      "$ref": "#/$defs/selectedProducts"
+    },
+    {
+      "$ref": "#/$defs/selectedReviews"
     }
   ],
   "$defs": {
@@ -206,6 +212,78 @@
           "items": {
             "$ref": "common.schema.json#/$defs/opaque"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectedProducts": {
+      "type": "object",
+      "required": [
+        "researchId",
+        "section",
+        "productRefs"
+      ],
+      "properties": {
+        "researchId": {
+          "$ref": "common.schema.json#/$defs/opaque"
+        },
+        "section": {
+          "const": "products"
+        },
+        "productRefs": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "common.schema.json#/$defs/opaque"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "characteristicNames": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "selectedReviews": {
+      "type": "object",
+      "required": [
+        "researchId",
+        "section",
+        "reviewRefs"
+      ],
+      "properties": {
+        "researchId": {
+          "$ref": "common.schema.json#/$defs/opaque"
+        },
+        "section": {
+          "const": "reviews"
+        },
+        "reviewRefs": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "common.schema.json#/$defs/opaque"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "textOffset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "textLimit": {
+          "type": "integer",
+          "minimum": 80,
+          "maximum": 12000,
+          "default": 12000
         }
       },
       "additionalProperties": false

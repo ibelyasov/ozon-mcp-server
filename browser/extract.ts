@@ -5,7 +5,8 @@ type PageOptions =
   | { mode: "context" }
   | { mode: "contextModal" }
   | { mode: "navigation"; target: "home" | "addressBook" }
-  | { mode: "fetch"; path: string };
+  | { mode: "fetch"; path: string }
+  | { mode: "sellerReplies"; reviewUuid: string; sku: string; rootSku: string };
 type PageError =
   | "CAPTCHA_OR_BLOCKED"
   | "FETCH_FAILED"
@@ -54,7 +55,7 @@ const publicWidgetNames = new Set([
   "webIconWithText",
   "webProductHeading",
   "webPrice",
-  "webGallery",
+  "webGallery", "webCharacteristics", "webSellerList",
 ]);
 const searchWidgetNames = new Set([
   "filtersDesktop", "searchResultsSort", "searchResultsFiltersActive",
@@ -237,6 +238,7 @@ function projectSearchWidget(name: string, raw: unknown): JsonRecord | undefined
             item[key] = variant;
           }
         }
+        if (isRecord(review.usefulness)) item.usefulness = scalars(review.usefulness, ["useful", "unuseful"]);
         if (isRecord(review.status)) item.status = scalars(review.status, ["id", "name"]);
         return item;
       });
@@ -273,6 +275,7 @@ function widgetName(key: string): string {
 
 function parseOptions(value: unknown): PageOptions | null {
   if (!isRecord(value)) return null;
+  if (value.mode === "sellerReplies" && typeof value.reviewUuid === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value.reviewUuid) && typeof value.sku === "string" && /^[0-9]{1,20}$/.test(value.sku) && typeof value.rootSku === "string" && /^[0-9]{1,20}$/.test(value.rootSku)) return { mode: "sellerReplies", reviewUuid: value.reviewUuid, sku: value.sku, rootSku: value.rootSku };
   if (value.mode === "widgets") return { mode: "widgets" };
   if (value.mode === "context") return { mode: "context" };
   if (value.mode === "contextModal") return { mode: "contextModal" };
@@ -313,6 +316,22 @@ function projectPublicWidget(name: string, raw: unknown): unknown {
   try { if (typeof raw === "string") value = JSON.parse(raw); } catch { return null; }
   if (!isRecord(value) || Array.isArray(value)) return null;
   switch (name) {
+    case "webCharacteristics": return { characteristics: Array.isArray(value.characteristics) ? value.characteristics.map((group) => {
+      if (!isRecord(group)) return null;
+      const out: JsonRecord = {};
+      for (const section of ["short", "long"]) if (Array.isArray(group[section])) out[section] = (group[section] as unknown[]).map((row) => {
+        if (!isRecord(row)) return null;
+        return { ...scalars(row, ["name"]), ...(Array.isArray(row.values) ? { values: row.values.map((v) => isRecord(v) ? scalars(v, ["text"]) : null) } : {}) };
+      });
+      return out;
+    }) : null };
+    case "webSellerList": return { sellers: Array.isArray(value.sellers) ? value.sellers.map((row) => {
+      if (!isRecord(row)) return null;
+      const out = scalars(row, ["sku", "name", "productLink", "available"]);
+      if (isRecord(row.price)) { const price: JsonRecord = {}; for (const key of ["cardPrice", "price"]) if (isRecord(row.price[key])) price[key] = scalars(row.price[key], ["price"]); out.price = price; }
+      if (Array.isArray(row.advantages)) out.advantages = records(row.advantages).filter((v) => v.key === "delivery").map((v) => ({ key: "delivery", contentRs: isRecord(v.contentRs) ? { headRs: displayField(v.contentRs.headRs) } : {} }));
+      return out;
+    }) : null, ...(isRecord(value.paging) ? { paging: scalars(value.paging, ["nextPage", "total"]) } : {}) };
     case "webPrice": return scalars(value, ["cardPrice", "price", "isAvailable", "deliveryLabel"]);
     case "webProductHeading": return { title: displayField(value.title) };
     case "webIconWithText": return { title: displayField(value.title), text: displayField(value.text) };
@@ -321,6 +340,7 @@ function projectPublicWidget(name: string, raw: unknown): unknown {
       ...(Array.isArray(value.images) ? { images: value.images.map(imageField) } : {}) };
     case "webSingleProductScore": case "webReviewProductScore": {
       const result = scalars(value, ["rating", "ratingValue", "text", "reviews", "reviewCount", "reviewsCount", "totalReviews"]);
+      if (Array.isArray(value.score)) result.score = records(value.score).map((v) => scalars(v, ["title", "value"]));
       if (isRecord(value.title)) result.title = scalars(value.title, ["text"]);
       return result;
     }
@@ -599,14 +619,14 @@ async function ozonPage(rawOptions: unknown): Promise<PageResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 35_000);
   try {
+    const replyLookup = options.mode === "sellerReplies";
     const response = await fetch(
-      "/api/composer-api.bx/page/json/v2?url=" +
-        encodeURIComponent(options.path),
-      {
-        headers: { accept: "application/json" },
-        signal: controller.signal,
-      },
+      replyLookup ? "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid" :
+        "/api/composer-api.bx/page/json/v2?url=" + encodeURIComponent(options.path),
+      replyLookup ? { method: "POST", mode: "same-origin", redirect: "manual", headers: { accept: "application/json", "content-type": "application/json" }, body: JSON.stringify({ reviewUuid: options.reviewUuid, sku: options.sku, rootSku: options.rootSku, limit: 10, offset: 0 }), signal: controller.signal } :
+        { headers: { accept: "application/json" }, signal: controller.signal },
     );
+    if (replyLookup && (response.url !== "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid" || response.redirected || response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400))) return { error: "INVALID_ORIGIN" };
     if (!response.ok) return { status: response.status };
     if (Number(response.headers.get("content-length")) > maxBytes) {
       return { error: "RESPONSE_TOO_LARGE" };
@@ -628,7 +648,16 @@ async function ozonPage(rawOptions: unknown): Promise<PageResult> {
       text += decoder.decode(value, { stream: true });
     }
     try {
-      return filterPage(JSON.parse(text + decoder.decode()) as unknown);
+      const data: unknown = JSON.parse(text + decoder.decode());
+      if (replyLookup) {
+        if (!isRecord(data) || !Array.isArray(data.comments)) return { error: "INVALID_RESPONSE" };
+        const comments = data.comments.slice(0, 10).flatMap((row) => {
+          if (!isRecord(row) || !isRecord(row.author) || !isRecord(row.author.clientOfficial) || typeof row.author.clientOfficial.brandName !== "string" || !row.author.clientOfficial.brandName || typeof row.comment !== "string") return [];
+          return [{ ...scalars(row, ["comment", "publishedAt", "createdAt"]), authorLabel: row.author.clientOfficial.brandName }];
+        });
+        return { page: { widgetStates: { sellerReplies: { comments, sourceTruncated: data.comments.length >= 10 } } } };
+      }
+      return filterPage(data);
     } catch {
       return { error: "INVALID_RESPONSE" };
     }

@@ -66,8 +66,8 @@
         },
         {
           "name": "offers",
-          "status": "unsupported",
-          "reason": "Offer enumeration is not implemented.",
+          "status": "supported",
+          "reason": null,
           "evidenceRefs": []
         },
         {

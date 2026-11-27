@@ -1,0 +1,73 @@
+{
+  "inputSchema": "schemas/ozon_compare_products.input.schema.json",
+  "outputSchema": "schemas/ozon_compare_products.output.schema.json",
+  "input": {
+    "researchId": "research-01",
+    "productRefs": [
+      "product-1",
+      "product-2"
+    ]
+  },
+  "output": {
+    "schemaVersion": "3",
+    "researchId": "research-01",
+    "data": {
+      "historical": true,
+      "rows": [
+        {
+          "productRef": "product-1",
+          "sku": "1",
+          "title": null,
+          "observedAt": "2026-09-13T09:02:00Z",
+          "priceMinor": null,
+          "currency": null,
+          "priceKind": "ozon_card",
+          "rating": null,
+          "reviewCount": null,
+          "characteristics": [],
+          "requirements": [],
+          "unitPrice": {
+            "status": "unknown",
+            "amountMinor": null,
+            "unit": null,
+            "basis": "unverified",
+            "characteristicName": null
+          },
+          "evidenceRefs": []
+        },
+        {
+          "productRef": "product-2",
+          "sku": "2",
+          "title": null,
+          "observedAt": "2026-09-13T09:02:00Z",
+          "priceMinor": null,
+          "currency": null,
+          "priceKind": "ozon_card",
+          "rating": null,
+          "reviewCount": null,
+          "characteristics": [],
+          "requirements": [],
+          "unitPrice": {
+            "status": "unknown",
+            "amountMinor": null,
+            "unit": null,
+            "basis": "unverified",
+            "characteristicName": null
+          },
+          "evidenceRefs": []
+        }
+      ],
+      "warnings": []
+    },
+    "context": {
+      "contextId": "ctx-01",
+      "regionLabel": null,
+      "regionVerification": "unverified",
+      "accountState": "unknown",
+      "accessState": "available"
+    },
+    "observedAt": "2026-09-13T09:02:00Z",
+    "evidence": [],
+    "warnings": []
+  }
+}

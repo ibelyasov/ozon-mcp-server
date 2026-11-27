@@ -3,7 +3,9 @@ use crate::{
     contracts,
     error::{self, Code, fail},
     images,
-    ozon::model::{ProductDetails, ReviewPage, SearchResponse},
+    ozon::model::{
+        ProductDetails, ProductReadOptions, ReviewPage, ReviewReadOptions, SearchResponse,
+    },
     ozon::outcome::ContextObservation,
     ozon::search::SearchArgs,
     ozon::source::OzonSource,
@@ -99,22 +101,50 @@ impl SourceBackend {
     async fn product(
         &mut self,
         target: &str,
+        options: &ProductReadOptions,
         cancel: &CancellationToken,
     ) -> Result<ProductDetails> {
         match self {
-            Self::Real(g) => g.product(target, cancel).await,
+            Self::Real(g) => g.product_with_options(target, options, cancel).await,
             #[cfg(test)]
             Self::Fake(g) => {
                 g.targets.push(target.into());
+                g.product_options.push(options.clone());
                 run_fake(g.products.pop_front(), cancel, &g.entered).await
             }
         }
     }
-    async fn reviews(&mut self, path: &str, cancel: &CancellationToken) -> Result<ReviewPage> {
+    async fn offers_page(
+        &mut self,
+        sku: &str,
+        path: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(
+        crate::ozon::model::ProductOffers,
+        crate::ozon::model::ReadUsage,
+    )> {
         match self {
-            Self::Real(g) => g.reviews(path, cancel).await,
+            Self::Real(g) => g.offers_page(sku, path, cancel).await,
             #[cfg(test)]
-            Self::Fake(g) => run_fake(g.reviews.pop_front(), cancel, &g.entered).await,
+            Self::Fake(g) => {
+                g.targets.push(format!("offers:{sku}:{path}"));
+                run_fake(g.offer_pages.pop_front(), cancel, &g.entered).await
+            }
+        }
+    }
+    async fn reviews(
+        &mut self,
+        path: &str,
+        options: &ReviewReadOptions,
+        cancel: &CancellationToken,
+    ) -> Result<ReviewPage> {
+        match self {
+            Self::Real(g) => g.reviews_with_options(path, options, cancel).await,
+            #[cfg(test)]
+            Self::Fake(g) => {
+                g.review_options.push(options.clone());
+                run_fake(g.reviews.pop_front(), cancel, &g.entered).await
+            }
         }
     }
     async fn image(
@@ -460,9 +490,10 @@ async fn execute(inner: &Inner, name: &str, args: Value, budget: &Budget) -> Res
         "ozon_get_products" => products(inner, &args, budget).await,
         "ozon_get_reviews" => reviews(inner, &args, budget).await,
         "ozon_get_images" => get_images(inner, &args, budget).await,
-        "ozon_list_research" | "ozon_get_research" | "ozon_append_research_note" => {
-            local_operation(inner, name, &args, budget)
-        }
+        "ozon_list_research"
+        | "ozon_get_research"
+        | "ozon_append_research_note"
+        | "ozon_compare_products" => local_operation(inner, name, &args, budget),
         _ => Err(fail(Code::InvalidArgument, "Unknown tool")),
     }
 }
@@ -510,6 +541,31 @@ fn local_operation(inner: &Inner, name: &str, args: &Value, budget: &Budget) -> 
                 "ozon_list_research" => txn.list(args)?,
                 "ozon_get_research" => txn.read(args)?,
                 "ozon_append_research_note" => txn.append_note(args)?,
+                "ozon_compare_products" => {
+                    let rid =
+                        rid.ok_or_else(|| fail(Code::InvalidArgument, "missing researchId"))?;
+                    let refs: Vec<String> = args["productRefs"]
+                        .as_array()
+                        .ok_or_else(|| fail(Code::InvalidArgument, "missing productRefs"))?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect();
+                    let candidates = txn.selected_products(rid, &refs)?;
+                    if let Some(quantities) = args["quantities"].as_array() {
+                        for quantity in quantities {
+                            let evidence: Vec<String> = quantity["evidenceRefs"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect();
+                            txn.validate_evidence_refs(rid, &evidence)?;
+                        }
+                    }
+                    crate::research::compare::compare(args, &candidates)?
+                }
                 _ => return Err(fail(Code::InvalidArgument, "Unknown journal operation")),
             };
             response::success(
@@ -598,6 +654,9 @@ struct SearchContinuation {
     paths: Vec<String>,
     no_progress: usize,
     page_progress: bool,
+}
+fn default_review_reads() -> u32 {
+    4
 }
 async fn search(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolReply> {
     let start = &args["start"];
@@ -908,9 +967,9 @@ fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
     }
     if let Some(reference) = selector["productRef"].as_str() {
         let stored = journal(inner)?.get_ref(reference, "product")?;
-        let target = stored.value["url"]
+        let target = stored.value["sku"]
             .as_str()
-            .or_else(|| stored.value["sku"].as_str())
+            .or_else(|| stored.value["url"].as_str())
             .ok_or_else(|| fail(Code::InvalidReference, "Product reference has no identity"))?
             .to_owned();
         return Ok(ResolvedProduct {
@@ -931,6 +990,25 @@ fn resolve_product(inner: &Inner, selector: &Value) -> Result<ResolvedProduct> {
         context_id: None,
         continuation: None,
     })
+}
+fn product_cache_key(target: &str) -> String {
+    if !target.is_empty() && target.chars().all(|c| c.is_ascii_digit()) {
+        return target.to_owned();
+    }
+    if let Some(url) = evidence::canonical_source_url(target)
+        && let Ok(url) = url::Url::parse(&url)
+        && let Some(segment) = url
+            .path()
+            .strip_prefix("/product/")
+            .and_then(|p| p.strip_suffix('/'))
+        && !segment.contains('/')
+    {
+        let sku = segment.rsplit('-').next().unwrap_or("");
+        if !sku.is_empty() && sku.chars().all(|c| c.is_ascii_digit()) {
+            return sku.to_owned();
+        }
+    }
+    target.to_owned()
 }
 async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolReply> {
     let selectors = args["products"]
@@ -960,9 +1038,48 @@ async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRe
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| vec!["characteristics".into()]);
-    let live = resolved
-        .iter()
-        .any(|item| item.as_ref().is_ok_and(|item| item.continuation.is_none()));
+    let names = args
+        .get("characteristicNames")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+    for result in &mut resolved {
+        if let Ok(item) = result
+            && let Some(cursor) = &item.continuation
+        {
+            let pinned_include = if cursor.include.is_empty() {
+                vec![cursor.section.clone()]
+            } else {
+                cursor.include.clone()
+            };
+            if names
+                .as_ref()
+                .is_some_and(|n| Some(n) != cursor.characteristic_names.as_ref())
+                || args
+                    .get("include")
+                    .is_some_and(|_| include != pinned_include)
+                || args
+                    .get("maxSourceReads")
+                    .is_some_and(|v| v.as_u64().map(|n| n as u32) != cursor.max_source_reads)
+            {
+                *result = Err(fail(
+                    Code::InvalidReference,
+                    "Product continuation settings cannot change",
+                ));
+            }
+        }
+    }
+    let live = resolved.iter().any(|item| {
+        item.as_ref().is_ok_and(|item| {
+            item.continuation
+                .as_ref()
+                .is_none_or(|c| c.offers_path.is_some())
+        })
+    });
     let _local_guard = if !live {
         Some(source_lock(inner, budget).await?)
     } else {
@@ -990,6 +1107,12 @@ async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRe
     if let Some(rid) = &rid {
         journal(inner)?.ensure_research(rid, context_id(&context)?)?;
     }
+    let read_limit = args["maxSourceReads"]
+        .as_u64()
+        .unwrap_or(if selectors.len() == 1 { 8 } else { 32 }) as u32;
+    let mut source_reads = 0u32;
+    let mut exhausted = false;
+    let mut cache = std::collections::BTreeMap::<String, ProductDetails>::new();
     let mut fetched = vec![];
     let fetch_deadline = budget.deadline - Duration::from_secs(5);
     for result in resolved {
@@ -1011,12 +1134,77 @@ async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRe
             )));
             continue;
         }
-        if let Some(continuation) = &product.continuation {
-            fetched.push(Ok((
-                continuation.raw.clone(),
-                vec![continuation.section.clone()],
-                product.continuation,
-                false,
+        if let Some(mut continuation) = product.continuation {
+            if let Some(path) = continuation.offers_path.take() {
+                if source_reads >= read_limit {
+                    exhausted = true;
+                    fetched.push(Err(fail(
+                        Code::SourceChanged,
+                        "Product source-read budget exhausted",
+                    )));
+                    continue;
+                }
+                let source = source_guard
+                    .as_mut()
+                    .expect("live source")
+                    .as_mut()
+                    .expect("initialized source");
+                let sku = continuation
+                    .raw
+                    .sku
+                    .clone()
+                    .ok_or_else(|| fail(Code::SourceChanged, "Offer cursor has no SKU"))?;
+                if Instant::now() >= fetch_deadline {
+                    fetched.push(Err(fail(
+                        Code::UpstreamTimeout,
+                        "Offer retrieval budget exhausted",
+                    )));
+                    continue;
+                }
+                let child = budget.cancel.child_token();
+                let retrieve = source.offers_page(&sku, &path, &child);
+                tokio::pin!(retrieve);
+                let outcome = tokio::select! { biased; result = &mut retrieve => result, _ = tokio::time::sleep_until(fetch_deadline) => { child.cancel(); let outcome = retrieve.await; let usage = match outcome { Ok((_,usage)) => usage, Err(error) => error.downcast_ref::<crate::ozon::model::ReadUsage>().cloned().unwrap_or_default() }; Err(fail(Code::UpstreamTimeout, "Offer retrieval budget exhausted").context(usage)) } };
+                match outcome {
+                    Ok((offers, usage)) => {
+                        source_reads += usage.source_reads;
+                        exhausted |= usage.budget_exhausted;
+                        continuation.raw.offers = Some(offers);
+                        continuation.offers_paths.push(path.clone());
+                        continuation.offset = 0;
+                        fetched.push(Ok((
+                            continuation.raw.clone(),
+                            vec![continuation.section.clone()],
+                            Some(continuation),
+                            true,
+                        )));
+                    }
+                    Err(error) => {
+                        source_reads += error
+                            .downcast_ref::<crate::ozon::model::ReadUsage>()
+                            .map_or(1, |u| u.source_reads);
+                        fetched.push(Err(error));
+                    }
+                }
+            } else {
+                fetched.push(Ok((
+                    continuation.raw.clone(),
+                    vec![continuation.section.clone()],
+                    Some(continuation),
+                    false,
+                )));
+            }
+            continue;
+        }
+        if let Some(raw) = cache.get(&product_cache_key(&product.target)) {
+            fetched.push(Ok((raw.clone(), include.clone(), None, true)));
+            continue;
+        }
+        if source_reads >= read_limit {
+            exhausted = true;
+            fetched.push(Err(fail(
+                Code::SourceChanged,
+                "Product source-read budget exhausted",
             )));
             continue;
         }
@@ -1034,9 +1222,27 @@ async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRe
             .expect("live source")
             .as_mut()
             .expect("initialized source");
-        let retrieve = source.product(&product.target, &child);
+        let options = ProductReadOptions {
+            description: include.iter().any(|s| s == "description"),
+            full_characteristics: include.iter().any(|s| s == "fullCharacteristics"),
+            offers: include.iter().any(|s| s == "offers"),
+            duty: include.iter().any(|s| s == "customsDuty"),
+            max_source_reads: read_limit - source_reads,
+        };
+        let retrieve = source.product(&product.target, &options, &child);
         tokio::pin!(retrieve);
-        let result = tokio::select! {biased; result=&mut retrieve=>result,_=tokio::time::sleep_until(fetch_deadline)=>{child.cancel();let _=retrieve.await;Err(fail(Code::UpstreamTimeout,"Product retrieval budget exhausted"))}};
+        let result = tokio::select! {biased; result=&mut retrieve=>result,_=tokio::time::sleep_until(fetch_deadline)=>{child.cancel();let outcome=retrieve.await; let usage=match outcome { Ok(raw)=>raw.read_usage, Err(error)=>error.downcast_ref::<crate::ozon::model::ReadUsage>().cloned().unwrap_or_default() }; Err(fail(Code::UpstreamTimeout,"Product retrieval budget exhausted").context(usage))}};
+        if let Ok(raw) = &result {
+            source_reads += raw.read_usage.source_reads;
+            exhausted |= raw.read_usage.budget_exhausted;
+            cache.insert(product_cache_key(&product.target), raw.clone());
+        } else if let Err(error) = &result {
+            let used = error
+                .downcast_ref::<crate::ozon::model::ReadUsage>()
+                .map(|u| u.source_reads)
+                .unwrap_or(1);
+            source_reads = source_reads.saturating_add(used).min(read_limit);
+        }
         fetched.push(result.map(|raw| (raw, include.clone(), None, true)));
     }
     let confirmation = match (&before, source_guard.as_mut()) {
@@ -1072,27 +1278,21 @@ async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRe
                     continue;
                 }
                 let result = txn.stage(|txn| {
-                    let value = observations::normalize_product(
-                        &raw,
-                        selector,
-                        txn,
-                        &rid,
-                        context_id(&context)?,
-                        &include,
-                        continuation.as_ref(),
-                    )?;
+                    let selected_names = continuation.as_ref().and_then(|c| c.characteristic_names.as_deref()).or(names.as_deref());
+                    let pinned_include = continuation.as_ref().map(|c| c.include.as_slice()).filter(|i| !i.is_empty()).unwrap_or(&include);
+                    let pinned_limit = continuation.as_ref().and_then(|c| c.max_source_reads).or(args["maxSourceReads"].as_u64().map(|n| n as u32));
+                    let mut value = observations::normalize_product(&raw, selector, txn, &rid, context_id(&context)?, &include, selected_names, pinned_include, pinned_limit, continuation.as_ref())?;
                     validate_evidence(&rid, &context, &value.evidence)?;
-                    response::success(
-                        "ozon_get_products",
-                        envelope(
-                            Some(&rid),
-                            json!({"results":[value.data.clone()]}),
-                            &context,
-                            vec![],
-                            &evidence::now(),
-                        ),
-                        vec![],
-                    )?;
+                    let check = |value: &Normalized| {
+                        let mut all_rows = rows.clone(); all_rows.push(value.data.clone());
+                        let mut warnings = normalized.warnings.clone(); warnings.extend(value.warnings.clone());
+                        response::success("ozon_get_products", envelope(Some(&rid), json!({"results":all_rows,"usage":{"sourceReads":source_reads,"sourceReadLimit":read_limit,"budgetExhausted":exhausted,"unit":"logical_source_reads"}}), &context, warnings, &evidence::now()), vec![])
+                    };
+                    if let Err(error) = check(&value) {
+                        if error::code(&error) != "RESULT_TOO_LARGE" || continuation.is_some() { return Err(error); }
+                        observations::compact_product_sections(&mut value, &raw, txn, &rid, &include, selected_names, pinned_include, pinned_limit, continuation.as_ref())?;
+                        check(&value)?;
+                    }
                     Ok(value)
                 });
                 match result {
@@ -1131,7 +1331,7 @@ async fn products(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRe
                 "ozon_get_products",
                 envelope(
                     Some(&rid),
-                    json!({"results":rows}),
+                    json!({"results":rows,"usage":{"sourceReads":source_reads,"sourceReadLimit":read_limit,"budgetExhausted":exhausted,"unit":"logical_source_reads"}}),
                     &context,
                     normalized.warnings,
                     &observed,
@@ -1158,6 +1358,14 @@ struct ReviewContinuation {
     paths: Vec<String>,
     no_progress: usize,
     page_progress: bool,
+    #[serde(default)]
+    include_details: bool,
+    #[serde(default)]
+    include_seller_replies: bool,
+    #[serde(default)]
+    text_limit: Option<usize>,
+    #[serde(default = "default_review_reads")]
+    max_source_reads: u32,
 }
 async fn reviews(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolReply> {
     let start = &args["start"];
@@ -1182,6 +1390,18 @@ async fn reviews(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRep
             || args
                 .get("includeFacets")
                 .is_some_and(|include| include.as_bool() != Some(state.include_facets))
+            || args
+                .get("includeDetails")
+                .is_some_and(|v| v.as_bool() != Some(state.include_details))
+            || args
+                .get("includeSellerReplies")
+                .is_some_and(|v| v.as_bool() != Some(state.include_seller_replies))
+            || args
+                .get("textLimit")
+                .is_some_and(|v| v.as_u64().map(|n| n as usize) != state.text_limit)
+            || args
+                .get("maxSourceReads")
+                .is_some_and(|v| v.as_u64() != Some(state.max_source_reads as u64))
         {
             return Err(fail(
                 Code::InvalidReference,
@@ -1219,26 +1439,37 @@ async fn reviews(inner: &Inner, args: &Value, budget: &Budget) -> Result<ToolRep
             paths: vec![],
             no_progress: 0,
             page_progress: false,
+            include_details: args["includeDetails"].as_bool().unwrap_or(false),
+            include_seller_replies: args["includeSellerReplies"].as_bool().unwrap_or(false),
+            text_limit: args["textLimit"].as_u64().map(|n| n as usize),
+            max_source_reads: args["maxSourceReads"].as_u64().unwrap_or(4) as u32,
         }
     };
     if state.raw.is_some() {
         let _source_guard = source_lock(inner, budget).await?;
         let context = cached_context(&*journal(inner)?)?;
         verify(&stored, Some(&rid), context_id(&context)?)?;
-        return commit_reviews(inner, &rid, &context, state, budget);
+        return commit_reviews(inner, &rid, &context, state, budget, false);
     }
     let mut guard = source(inner, budget).await?;
     let source = guard.as_mut().expect("initialized source");
     let before = source.context(&budget.cancel).await?;
     let context = observed_context(&before);
     verify(&stored, Some(&rid), context_id(&context)?)?;
-    let raw = source.reviews(&state.path, &budget.cancel).await?;
+    let options = ReviewReadOptions {
+        include_details: state.include_details,
+        include_seller_replies: state.include_seller_replies,
+        max_source_reads: state.max_source_reads,
+    };
+    let raw = source
+        .reviews(&state.path, &options, &budget.cancel)
+        .await?;
     let after = source.context(&budget.cancel).await?;
     confirm(&before, &after)?;
     budget.check()?;
     state.raw = Some(raw);
     state.offset = 0;
-    commit_reviews(inner, &rid, &context, state, budget)
+    commit_reviews(inner, &rid, &context, state, budget, true)
 }
 fn commit_reviews(
     inner: &Inner,
@@ -1246,6 +1477,7 @@ fn commit_reviews(
     context: &Value,
     mut state: ReviewContinuation,
     budget: &Budget,
+    live: bool,
 ) -> Result<ToolReply> {
     let raw = state
         .raw
@@ -1283,7 +1515,14 @@ fn commit_reviews(
                     "Invalid captured review position",
                 ));
             }
+            let mut text_units = 0usize;
             while offset < raw.reviews.len() && indices.len() < state.limit {
+                let item = &raw.reviews[offset];
+                let units: usize = [&item.comment, &item.pros, &item.cons].iter().filter_map(|s| s.as_ref()).map(|s| s.encode_utf16().count()).sum();
+                let reply_units = if state.include_seller_replies { 4000 } else { 0 };
+                let shown = units.min(state.text_limit.unwrap_or(12000).min(12000) * 2) + reply_units;
+                if !indices.is_empty() && text_units + shown > 30000 { break; }
+                text_units += shown;
                 let key =
                     observations::review_identity(&raw.reviews[offset], &identity_url, offset)?;
                 if seen.insert(key.clone()) {
@@ -1338,6 +1577,10 @@ fn commit_reviews(
                     chain_complete: state.chain_complete,
                     paths: state.paths.clone(),
                     no_progress: state.no_progress,
+                    include_details: state.include_details,
+                    include_seller_replies: state.include_seller_replies,
+                    text_limit: state.text_limit,
+                    max_source_reads: state.max_source_reads,
                     page_progress: if remainder {
                         state.page_progress
                     } else {
@@ -1367,8 +1610,12 @@ fn commit_reviews(
                     chain_complete: state.chain_complete,
                     include_facets: state.include_facets,
                     next_cursor: next.as_deref(),
+                    text_limit: state.text_limit,
+                    include_details: state.include_details,
+                    include_seller_replies: state.include_seller_replies,
                 },
             )?;
+            normalized.data["usage"] = json!({"sourceReads":if live {raw.read_usage.source_reads} else {0},"sourceReadLimit":state.max_source_reads,"budgetExhausted":live && raw.read_usage.budget_exhausted,"unit":"logical_source_reads"});
             if stalled {
                 normalized.data["coverage"]["completeness"] = json!("partial");
                 normalized.warnings.push(observations::warning(
@@ -1563,9 +1810,17 @@ struct FakeSource {
     search_args: Vec<SearchArgs>,
     products: VecDeque<FakeAction<ProductDetails>>,
     reviews: VecDeque<FakeAction<ReviewPage>>,
+    offer_pages: VecDeque<
+        FakeAction<(
+            crate::ozon::model::ProductOffers,
+            crate::ozon::model::ReadUsage,
+        )>,
+    >,
     images: VecDeque<FakeAction<images::FetchedImage>>,
     entered: Arc<tokio::sync::Notify>,
     targets: Vec<String>,
+    product_options: Vec<ProductReadOptions>,
+    review_options: Vec<ReviewReadOptions>,
 }
 #[cfg(test)]
 impl FakeSource {
@@ -1584,9 +1839,12 @@ impl FakeSource {
             search_args: vec![],
             products: VecDeque::new(),
             reviews: VecDeque::new(),
+            offer_pages: VecDeque::new(),
             images: VecDeque::new(),
             entered: Arc::new(tokio::sync::Notify::new()),
             targets: vec![],
+            product_options: vec![],
+            review_options: vec![],
         }
     }
     async fn context(&mut self, cancel: &CancellationToken) -> Result<ContextObservation> {
@@ -1733,11 +1991,16 @@ mod tests {
                     sku: "202".into(),
                     title: Some("Синий".into()),
                     url: None,
+                    displayed_price_minor: None,
+                    available: None,
                 }],
                 has_next: Some(false),
                 next_path: None,
             },
             warnings: vec![],
+            full_characteristics: None,
+            offers: None,
+            read_usage: Default::default(),
         }
     }
     fn review(id: Option<&str>, comment: &str) -> Review {
@@ -1754,6 +2017,7 @@ mod tests {
             date: Some("2026-09-30".into()),
             purchased: Some(true),
             variant_label: Some("XL".into()),
+            details: None,
         }
     }
     fn review_page(mut reviews: Vec<Review>, path: &str, next: Option<&str>) -> ReviewPage {
@@ -1775,6 +2039,8 @@ mod tests {
             refinements: vec![],
             aggregation_scope: ReviewAggregationScope::MultipleVariants,
             warnings: vec![],
+            star_counts: None,
+            read_usage: Default::default(),
         }
     }
     fn fetched_image() -> images::FetchedImage {
@@ -1833,7 +2099,7 @@ mod tests {
             context["data"]["capabilities"].as_array().unwrap().len(),
             17
         );
-        assert_eq!(context["data"]["capabilities"][8]["status"], "unsupported");
+        assert_eq!(context["data"]["capabilities"][8]["status"], "supported");
         let search = call(
             &application,
             "ozon_search",
@@ -2107,8 +2373,10 @@ mod tests {
     #[tokio::test]
     async fn mixed_product_errors_preserve_order_and_url_null_variant_uses_sku() {
         let mut fake = FakeSource::new();
-        fake.products
-            .push_back(FakeAction::Observation(product("101")));
+        let mut populated = product("101");
+        populated.variants.items[0].displayed_price_minor = Some(99000);
+        populated.variants.items[0].available = Some(true);
+        fake.products.push_back(FakeAction::Observation(populated));
         let mut malformed = product("666");
         malformed.name = Some("x".repeat(1001));
         fake.products.push_back(FakeAction::Observation(malformed));
@@ -2124,6 +2392,10 @@ mod tests {
             vec!["error", "ok", "error"]
         );
         let rid = initial["researchId"].as_str().unwrap();
+        let variant_row = &rows[1]["product"]["variants"]["items"][0];
+        assert_eq!(variant_row["prices"][0]["amountMinor"], 99000);
+        assert_eq!(variant_row["prices"][0]["type"], "unknown");
+        assert_eq!(variant_row["availability"], "available");
         let variant = rows[1]["product"]["variants"]["items"][0]["productRef"]
             .as_str()
             .unwrap();
@@ -2309,16 +2581,473 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn large_product_batch_uses_section_cursors_without_losing_rows() {
+        let mut fake = FakeSource::new();
+        let mut selectors = Vec::new();
+        for sku in 101..=108 {
+            let mut card = product(&sku.to_string());
+            card.description.text = "т".repeat(12000);
+            card.read_usage.source_reads = 1;
+            fake.products.push_back(FakeAction::Observation(card));
+            selectors.push(json!({"sku":sku.to_string()}));
+        }
+        let (application, _dir) = fixture(fake).await;
+        let result = call(
+            &application,
+            "ozon_get_products",
+            json!({"products":selectors,"include":["description"]}),
+        )
+        .await;
+        let rid = result["researchId"].as_str().unwrap();
+        let rows = result["data"]["results"].as_array().unwrap();
+        assert_eq!(rows.len(), 8);
+        assert!(rows.iter().all(|r| r["status"] == "ok"));
+        let cursor = rows
+            .iter()
+            .find_map(|r| r["product"]["description"]["nextCursor"].as_str())
+            .expect("large batch has a continuation");
+        let next = call(
+            &application,
+            "ozon_get_products",
+            json!({"researchId":rid,"products":[{"cursor":cursor}]}),
+        )
+        .await;
+        assert_eq!(
+            next["data"]["results"][0]["product"]["description"]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            6000
+        );
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_characteristics_cursor_makes_progress_and_preserves_source_truncation() {
+        let mut fake = FakeSource::new();
+        let mut card = product("991");
+        let rows = (0..40)
+            .map(|i| Characteristic {
+                source_index: i,
+                source_locator: format!("/full/{i}"),
+                label: format!("Field {i}"),
+                value: "x".repeat(2000),
+            })
+            .collect();
+        let mut source = coverage(40);
+        source.local_truncated = true;
+        card.full_characteristics = Some(FullCharacteristics {
+            items: rows,
+            source,
+            acquisition: acquisition("https://www.ozon.ru/product/991/"),
+        });
+        card.read_usage.source_reads = 1;
+        fake.products.push_back(FakeAction::Observation(card));
+        let (app, _dir) = fixture(fake).await;
+        let first = call(
+            &app,
+            "ozon_get_products",
+            json!({"products":[{"sku":"991"}],"include":["fullCharacteristics"]}),
+        )
+        .await;
+        let rid = first["researchId"].as_str().unwrap();
+        let mut section = first["data"]["results"][0]["product"]["fullCharacteristics"].clone();
+        let mut count = 0;
+        loop {
+            count += section["items"].as_array().unwrap().len();
+            assert_eq!(section["truncated"], true);
+            let Some(cursor) = section["nextCursor"].as_str() else {
+                break;
+            };
+            let next = call(
+                &app,
+                "ozon_get_products",
+                json!({"researchId":rid,"products":[{"cursor":cursor}]}),
+            )
+            .await;
+            section = next["data"]["results"][0]["product"]["fullCharacteristics"].clone();
+            assert!(!section["items"].as_array().unwrap().is_empty());
+            assert!(count < 40);
+        }
+        assert_eq!(count, 40);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_offer_rows_page_by_measured_size() {
+        let mut fake = FakeSource::new();
+        let mut card = product("994");
+        let offers = (0..20)
+            .map(|i| ProductOffer {
+                sku: (2000 + i).to_string(),
+                seller: Seller {
+                    name: "😀".repeat(500),
+                    rating: None,
+                    url: None,
+                },
+                card_price_minor: None,
+                regular_price_minor: Some(100),
+                available: None,
+                delivery_label: Some("😀".repeat(1000)),
+                url: None,
+            })
+            .collect();
+        card.offers = Some(ProductOffers {
+            items: offers,
+            source: coverage(20),
+            acquisition: acquisition("https://www.ozon.ru/product/994/"),
+            has_next: Some(false),
+            next_path: None,
+        });
+        fake.products.push_back(FakeAction::Observation(card));
+        let (app, _dir) = fixture(fake).await;
+        let first = call(
+            &app,
+            "ozon_get_products",
+            json!({"products":[{"sku":"994"}],"include":["offers"]}),
+        )
+        .await;
+        let rid = first["researchId"].as_str().unwrap();
+        assert_eq!(
+            first["data"]["results"][0]["status"], "ok",
+            "{}",
+            first["data"]["results"][0]
+        );
+        let mut section = first["data"]["results"][0]["product"]["offers"].clone();
+        let mut total = 0;
+        loop {
+            let count = section["items"].as_array().unwrap().len();
+            assert!(count > 0);
+            total += count;
+            let Some(cursor) = section["nextCursor"].as_str() else {
+                break;
+            };
+            let next = call(
+                &app,
+                "ozon_get_products",
+                json!({"researchId":rid,"products":[{"cursor":cursor}]}),
+            )
+            .await;
+            section = next["data"]["results"][0]["product"]["offers"].clone();
+            assert!(total < 20);
+        }
+        assert_eq!(total, 20);
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reply_metadata_is_included_in_page_budget() {
+        let mut fake = FakeSource::new();
+        fake.products
+            .push_back(FakeAction::Observation(product("995")));
+        let reviews = (0..7)
+            .map(|i| {
+                let mut item = review(Some(&format!("{i}")), "x");
+                item.details = Some(ReviewDetails {
+                    helpful: None,
+                    unhelpful: None,
+                    item_sku: None,
+                    seller_replies: (0..9)
+                        .map(|_| SellerReply {
+                            text: "x".into(),
+                            published_at: None,
+                            author_label: Some("a".repeat(1000)),
+                        })
+                        .collect(),
+                    replies_status: SourceSectionStatus::Available,
+                    replies_acquisition: acquisition(
+                        "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid",
+                    ),
+                });
+                item
+            })
+            .collect();
+        let mut page = review_page(reviews, "/product/995/?tab=reviews", None);
+        page.star_counts = Some(vec![StarCount {
+            stars: 5,
+            count: 42,
+        }]);
+        fake.reviews.push_back(FakeAction::Observation(page));
+        let (app, _dir) = fixture(fake).await;
+        let card = call(
+            &app,
+            "ozon_get_products",
+            json!({"products":[{"sku":"995"}]}),
+        )
+        .await;
+        let rid = card["researchId"].as_str().unwrap();
+        let pref = card["data"]["results"][0]["product"]["productRef"]
+            .as_str()
+            .unwrap();
+        let result = call(&app, "ozon_get_reviews", json!({"researchId":rid,"start":{"productRef":pref},"includeSellerReplies":true,"maxSourceReads":8,"textLimit":80})).await;
+        assert_eq!(result["data"]["reviews"].as_array().unwrap().len(), 7);
+        assert_eq!(result["data"]["aggregate"]["starCounts"][0]["count"], 42);
+        assert!(
+            result["data"]["reviews"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["sellerReplies"]["truncated"] == true)
+        );
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn later_search_candidate_keeps_unselected_requirement_for_local_comparison() {
+        let mut fake = FakeSource::new();
+        fake.searches
+            .push_back(FakeAction::Observation(search_page(&["941"], None)));
+        fake.searches
+            .push_back(FakeAction::Observation(search_page(&["942"], None)));
+        let mut first = product("941");
+        first.characteristics[0].label = "Материал".into();
+        first.characteristics[0].value = "пластик".into();
+        first.characteristics.truncate(1);
+        let mut second = product("942");
+        second.characteristics[0].label = "Материал".into();
+        second.characteristics[0].value = "сталь".into();
+        second.characteristics.truncate(1);
+        second.card_price_minor = Some(90000);
+        fake.products.push_back(FakeAction::Observation(first));
+        fake.products.push_back(FakeAction::Observation(second));
+        let (app, _dir) = fixture(fake).await;
+        let search1 = call(&app, "ozon_search", json!({"start":{"query":"first"}})).await;
+        let rid = search1["researchId"].as_str().unwrap();
+        let search2 = call(
+            &app,
+            "ozon_search",
+            json!({"researchId":rid,"start":{"query":"later"}}),
+        )
+        .await;
+        let a = search1["data"]["items"][0]["productRef"].as_str().unwrap();
+        let b = search2["data"]["items"][0]["productRef"].as_str().unwrap();
+        let cards = call(&app, "ozon_get_products", json!({"researchId":rid,"products":[{"productRef":a},{"productRef":b}],"include":["characteristics"],"characteristicNames":["Другой"]})).await;
+        let a = cards["data"]["results"][0]["product"]["productRef"]
+            .as_str()
+            .unwrap();
+        let b = cards["data"]["results"][1]["product"]["productRef"]
+            .as_str()
+            .unwrap();
+        let result = call(&app, "ozon_compare_products", json!({"researchId":rid,"productRefs":[a,b],"sortBy":"price","requirements":[{"name":"Материал","equals":"сталь"},{"name":"Отсутствует","equals":"да"}]})).await;
+        let rows = result["data"]["rows"].as_array().unwrap();
+        assert_eq!(rows[0]["sku"], "942");
+        assert_eq!(rows[0]["requirements"][0]["status"], "matches");
+        assert_eq!(rows[1]["requirements"][0]["status"], "does_not_match");
+        assert_eq!(rows[0]["requirements"][1]["status"], "unknown");
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_offers_continuation_reads_once_and_stops_on_cycle() {
+        let path = "/modal/otherOffersFromSellers?product_id=993&sort=price&page=2";
+        let mut fake = FakeSource::new();
+        let mut card = product("993");
+        let offers = ProductOffers {
+            items: vec![],
+            source: coverage(0),
+            acquisition: acquisition("https://www.ozon.ru/product/993/"),
+            has_next: Some(true),
+            next_path: Some(path.into()),
+        };
+        card.offers = Some(offers.clone());
+        card.read_usage.source_reads = 1;
+        fake.products.push_back(FakeAction::Observation(card));
+        fake.offer_pages.push_back(FakeAction::Observation((
+            offers,
+            ReadUsage {
+                source_reads: 1,
+                budget_exhausted: false,
+            },
+        )));
+        let (app, _dir) = fixture(fake).await;
+        let first = call(
+            &app,
+            "ozon_get_products",
+            json!({"products":[{"sku":"993"}],"include":["offers"]}),
+        )
+        .await;
+        let rid = first["researchId"].as_str().unwrap();
+        let cursor = first["data"]["results"][0]["product"]["offers"]["nextCursor"]
+            .as_str()
+            .unwrap();
+        let next = call(
+            &app,
+            "ozon_get_products",
+            json!({"researchId":rid,"products":[{"cursor":cursor}]}),
+        )
+        .await;
+        assert_eq!(next["data"]["usage"]["sourceReads"], 1);
+        assert!(next["data"]["results"][0]["product"]["offers"]["nextCursor"].is_null());
+        assert!(
+            next["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == "CONTINUATION_STALLED")
+        );
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_seller_replies_are_explicitly_partial_and_review_stays_available() {
+        let mut fake = FakeSource::new();
+        fake.products
+            .push_back(FakeAction::Observation(product("992")));
+        let mut item = review(Some("id"), "review");
+        item.details = Some(ReviewDetails {
+            helpful: Some(2),
+            unhelpful: None,
+            item_sku: Some("992".into()),
+            seller_replies: (0..9)
+                .map(|_| SellerReply {
+                    text: "x".repeat(7000),
+                    published_at: None,
+                    author_label: Some("Seller".into()),
+                })
+                .collect(),
+            replies_status: SourceSectionStatus::Available,
+            replies_acquisition: acquisition(
+                "https://www.ozon.ru/api/composer-api.bx/_action/rpGetCommentsByReviewUuid",
+            ),
+        });
+        fake.reviews.push_back(FakeAction::Observation(review_page(
+            vec![item],
+            "/product/992/?tab=reviews",
+            None,
+        )));
+        let (app, _dir) = fixture(fake).await;
+        let card = call(
+            &app,
+            "ozon_get_products",
+            json!({"products":[{"sku":"992"}]}),
+        )
+        .await;
+        let rid = card["researchId"].as_str().unwrap();
+        let pref = card["data"]["results"][0]["product"]["productRef"]
+            .as_str()
+            .unwrap();
+        let result = call(&app, "ozon_get_reviews", json!({"researchId":rid,"start":{"productRef":pref},"includeDetails":true,"includeSellerReplies":true,"textLimit":80})).await;
+        let row = &result["data"]["reviews"][0];
+        assert_eq!(row["text"], "review");
+        assert_eq!(row["sellerReplies"]["truncated"], true);
+        assert_eq!(row["sellerReplies"]["status"], "partial");
+        app.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_review_expands_locally_and_product_snapshot_preserves_unfiltered_characteristics()
+    {
+        let mut fake = FakeSource::new();
+        let mut card = product("901");
+        card.read_usage.source_reads = 1;
+        fake.products.push_back(FakeAction::Observation(card));
+        let long_text = "аб😀".repeat(9000);
+        let mut page = review_page(
+            vec![review(Some("long"), &long_text)],
+            "/product/901/?tab=reviews",
+            None,
+        );
+        page.read_usage.source_reads = 1;
+        fake.reviews.push_back(FakeAction::Observation(page));
+        let (application, _dir) = fixture(fake).await;
+        let started = std::time::Instant::now();
+        let products = call(&application, "ozon_get_products", json!({"products":[{"sku":"901"},{"url":"https://www.ozon.ru/product/901/"}],"include":["characteristics"],"characteristicNames":["Размер"],"maxSourceReads":1})).await;
+        assert_eq!(products["data"]["usage"]["sourceReads"], 1);
+        let rid = products["researchId"].as_str().unwrap();
+        let product_ref = products["data"]["results"][0]["product"]["productRef"]
+            .as_str()
+            .unwrap();
+        assert_eq!(products["data"]["results"][1]["status"], "ok");
+        let second_ref = products["data"]["results"][1]["product"]["productRef"]
+            .as_str()
+            .unwrap();
+        let before_compare = {
+            let guard = application.inner.source.lock().await;
+            match guard.as_ref().unwrap() {
+                SourceBackend::Fake(fake) => fake.targets.len(),
+                _ => unreachable!(),
+            }
+        };
+        let compared = call(
+            &application,
+            "ozon_compare_products",
+            json!({"researchId":rid,"productRefs":[product_ref,second_ref]}),
+        )
+        .await;
+        let after_compare = {
+            let guard = application.inner.source.lock().await;
+            match guard.as_ref().unwrap() {
+                SourceBackend::Fake(fake) => fake.targets.len(),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(before_compare, after_compare);
+        assert_eq!(compared["data"]["historical"], true);
+        let snapshot = call(
+            &application,
+            "ozon_get_research",
+            json!({"researchId":rid,"section":"products","productRefs":[product_ref]}),
+        )
+        .await;
+        assert_eq!(
+            snapshot["data"]["payload"][0]["characteristics"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let reviews = call(
+            &application,
+            "ozon_get_reviews",
+            json!({"researchId":rid,"start":{"productRef":product_ref},"textLimit":80}),
+        )
+        .await;
+        let row = &reviews["data"]["reviews"][0];
+        assert_eq!(row["textTruncated"], true);
+        let reference = row["reviewRef"].as_str().unwrap();
+        let mut restored = String::new();
+        let mut offset = 0;
+        loop {
+            let result = call(&application, "ozon_get_research", json!({"researchId":rid,"section":"reviews","reviewRefs":[reference],"textOffset":offset,"textLimit":12000})).await;
+            let part = &result["data"]["payload"][0];
+            restored.push_str(part["text"].as_str().unwrap());
+            match part["nextTextOffset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(restored, long_text);
+        {
+            let guard = application.inner.source.lock().await;
+            let SourceBackend::Fake(fake) = guard.as_ref().unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(fake.targets.len(), 1);
+            assert_eq!(fake.review_options.len(), 1);
+            assert!(!fake.product_options[0].description && !fake.product_options[0].offers);
+        }
+        eprintln!(
+            "FIXTURE duplicate_product_calls={before_compare} compare_extra_product_calls={} review_calls=1 product_response_utf16={} product_response_bytes={} review_response_utf16={} review_response_bytes={} elapsed_ms={}",
+            after_compare - before_compare,
+            response::serialized_utf16_len(&products).unwrap(),
+            serde_json::to_vec(&products).unwrap().len(),
+            response::serialized_utf16_len(&reviews).unwrap(),
+            serde_json::to_vec(&reviews).unwrap().len(),
+            started.elapsed().as_millis()
+        );
+        application.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn source_projection_fixture_reaches_public_reviews_without_loss_or_private_fields() {
         let golden: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/domain/source-projection.json"
         ))
         .unwrap();
         let mut raw = crate::ozon::decode::parse_reviews(&golden["projected"], 30);
-        assert_eq!(
-            serde_json::to_value(&raw.reviews).unwrap(),
-            golden["reviews"]
-        );
+        let expected: Vec<Review> = serde_json::from_value(golden["reviews"].clone()).unwrap();
+        assert_eq!(raw.reviews, expected);
         raw.acquisition = acquisition("https://www.ozon.ru/product/901/reviews/");
         let mut fake = FakeSource::new();
         fake.products

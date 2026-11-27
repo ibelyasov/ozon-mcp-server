@@ -62,6 +62,38 @@ class ProductSectionTruncationTests(unittest.TestCase):
         output = self.with_description(truncated=True, has_next=False, next_cursor=None)
         self.assertTrue(any("truncated section cannot have hasNext=false" in error for error in self.errors(output)))
 
+class ResearchDepthContractsTests(unittest.TestCase):
+    def schema(self, name: str) -> dict:
+        return validator.standalone(validator.load(f"schemas/{name}.schema.json"))
+
+    def test_opt_in_bounds_and_strict_quantities(self) -> None:
+        products = self.schema("ozon_get_products.input")
+        self.assertFalse(validator.schema_errors(products, {"products": [{"sku": "123"}], "include": ["fullCharacteristics", "offers", "customsDuty"], "maxSourceReads": 32, "characteristicNames": ["Вес"]}))
+        self.assertTrue(validator.schema_errors(products, {"products": [{"sku": "123"}], "maxSourceReads": 33}))
+        self.assertTrue(validator.schema_errors(products, {"products": [{"cursor": "c"}], "characteristicNames": ["Вес"]}))
+        reviews = self.schema("ozon_get_reviews.input")
+        self.assertFalse(validator.schema_errors(reviews, {"start": {"productRef": "p"}, "textLimit": 80, "includeDetails": True, "maxSourceReads": 16}))
+        self.assertTrue(validator.schema_errors(reviews, {"start": {"productRef": "p"}, "textLimit": 79}))
+        compare = self.schema("ozon_compare_products.input")
+        args = {"researchId": "r", "productRefs": ["p1", "p2"], "quantities": [{"productRef": "p1", "amount": 1, "unit": "г", "evidenceRefs": ["e"], "characteristicName": "Вес"}]}
+        self.assertFalse(validator.schema_errors(compare, args))
+        del args["quantities"][0]["characteristicName"]
+        self.assertTrue(validator.schema_errors(compare, args))
+
+    def test_review_fragment_requires_truthful_length(self) -> None:
+        output = validator.load("examples/positive/ozon_get_reviews.json")["output"]
+        row = output["data"]["reviews"][0]
+        row.update(text="short", textTruncated=True, textLength=5)
+        self.assertTrue(validator.semantic_errors("ozon_get_reviews.output.schema.json", output))
+        row["textLength"] = 6
+        self.assertFalse(validator.semantic_errors("ozon_get_reviews.output.schema.json", output))
+
+    def test_expansion_selection_is_bounded(self) -> None:
+        schema = self.schema("ozon_get_research.input")
+        self.assertFalse(validator.schema_errors(schema, {"researchId": "r", "section": "reviews", "reviewRefs": ["x"], "textOffset": 0, "textLimit": 12000}))
+        self.assertTrue(validator.schema_errors(schema, {"researchId": "r", "section": "products", "productRefs": [str(i) for i in range(9)]}))
+        self.assertTrue(validator.schema_errors(schema, {"researchId": "r", "section": "reviews", "reviewRefs": ["x"], "cursor": "c"}))
+
 
 if __name__ == "__main__":
     unittest.main()

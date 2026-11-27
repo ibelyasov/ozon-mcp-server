@@ -31,6 +31,7 @@ PROTOCOL_VERSION = "2025-11-25"
 EXPECTED_TOOLS = {
     "ozon_get_context", "ozon_search", "ozon_get_products", "ozon_get_reviews",
     "ozon_get_images", "ozon_list_research", "ozon_get_research", "ozon_append_research_note",
+    "ozon_compare_products",
 }
 # Service deadline is 55 seconds; five seconds allow transport/cleanup delivery.
 CALL_TIMEOUT = 60.0
@@ -53,7 +54,7 @@ def replay_data_matches(kind: str, expected: dict[str, Any], actual: dict[str, A
         refinement_reference_fields = ("searchRef",)
     elif kind == "reviews":
         rows_key = "reviews"
-        row_reference_fields = ("evidenceRefs", "imageRefs")
+        row_reference_fields = ("reviewRef", "evidenceRefs", "imageRefs")
         refinement_reference_fields = ("reviewSearchRef",)
     else:
         raise ValueError(f"unsupported replay data kind: {kind}")
@@ -464,6 +465,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, help="new private disposable root; default: fresh /tmp directory")
     parser.add_argument("--output-dir", type=Path, required=True, help="new artifact directory; retained after cleanup")
     parser.add_argument("--query", action="append", dest="queries", help="repeat generic marketplace queries")
+    parser.add_argument("--headless", action="store_true", help="explicit diagnostic headless mode; default: visible browser")
     parser.add_argument("--crash-restart", action="store_true", help="kill only the owned broker and test verified Chrome recovery")
     parser.add_argument("--total-timeout", type=float, default=600.0, help="whole observation budget in seconds (default: 600)")
     return parser.parse_args()
@@ -499,7 +501,7 @@ def run_observations(clients: list[McpClient], contracts: Contracts, report: dic
     for number, query in enumerate(queries):
         _, page = tool_call(clients[number % 2], "ozon_search",
                             {"start": {"query": query, "priceRange": {"maxMinor": 10000000}},
-                             "limit": 1, "includeFacets": True, "refinementLimit": 2}, contracts, report)
+                             "limit": 2, "includeFacets": True, "refinementLimit": 2}, contracts, report)
         if not page["data"]["items"]:
             report["partials"].append(f"query {number + 1}: no candidates observed")
             continue
@@ -527,15 +529,18 @@ def run_observations(clients: list[McpClient], contracts: Contracts, report: dic
     research_id = primary["researchId"]
     first = primary["data"]["items"][0]
     selectors = [{"sku": first["sku"]}, {"productRef": first["productRef"]}, {"url": first["url"]}]
+    if len(primary["data"]["items"]) > 1:
+        selectors.append({"sku": primary["data"]["items"][1]["sku"]})
+    expected_skus = {item["sku"] for item in primary["data"]["items"]}
     _, products = tool_call(clients[0], "ozon_get_products", {"products": selectors,
-                           "researchId": research_id, "include": ["characteristics", "description", "variants", "images"]}, contracts, report)
+                           "researchId": research_id, "include": ["characteristics", "description", "variants", "images", "fullCharacteristics", "offers", "customsDuty"]}, contracts, report)
     good = [item["product"] for item in products["data"]["results"] if item["status"] == "ok"]
     if len(good) != len(selectors):
         report["partials"].append("one or more product selectors did not yield a product")
     for product in good:
-        if product["sku"] != first["sku"]:
+        if product["sku"] not in expected_skus:
             raise SmokeFailure("product selector resolved to the wrong SKU")
-        for section in ("characteristics", "description", "variants", "images"):
+        for section in ("characteristics", "description", "variants", "images", "fullCharacteristics", "offers"):
             value = product[section]
             report["coverage"][f"product_{section}"] |= value["status"] == "available"
             if value["status"] != "available":
@@ -546,8 +551,23 @@ def run_observations(clients: list[McpClient], contracts: Contracts, report: dic
                           "researchId": research_id}, contracts, report)
                 report["coverage"]["product_section_pagination"] = True
     _, reviews = tool_call(clients[1], "ozon_get_reviews", {"start": {"productRef": first["productRef"]},
-                          "researchId": research_id, "limit": 1, "includeFacets": True}, contracts, report)
+                          "researchId": research_id, "limit": 1, "includeFacets": True,
+                          "includeDetails": True, "includeSellerReplies": True, "textLimit": 300}, contracts, report)
     report["coverage"]["reviews"] = bool(reviews["data"]["reviews"])
+    review_refs = [row["reviewRef"] for row in reviews["data"]["reviews"][:1]]
+    if review_refs:
+        tool_call(clients[0], "ozon_get_research", {"researchId": research_id,
+                  "section": "reviews", "reviewRefs": review_refs, "textLimit": 1000}, contracts, report)
+        report["coverage"]["local_review_expansion"] = True
+    if good:
+        tool_call(clients[1], "ozon_get_research", {"researchId": research_id,
+                  "section": "products", "productRefs": [good[0]["productRef"]]}, contracts, report)
+        report["coverage"]["local_product_expansion"] = True
+    distinct_refs = list({row["sku"]: row["productRef"] for row in good}.values())
+    if len(distinct_refs) >= 2:
+        tool_call(clients[1], "ozon_compare_products", {"researchId": research_id,
+                  "productRefs": distinct_refs[:2], "sortBy": "price"}, contracts, report)
+        report["coverage"]["local_comparison"] = True
     cursor = reviews["data"]["nextCursor"]
     if cursor:
         args = {"start": {"cursor": cursor}, "researchId": research_id, "limit": 1}
@@ -633,18 +653,21 @@ def main() -> int:
     output.mkdir(mode=0o700, parents=True)
     env = {key: value for key, value in os.environ.items() if not key.startswith("OZON_")}
     env.update(OZON_DATA_DIR=str(root), OZON_USER_DATA_DIR=str(profile),
-               OZON_BROWSER_EXECUTABLE=str(chrome), OZON_HEADLESS="true", OZON_IMAGE_DOH_FALLBACK="off")
+               OZON_BROWSER_EXECUTABLE=str(chrome), OZON_HEADLESS="true" if args.headless else "false", OZON_IMAGE_DOH_FALLBACK="off")
     started = time.monotonic()
     deadline = started + args.total_timeout
     coverage_names = ["shared_context", "region_verification", "account_observation", "search",
                       "search_pagination_replay", "search_refinements", "product_characteristics", "product_description",
-                      "product_variants", "product_images", "product_section_pagination", "reviews",
+                      "product_variants", "product_images", "product_fullCharacteristics", "product_offers",
+                      "local_review_expansion", "local_product_expansion", "local_comparison",
+                      "product_section_pagination", "reviews",
                       "review_pagination_replay", "review_refinements", "product_image_content", "review_image_content",
                       "cross_client_journal_notes", "restart_continuity", "crash_browser_recovery"]
     report: dict[str, Any] = {"status": "FAIL", "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        "browserMode": "headless" if args.headless else "visible", "profileKind": "fresh_disposable",
         "dataDir": str(root), "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "calls": [], "timingsMs": [], "partials": [], "failures": [], "images": [],
-        "coverage": {name: False for name in coverage_names}, "offers": "unsupported"}
+        "coverage": {name: False for name in coverage_names}, "offers": "supported; live observation pending"}
     clients: list[McpClient] = []
     broker = None
     handles = []
@@ -669,6 +692,8 @@ def main() -> int:
             clients.append(client)
             client.initialize()
             contracts.discovery(require_rpc_result(client.request("tools/list", {}), "tools/list"))
+        # Local transport remains independently observable if marketplace access is blocked.
+        tool_call(clients[0], "ozon_list_research", {"limit": 1}, contracts, report)
         research_id, note_id, operation_id, before = run_observations(clients, contracts, report, queries, output)
         old_record = ownership_record(profile, chrome)
         if args.crash_restart:

@@ -1332,6 +1332,7 @@ mod tests {
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config = Config::at(root.path().to_path_buf()).unwrap();
         config.browser.executable = Some(std::fs::canonicalize(executable).unwrap());
+        config.browser.headless = true;
         let mut browser = BrowserSession::new(&config).await.unwrap();
         browser
             .ensure_running(&CancellationToken::new())

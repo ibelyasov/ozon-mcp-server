@@ -607,7 +607,19 @@ fn parse_variants(page: &Value) -> ProductVariants {
                     (_, Some(value)) => Some(value),
                     _ => None,
                 };
-                items.push(ProductVariant { sku, title, url });
+                items.push(ProductVariant {
+                    sku,
+                    title,
+                    url,
+                    displayed_price_minor: price_to_minor(variant.get("price")),
+                    available: variant.get("availability").and_then(|v| {
+                        v.as_bool().or_else(|| match v.as_str()? {
+                            "inStock" => Some(true),
+                            "outOfStock" => Some(false),
+                            _ => None,
+                        })
+                    }),
+                });
             }
         }
     }
@@ -1051,8 +1063,256 @@ pub fn parse_details(base_page: &Value, page2: Option<&Value>) -> ProductDetails
         characteristics_complete: false,
         description,
         variants: parse_variants(base_page),
+        full_characteristics: None,
+        offers: None,
+        read_usage: Default::default(),
         warnings: Vec::new(),
     }
+}
+
+pub fn parse_full_characteristics(page: &Value) -> crate::ozon::model::FullCharacteristics {
+    use crate::ozon::model::FullCharacteristics;
+    let mut source = SourceCoverage::default();
+    let mut items = Vec::new();
+    for (key, state) in WidgetSet::new(page).all_named("webCharacteristics") {
+        let Some(groups) = state.get("characteristics").and_then(Value::as_array) else {
+            source.malformed_rows += 1;
+            continue;
+        };
+        source.present = true;
+        for (group_index, group) in groups.iter().enumerate() {
+            if !group.get("short").is_some_and(Value::is_array)
+                && !group.get("long").is_some_and(Value::is_array)
+            {
+                source.malformed_rows += 1;
+            }
+            for section in ["short", "long"] {
+                if let Some(rows) = group.get(section).and_then(Value::as_array) {
+                    for (index, row) in rows.iter().enumerate() {
+                        source.raw_rows += 1;
+                        let label = row.get("name").and_then(|v| text_from(Some(v)));
+                        let value = row
+                            .get("values")
+                            .and_then(Value::as_array)
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|x| text_from(x.get("text")))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .filter(|v| !v.is_empty());
+                        if let (Some(label), Some(value)) = (label, value) {
+                            items.push(Characteristic {
+                                source_index: source.raw_rows - 1,
+                                source_locator: format!(
+                                    "{}/characteristics/{group_index}/{section}/{index}",
+                                    widget_locator(&key)
+                                ),
+                                label,
+                                value,
+                            });
+                        } else {
+                            source.malformed_rows += 1;
+                        }
+                    }
+                } else if group.get(section).is_some() {
+                    source.malformed_rows += 1;
+                }
+            }
+        }
+    }
+    source.parsed_rows = items.len();
+    source.local_truncated = items.len() > 500;
+    items.truncate(500);
+    FullCharacteristics {
+        items,
+        source,
+        acquisition: page
+            .get("acquisition")
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+    }
+}
+pub fn empty_offers() -> crate::ozon::model::ProductOffers {
+    crate::ozon::model::ProductOffers {
+        items: Vec::new(),
+        source: SourceCoverage::default(),
+        acquisition: None,
+        has_next: None,
+        next_path: None,
+    }
+}
+pub fn parse_offers(page: &Value) -> crate::ozon::model::ProductOffers {
+    use crate::ozon::model::ProductOffer;
+    let mut result = empty_offers();
+    result.acquisition = page
+        .get("acquisition")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    for (_, state) in WidgetSet::new(page).all_named("webSellerList") {
+        let Some(rows) = state.get("sellers").and_then(Value::as_array) else {
+            result.source.malformed_rows += 1;
+            continue;
+        };
+        result.source.present = true;
+        result.source.raw_rows += rows.len();
+        for row in rows {
+            let (Some(sku), Some(name)) = (
+                normalize_sku(row.get("sku")),
+                row.get("name").and_then(|v| text_from(Some(v))),
+            ) else {
+                result.source.malformed_rows += 1;
+                continue;
+            };
+            let url = clean_url(row.get("productLink")).filter(|url| {
+                sku_from_url(Some(&Value::String(url.clone()))).as_deref() == Some(&sku)
+            });
+            result.items.push(ProductOffer {
+                sku,
+                seller: Seller {
+                    name,
+                    rating: None,
+                    url: None,
+                },
+                card_price_minor: price_to_minor(row.pointer("/price/cardPrice/price")),
+                regular_price_minor: price_to_minor(row.pointer("/price/price/price")),
+                available: row.get("available").and_then(Value::as_bool),
+                delivery_label: row
+                    .get("advantages")
+                    .and_then(Value::as_array)
+                    .and_then(|v| {
+                        v.iter()
+                            .find(|a| a.get("key").and_then(Value::as_str) == Some("delivery"))
+                    })
+                    .and_then(|v| text_from(v.pointer("/contentRs/headRs"))),
+                url,
+            });
+        }
+        if state
+            .pointer("/paging/total")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > rows.len() as u64)
+        {
+            result.source.source_truncated = true;
+        }
+        if state.pointer("/paging/nextPage").is_some_and(|v| {
+            v.as_str().is_some_and(|s| !s.is_empty()) || v.as_u64().is_some_and(|n| n > 0)
+        }) {
+            result.source.source_truncated = true;
+            result.has_next = Some(true);
+            result.next_path = state
+                .pointer("/paging/nextPage")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+        }
+    }
+    result.source.parsed_rows = result.items.len();
+    result.source.local_truncated = result.items.len() > 100;
+    result.items.truncate(100);
+    result
+}
+pub fn add_review_details(page: &Value, result: &mut ReviewPage) {
+    let state = WidgetSet::new(page).all_valid("webListReviews").find(|v| {
+        v.get("reviews")
+            .or_else(|| v.get("items"))
+            .is_some_and(Value::is_array)
+    });
+    let rows = state
+        .as_ref()
+        .and_then(|v| v.get("reviews").or_else(|| v.get("items")))
+        .and_then(Value::as_array);
+    for review in &mut result.reviews {
+        let Some(row) = rows.and_then(|rows| rows.get(review.source_index)) else {
+            continue;
+        };
+        review.details = Some(crate::ozon::model::ReviewDetails {
+            helpful: row.pointer("/usefulness/useful").and_then(Value::as_u64),
+            unhelpful: row.pointer("/usefulness/unuseful").and_then(Value::as_u64),
+            item_sku: normalize_sku(row.get("itemId")),
+            seller_replies: Vec::new(),
+            replies_acquisition: None,
+            replies_status: SourceSectionStatus::Unknown,
+        });
+    }
+    result.star_counts = WidgetSet::new(page)
+        .all_valid("webReviewProductScore")
+        .find_map(|state| {
+            let rows = state.get("score")?.as_array()?;
+            let parsed: Vec<_> = rows
+                .iter()
+                .filter_map(|row| {
+                    let title = row.get("title")?.as_str()?;
+                    let stars = title.chars().next()?.to_digit(10)? as u8;
+                    if title.chars().nth(1).is_some_and(|c| c.is_ascii_digit()) {
+                        return None;
+                    }
+                    let count = row.get("value")?.as_u64()?;
+                    (1..=5)
+                        .contains(&stars)
+                        .then_some(crate::ozon::model::StarCount { stars, count })
+                })
+                .collect();
+            let mut counts = Vec::new();
+            for stars in 1..=5 {
+                let mut values = parsed
+                    .iter()
+                    .filter(|entry| entry.stars == stars)
+                    .map(|entry| entry.count);
+                if let Some(first) = values.next()
+                    && values.all(|value| value == first)
+                {
+                    counts.push(crate::ozon::model::StarCount {
+                        stars,
+                        count: first,
+                    });
+                }
+            }
+            (!counts.is_empty()).then_some(counts)
+        });
+}
+
+pub fn review_uuid(page: &Value, index: usize) -> Option<String> {
+    let state = WidgetSet::new(page).all_valid("webListReviews").find(|v| {
+        v.get("reviews")
+            .or_else(|| v.get("items"))
+            .is_some_and(Value::is_array)
+    })?;
+    let uuid = state
+        .get("reviews")
+        .or_else(|| state.get("items"))?
+        .as_array()?
+        .get(index)?
+        .get("uuid")?
+        .as_str()?;
+    (!uuid.is_empty()
+        && uuid.len() <= 128
+        && uuid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')))
+    .then(|| uuid.to_owned())
+}
+pub fn decode_seller_replies(
+    page: &Value,
+) -> Option<(Vec<crate::ozon::model::SellerReply>, SourceSectionStatus)> {
+    let state = page.pointer("/widgetStates/sellerReplies")?;
+    let rows = state.get("comments")?.as_array()?;
+    let replies = rows
+        .iter()
+        .filter_map(|v| {
+            Some(crate::ozon::model::SellerReply {
+                text: v.get("comment")?.as_str()?.to_owned(),
+                published_at: unix_to_date(v.get("publishedAt").or_else(|| v.get("createdAt"))),
+                author_label: v
+                    .get("authorLabel")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    let status = if state.get("sourceTruncated").and_then(Value::as_bool) == Some(true) {
+        SourceSectionStatus::Partial
+    } else {
+        SourceSectionStatus::Available
+    };
+    Some((replies, status))
 }
 
 fn unix_to_date(value: Option<&Value>) -> Option<String> {
@@ -1250,6 +1510,7 @@ pub fn parse_reviews(page: &Value, limit: usize) -> ReviewPage {
                 // only an affirmative upstream value is treated as evidence.
                 purchased: (review.get("isItemPurchased").and_then(Value::as_bool) == Some(true))
                     .then_some(true),
+                details: None,
                 variant_label: variant_label.or_else(|| {
                     review
                         .pointer("/productVariant/title")
@@ -1309,6 +1570,8 @@ pub fn parse_reviews(page: &Value, limit: usize) -> ReviewPage {
         has_next,
         refinements,
         aggregation_scope,
+        star_counts: None,
+        read_usage: Default::default(),
         warnings: Vec::new(),
     }
 }

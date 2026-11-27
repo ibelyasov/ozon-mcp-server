@@ -66,6 +66,29 @@
                 "null"
               ],
               "minimum": 0
+            },
+            "starCounts": {
+              "type": "array",
+              "maxItems": 5,
+              "items": {
+                "type": "object",
+                "required": [
+                  "stars",
+                  "count"
+                ],
+                "properties": {
+                  "stars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5
+                  },
+                  "count": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
             }
           },
           "additionalProperties": false
@@ -108,6 +131,32 @@
             "boolean",
             "null"
           ]
+        },
+        "usage": {
+          "type": "object",
+          "required": [
+            "sourceReads",
+            "sourceReadLimit",
+            "budgetExhausted",
+            "unit"
+          ],
+          "properties": {
+            "sourceReads": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sourceReadLimit": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "budgetExhausted": {
+              "type": "boolean"
+            },
+            "unit": {
+              "const": "logical_source_reads"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -195,9 +244,119 @@
         },
         "evidenceRefs": {
           "$ref": "common.schema.json#/$defs/evidenceRefs"
+        },
+        "textTruncated": {
+          "type": "boolean"
+        },
+        "textLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "helpfulVotes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "unhelpfulVotes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "subjectSku": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9]+$",
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sellerReplies": {
+          "type": "object",
+          "required": [
+            "status",
+            "items",
+            "truncated"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "available",
+                "unsupported",
+                "unknown",
+                "partial"
+              ]
+            },
+            "items": {
+              "type": "array",
+              "maxItems": 30,
+              "items": {
+                "type": "object",
+                "required": [
+                  "text",
+                  "publishedAt",
+                  "authorLabel"
+                ],
+                "properties": {
+                  "text": {
+                    "type": "string",
+                    "maxLength": 12000
+                  },
+                  "publishedAt": {
+                    "oneOf": [
+                      {
+                        "$ref": "common.schema.json#/$defs/timestamp"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "authorLabel": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 1000
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "textTruncated": {
+                "const": true
+              }
+            },
+            "required": [
+              "textTruncated"
+            ]
+          },
+          "then": {
+            "required": [
+              "textLength"
+            ]
+          }
+        }
+      ]
     },
     "refinement": {
       "type": "object",
