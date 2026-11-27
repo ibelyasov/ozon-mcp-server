@@ -97,73 +97,10 @@
         }
       ]
     },
-    "sectionBase": {
-      "type": "object",
-      "required": [
-        "status",
-        "truncated",
-        "nextCursor",
-        "hasNext"
-      ],
-      "properties": {
-        "status": {
-          "enum": [
-            "available",
-            "unsupported",
-            "unknown",
-            "partial"
-          ]
-        },
-        "truncated": {
-          "type": "boolean"
-        },
-        "nextCursor": {
-          "oneOf": [
-            {
-              "$ref": "common.schema.json#/$defs/opaque"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "hasNext": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        }
-      }
-    },
-    "characteristic": {
-      "type": "object",
-      "required": [
-        "name",
-        "value"
-      ],
-      "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 500
-        },
-        "value": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 4000
-        },
-        "evidenceRefs": {
-          "$ref": "common.schema.json#/$defs/evidenceRefs"
-        }
-      },
-      "additionalProperties": false
-    },
     "characteristicsSection": {
       "allOf": [
         {
-          "$ref": "#/$defs/sectionBase"
+          "$ref": "common.schema.json#/$defs/productSectionBase"
         },
         {
           "type": "object",
@@ -175,99 +112,7 @@
               "type": "array",
               "maxItems": 50,
               "items": {
-                "$ref": "#/$defs/characteristic"
-              }
-            }
-          }
-        }
-      ],
-      "unevaluatedProperties": false
-    },
-    "descriptionSection": {
-      "allOf": [
-        {
-          "$ref": "#/$defs/sectionBase"
-        },
-        {
-          "type": "object",
-          "required": [
-            "text"
-          ],
-          "properties": {
-            "text": {
-              "type": [
-                "string",
-                "null"
-              ],
-              "maxLength": 12000
-            },
-            "evidenceRefs": {
-              "$ref": "common.schema.json#/$defs/evidenceRefs"
-            }
-          }
-        }
-      ],
-      "unevaluatedProperties": false
-    },
-    "variant": {
-      "type": "object",
-      "required": [
-        "productRef",
-        "sku",
-        "title"
-      ],
-      "properties": {
-        "productRef": {
-          "$ref": "common.schema.json#/$defs/opaque"
-        },
-        "sku": {
-          "type": "string",
-          "pattern": "^[0-9]+$",
-          "maxLength": 64
-        },
-        "title": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 1000
-        },
-        "evidenceRefs": {
-          "$ref": "common.schema.json#/$defs/evidenceRefs"
-        },
-        "prices": {
-          "type": "array",
-          "maxItems": 3,
-          "items": {
-            "$ref": "common.schema.json#/$defs/price"
-          }
-        },
-        "availability": {
-          "enum": [
-            "available",
-            "unavailable",
-            "unknown"
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
-    "variantsSection": {
-      "allOf": [
-        {
-          "$ref": "#/$defs/sectionBase"
-        },
-        {
-          "type": "object",
-          "required": [
-            "items"
-          ],
-          "properties": {
-            "items": {
-              "type": "array",
-              "maxItems": 20,
-              "items": {
-                "$ref": "#/$defs/variant"
+                "$ref": "common.schema.json#/$defs/productCharacteristic"
               }
             }
           }
@@ -304,52 +149,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "image": {
-      "type": "object",
-      "required": [
-        "imageRef",
-        "altText"
-      ],
-      "properties": {
-        "imageRef": {
-          "$ref": "common.schema.json#/$defs/opaque"
-        },
-        "altText": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 1000
-        },
-        "evidenceRefs": {
-          "$ref": "common.schema.json#/$defs/evidenceRefs"
-        }
-      },
-      "additionalProperties": false
-    },
-    "imagesSection": {
-      "allOf": [
-        {
-          "$ref": "#/$defs/sectionBase"
-        },
-        {
-          "type": "object",
-          "required": [
-            "items"
-          ],
-          "properties": {
-            "items": {
-              "type": "array",
-              "maxItems": 12,
-              "items": {
-                "$ref": "#/$defs/image"
-              }
-            }
-          }
-        }
-      ],
-      "unevaluatedProperties": false
     },
     "product": {
       "type": "object",
@@ -470,13 +269,13 @@
           "$ref": "#/$defs/characteristicsSection"
         },
         "description": {
-          "$ref": "#/$defs/descriptionSection"
+          "$ref": "common.schema.json#/$defs/productDescriptionSection"
         },
         "variants": {
-          "$ref": "#/$defs/variantsSection"
+          "$ref": "common.schema.json#/$defs/productVariantsSection"
         },
         "images": {
-          "$ref": "#/$defs/imagesSection"
+          "$ref": "common.schema.json#/$defs/productImagesSection"
         },
         "evidenceRefs": {
           "$ref": "common.schema.json#/$defs/evidenceRefs"
@@ -492,7 +291,7 @@
           "$ref": "#/$defs/characteristicsSection"
         },
         "offers": {
-          "$ref": "#/$defs/offersSection"
+          "$ref": "common.schema.json#/$defs/productOffersSection"
         }
       },
       "additionalProperties": false
@@ -579,94 +378,6 @@
           "$ref": "#/$defs/errorResult"
         }
       ]
-    },
-    "offer": {
-      "type": "object",
-      "required": [
-        "productRef",
-        "sku",
-        "seller",
-        "prices",
-        "availability",
-        "deliveryLabel",
-        "evidenceRefs",
-        "relation",
-        "configurationVerified"
-      ],
-      "properties": {
-        "productRef": {
-          "$ref": "common.schema.json#/$defs/opaque"
-        },
-        "sku": {
-          "type": "string",
-          "pattern": "^[0-9]+$",
-          "maxLength": 64
-        },
-        "seller": {
-          "oneOf": [
-            {
-              "$ref": "common.schema.json#/$defs/seller"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "prices": {
-          "type": "array",
-          "maxItems": 3,
-          "items": {
-            "$ref": "common.schema.json#/$defs/price"
-          }
-        },
-        "availability": {
-          "enum": [
-            "available",
-            "unavailable",
-            "unknown"
-          ]
-        },
-        "deliveryLabel": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 1000
-        },
-        "evidenceRefs": {
-          "$ref": "common.schema.json#/$defs/evidenceRefs"
-        },
-        "relation": {
-          "const": "ozon_related_offer"
-        },
-        "configurationVerified": {
-          "const": false
-        }
-      },
-      "additionalProperties": false
-    },
-    "offersSection": {
-      "allOf": [
-        {
-          "$ref": "#/$defs/sectionBase"
-        },
-        {
-          "type": "object",
-          "required": [
-            "items"
-          ],
-          "properties": {
-            "items": {
-              "type": "array",
-              "maxItems": 20,
-              "items": {
-                "$ref": "#/$defs/offer"
-              }
-            }
-          }
-        }
-      ],
-      "unevaluatedProperties": false
     }
   }
 }

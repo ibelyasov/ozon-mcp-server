@@ -1539,10 +1539,15 @@ mod tests {
     fn context(id: &str) -> Value {
         json!({"contextId":id,"regionLabel":null,"regionVerification":"unverified","accountState":"unknown","accessState":"available"})
     }
+
+    fn journal_fixture() -> (tempfile::TempDir, Journal) {
+        let dir = private_tempdir();
+        let journal = Journal::open(dir.path()).unwrap();
+        (dir, journal)
+    }
     #[test]
     fn source_admission_and_failed_operation_do_not_retire_idle_history() {
-        let d = private_tempdir();
-        let mut journal = Journal::open(d.path()).unwrap();
+        let (_dir, mut journal) = journal_fixture();
         let active = journal.create_research("active", &context("c")).unwrap();
         let idle = journal.create_research("idle", &context("c")).unwrap();
         journal.conn.execute(
@@ -1607,8 +1612,7 @@ mod tests {
 
     #[test]
     fn note_idempotency_and_conflict() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let r = s.create_research("t", &context("c")).unwrap();
         let product = s.put_ref(&r, "product", &json!({"sku":"1"}), None).unwrap();
         s.record(&r, "search", "q", std::slice::from_ref(&product), &[])
@@ -1639,8 +1643,7 @@ mod tests {
     }
     #[test]
     fn stable_paging() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         for n in 0..3 {
             s.create_research(&format!("r{n}"), &context("c")).unwrap();
         }
@@ -1653,8 +1656,7 @@ mod tests {
     }
     #[test]
     fn retention_respects_lease_and_reports_full() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let old = s.create_research("old", &context("c")).unwrap();
         s.conn
             .execute(
@@ -1679,8 +1681,7 @@ mod tests {
 
     #[test]
     fn maintenance_reclaims_space_and_preserves_newer_research() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let old = s.create_research("old", &context("c")).unwrap();
         s.put_ref(&old, "product", &json!({"value":"x".repeat(200_000)}), None)
             .unwrap();
@@ -1716,8 +1717,7 @@ mod tests {
 
     #[test]
     fn maintenance_removes_expired_temporary_authority() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let research = s.create_research("r", &context("c")).unwrap();
         s.put_ref(&research, "product", &json!({}), Some(0))
             .unwrap();
@@ -1748,8 +1748,7 @@ mod tests {
 
     #[test]
     fn maintenance_batches_many_small_researches_without_pruning_all() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         for index in 0..80 {
             let research = s
                 .create_research(&format!("small-{index:02}"), &context("c"))
@@ -1781,8 +1780,7 @@ mod tests {
 
     #[test]
     fn long_lived_writes_enforce_cap_and_keep_active_research() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let old = s.create_research("old", &context("c")).unwrap();
         s.put_ref(&old, "product", &json!({"value":"o".repeat(200_000)}), None)
             .unwrap();
@@ -1833,8 +1831,7 @@ mod tests {
 
     #[test]
     fn invalid_writes_do_not_evict_idle_research() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let victim = s.create_research("victim", &context("c")).unwrap();
         s.put_ref(
             &victim,
@@ -1905,8 +1902,7 @@ mod tests {
 
     #[test]
     fn underestimated_growth_rolls_back_write_and_eviction() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let research = s.create_research("protected", &context("c")).unwrap();
         s.reclaim_space().unwrap();
         let before_lease: String = s
@@ -1959,8 +1955,7 @@ mod tests {
 
     #[test]
     fn capacity_reclamation_crosses_a_small_batch_page_plateau() {
-        let d = private_tempdir();
-        let mut s = Journal::open(d.path()).unwrap();
+        let (_dir, mut s) = journal_fixture();
         let active = s.create_research("active", &context("c")).unwrap();
         let context_json = canonical(&context("c"));
         let tx = s.conn.transaction().unwrap();
@@ -2048,8 +2043,7 @@ mod tests {
 
     #[test]
     fn candidate_observations_are_immutable_and_product_count_is_unique_skus() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let rid = store.create_research("candidates", &context("c")).unwrap();
         let mut refs = Vec::new();
         for price in ["regular", "original"] {
@@ -2120,8 +2114,7 @@ mod tests {
 
     #[test]
     fn variant_product_authority_is_valid_for_notes_without_an_event() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let rid = store.create_research("variant", &context("c")).unwrap();
         let (variant,note)=store.commit_operation(Some(&rid),||Ok(()),|tx| {
             let variant=tx.put_ref(&rid,"product",&json!({"sku":"456","url":null}),None)?;
@@ -2143,8 +2136,7 @@ mod tests {
 
     #[test]
     fn filtered_listing_cursor_keeps_query_and_does_not_skip_after_issued_row_update() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let a = store.create_research("match A", &context("c")).unwrap();
         let b = store.create_research("match B", &context("c")).unwrap();
         let c = store.create_research("match C", &context("c")).unwrap();
@@ -2193,8 +2185,7 @@ mod tests {
     #[test]
     fn valid_large_notes_page_by_serialized_size_and_exact_selection_is_addressable() {
         for text in ["a".repeat(12_000), "\n".repeat(12_000), "😀".repeat(12_000)] {
-            let d = private_tempdir();
-            let mut store = Journal::open(d.path()).unwrap();
+            let (_dir, mut store) = journal_fixture();
             let rid = store.create_research("large notes", &context("c")).unwrap();
             let note_ids=store.commit_operation(Some(&rid),||Ok(()),|tx| {
                 (0..5).map(|n| tx.append_note(&json!({"researchId":rid,"operationId":format!("large-{n}"),"kind":"assessment","text":text})).map(|note|note["noteId"].clone())).collect::<Result<Vec<_>>>()
@@ -2276,8 +2267,7 @@ mod tests {
 
     #[test]
     fn event_and_evidence_pages_are_whole_and_oversized_record_is_controlled() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let events = store
             .create_research("large events", &context("c"))
             .unwrap();
@@ -2339,8 +2329,7 @@ mod tests {
 
     #[test]
     fn failed_response_validation_rolls_back_the_entire_observation_operation() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let rid = store.create_research("atomic", &context("c")).unwrap();
         let before: String = store
             .conn
@@ -2390,8 +2379,7 @@ mod tests {
     #[test]
     fn cancelled_commit_rolls_back_quota_eviction_and_all_staged_rows() {
         use std::cell::Cell;
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let idle = store.create_research("idle", &context("c")).unwrap();
         store
             .put_ref(
@@ -2451,8 +2439,7 @@ mod tests {
 
     #[test]
     fn periodic_maintenance_runs_between_successful_operations_and_rolls_back_with_failure() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let idle = store.create_research("old", &context("c")).unwrap();
         store.conn.execute("UPDATE researches SET updated_at='2000-01-01T00:00:00.000Z',protected_until=NULL WHERE id=?",[&idle]).unwrap();
         store.last_maintenance = None;
@@ -2471,8 +2458,7 @@ mod tests {
 
     #[test]
     fn per_item_savepoints_keep_successes_and_roll_back_failed_nested_items() {
-        let d = private_tempdir();
-        let mut store = Journal::open(d.path()).unwrap();
+        let (_dir, mut store) = journal_fixture();
         let rid = store.create_research("batch", &context("c")).unwrap();
         let kept=store.commit_operation(Some(&rid),||Ok(()),|tx| {
             let first=tx.stage(|item| item.put_ref(&rid,"product",&json!({"sku":"1"}),None))?;
@@ -2529,8 +2515,7 @@ mod tests {
     #[test]
     fn large_batch_event_chunks_keep_all_authority_and_read_as_schema_valid_history() {
         for (evidence_count, product_count) in [(101_usize, 37), (400, 8)] {
-            let d = private_tempdir();
-            let mut store = Journal::open(d.path()).unwrap();
+            let (_dir, mut store) = journal_fixture();
             let rid = store.create_research("large batch", &context("c")).unwrap();
             let observed = "2026-09-30T00:00:00.000Z";
             let evidence=(0..evidence_count).map(|index|json!({

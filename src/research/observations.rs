@@ -1061,31 +1061,9 @@ pub fn normalize_product(
             }
             _ => return Err(fail(Code::InvalidArgument, "Unknown product section")),
         };
-        if let Some(offset) = next_offset {
-            let cursor = ProductContinuation {
-                raw: raw.clone(),
-                product_ref: product_ref.clone(),
-                section: section.clone(),
-                offset,
-                observed_at: observed.clone(),
-                source_url: source_url.clone(),
-                characteristic_names: characteristic_names.map(<[String]>::to_vec),
-                include: original_include.to_vec(),
-                max_source_reads,
-                offers_path: None,
-                offers_paths: continuation
-                    .map(|c| c.offers_paths.clone())
-                    .unwrap_or_default(),
-            };
-            data["nextCursor"] = json!(txn.put_ref(
-                rid,
-                "product_cursor",
-                &serde_json::to_value(cursor)?,
-                Some(1800)
-            )?);
-        }
-        if section == "offers"
-            && next_offset.is_none()
+        let cursor_position = if let Some(offset) = next_offset {
+            Some((offset, None))
+        } else if section == "offers"
             && let Some(path) = raw.offers.as_ref().and_then(|o| o.next_path.as_ref())
         {
             if continuation.is_some_and(|c| c.offers_paths.contains(path)) {
@@ -1097,17 +1075,22 @@ pub fn normalize_product(
                 product[section] = data;
                 continue;
             }
+            Some((0, Some(path.clone())))
+        } else {
+            None
+        };
+        if let Some((offset, offers_path)) = cursor_position {
             let cursor = ProductContinuation {
                 raw: raw.clone(),
                 product_ref: product_ref.clone(),
                 section: section.clone(),
-                offset: 0,
+                offset,
                 observed_at: observed.clone(),
                 source_url: source_url.clone(),
                 characteristic_names: characteristic_names.map(<[String]>::to_vec),
                 include: original_include.to_vec(),
                 max_source_reads,
-                offers_path: Some(path.clone()),
+                offers_path,
                 offers_paths: continuation
                     .map(|c| c.offers_paths.clone())
                     .unwrap_or_default(),
